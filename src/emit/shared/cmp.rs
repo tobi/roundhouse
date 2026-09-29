@@ -62,7 +62,7 @@ pub fn classify_cmp(lhs: &Expr, rhs: &Expr) -> CmpCase {
 
     match (lhs_ty, rhs_ty) {
         // Not SameType: Go's `time.Time` has no native `<`, so leave the rendering to each target.
-        (l, r) if is_time(l) && is_time(r) => CmpCase::Unknown,
+        (l, r) if is_temporal(l) && is_temporal(r) => CmpCase::Unknown,
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => CmpCase::SameType,
         (Ty::Str, Ty::Str) | (Ty::Sym, Ty::Sym) => CmpCase::SameType,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => CmpCase::NumericPromote,
@@ -73,24 +73,27 @@ pub fn classify_cmp(lhs: &Expr, rhs: &Expr) -> CmpCase {
         _ if super::operand::is_user_operator_receiver(Some(lhs_ty)) => CmpCase::Unknown,
         // `(score || BEST) <= LIMIT` where the arms are Integer and
         // `Numeric`: every arm is an ordered number.
-        (l, r) if is_number(l) && is_number(r) => CmpCase::NumericPromote,
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => CmpCase::NumericPromote,
         _ => CmpCase::Incompatible,
     }
 }
 
-/// An ordered number: `Int`, `Float`, `Numeric`/`BigDecimal`/`Rational`, or
-/// a union whose every arm is one (`Numeric | Integer`).
-fn is_number(ty: &Ty) -> bool {
+/// A point in time, of whatever class: the first-class `Time`, the legacy
+/// `Class { Time }`, and the other classes Rails orders against it
+/// (`DateTime`, `Date`, `ActiveSupport::TimeWithZone`), or a union of
+/// only those. `Time`, `Date` and `DateTime` compare across each other
+/// (ActiveSupport teaches `Time#<=>` to take a `Date`), so `cutoff` typed
+/// `Time | DateTime | Date` against a `Time` is a valid comparison, not a
+/// mismatch. A `nil` arm is NOT temporal: `Time? < Time` still is one.
+fn is_temporal(ty: &Ty) -> bool {
     match ty {
-        Ty::Int | Ty::Float => true,
-        Ty::Class { id, .. } => matches!(id.0.as_str(), "Numeric" | "BigDecimal" | "Rational"),
-        Ty::Union { variants } => !variants.is_empty() && variants.iter().all(is_number),
+        Ty::Time => true,
+        Ty::Class { id, .. } => {
+            matches!(id.0.as_str(), "Time" | "DateTime" | "Date" | "ActiveSupport::TimeWithZone")
+        }
+        Ty::Union { variants } => !variants.is_empty() && variants.iter().all(is_temporal),
         _ => false,
     }
-}
-
-fn is_time(ty: &Ty) -> bool {
-    matches!(ty, Ty::Time) || matches!(ty, Ty::Class { id, .. } if id.0.as_str() == "Time")
 }
 
 #[cfg(test)]
