@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::app::App;
-use crate::gems::{GemCensus, gems_owning_constant};
+use crate::gems::{GemCensus, gems_owning_constant_with};
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
@@ -355,16 +355,16 @@ impl GemAncestry {
         }
     }
 
-    pub(super) fn receiver_gem<'a>(&self, ty: &Ty, census: &'a GemCensus) -> GemClaim<'a> {
+    pub(super) fn receiver_gem<'a>(&self, ty: &Ty, census: &'a GemCensus, declares: &dyn Fn(&str, &str) -> Option<bool>) -> GemClaim<'a> {
         match ty {
-            Ty::Class { id, .. } => self.class_gem(id, census),
+            Ty::Class { id, .. } => self.class_gem(id, census, declares),
             Ty::Union { variants } => {
                 let mut claim = GemClaim::Absent;
                 let mut missing = false;
                 // Match nullable dispatch: nil is not a concrete receiver arm.
                 // Every other arm must identify the same single gem.
                 for variant in variants.iter().filter(|ty| !matches!(ty, Ty::Nil)) {
-                    match self.receiver_gem(variant, census) {
+                    match self.receiver_gem(variant, census, declares) {
                         GemClaim::Absent => missing = true,
                         GemClaim::Uncertain => return GemClaim::Uncertain,
                         GemClaim::Known { gem, constant } => {
@@ -394,7 +394,7 @@ impl GemAncestry {
         }
     }
 
-    fn class_gem<'a>(&self, id: &ClassId, census: &'a GemCensus) -> GemClaim<'a> {
+    fn class_gem<'a>(&self, id: &ClassId, census: &'a GemCensus, declares: &dyn Fn(&str, &str) -> Option<bool>) -> GemClaim<'a> {
         let mut pending = vec![id.clone()];
         let mut seen = HashSet::new();
         let mut candidates = BTreeMap::new();
@@ -410,7 +410,7 @@ impl GemAncestry {
                     pending.push(target);
                 }
             } else {
-                for gem in gems_owning_constant(census, id.0.as_str()) {
+                for gem in gems_owning_constant_with(census, id.0.as_str(), declares) {
                     candidates
                         .entry(gem)
                         .and_modify(|witness: &mut String| {
