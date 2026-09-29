@@ -165,3 +165,23 @@ end
     assert!(out.contains("self.class.label"), "got:\n{out}");
     assert!(out.contains("self.return.id"), "got:\n{out}");
 }
+
+#[test]
+fn a_delegated_writer_forwards_its_value() {
+    // billing's `delegate :request_id, :request_id=, to: :class`: the
+    // writer needs a parameter, and a zero-arg `def request_id=` is not
+    // Ruby at all — the snippet failed to parse and took the reader
+    // down with it.
+    let out = emit(
+        r#"class Filter
+  delegate :request_id, :request_id=, to: :class
+
+  def self.request_id
+    @request_id
+  end
+end
+"#,
+    );
+    assert!(out.contains("self.class.request_id"), "got:\n{out}");
+    assert!(out.contains("self.class.request_id = value"), "got:\n{out}");
+}

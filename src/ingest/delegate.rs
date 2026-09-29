@@ -202,7 +202,15 @@ fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
             continue;
         }
         let (t, m) = (receiver(d.target.as_str()), d.method.as_str());
-        if d.allow_nil {
+        if let Some(attr) = m.strip_suffix('=') {
+            // A writer (`delegate :id, :id=, to: :class`) takes the value
+            // it forwards; Rails' `allow_nil` guards it the same way.
+            let guard = if d.allow_nil { format!("return if {t}.nil?\n    ") } else { String::new() };
+            body.push_str(&format!(
+                "  def {}(value)\n    {guard}{t}.{attr} = value\n  end\n\n",
+                d.name
+            ));
+        } else if d.allow_nil {
             // A ternary, not `return nil if …`: it leaves the method
             // ending in a read, which is what the strict targets want
             // of a non-void body.

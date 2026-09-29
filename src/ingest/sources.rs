@@ -40,6 +40,10 @@ thread_local! {
 struct Registry {
     files: Vec<SourceFile>,
     by_path: HashMap<String, FileId>,
+    /// Files already drained this ingest. Ids keep counting past them,
+    /// so a pass that synthesizes source after the main drain (the
+    /// `delegate` expansion) hands out ids a second drain can append.
+    drained: u32,
 }
 
 /// Clear the registry for a fresh whole-app ingest.
@@ -60,7 +64,7 @@ pub fn register(path: &str, text: &str) -> FileId {
             path: path.to_string(),
             text: text.to_string(),
         });
-        let id = FileId(reg.files.len() as u32);
+        let id = FileId(reg.drained + reg.files.len() as u32);
         reg.by_path.insert(path.to_string(), id);
         id
     })
@@ -86,17 +90,19 @@ pub fn path_of(id: FileId) -> Option<String> {
         let reg = s.borrow();
         (id.0 as usize)
             .checked_sub(1)
+            .and_then(|i| i.checked_sub(reg.drained as usize))
             .and_then(|i| reg.files.get(i))
             .map(|f| f.path.clone())
     })
 }
 
-/// Move the registered files out (ids stay valid as indices + 1) and
-/// clear the registry.
+/// Move the registered files out and clear the registry. Ids stay valid
+/// as indices + 1 into the concatenation of every drain since [`reset`].
 pub fn drain() -> Vec<SourceFile> {
     SOURCES.with(|s| {
         let mut reg = s.borrow_mut();
         reg.by_path.clear();
+        reg.drained += reg.files.len() as u32;
         std::mem::take(&mut reg.files)
     })
 }
@@ -134,5 +140,17 @@ mod tests {
         assert_eq!(files[0].path, "a.rb");
         assert_eq!(files[1].path, "b.rb");
         assert_eq!(file_id("a.rb"), FileId(0));
+    }
+
+    #[test]
+    fn ids_keep_counting_past_a_drain() {
+        reset();
+        register("a.rb", "1");
+        let first = drain();
+        let late = register("<delegate A>", "2");
+        assert_eq!(late, FileId(2));
+        assert_eq!(path_of(late).as_deref(), Some("<delegate A>"));
+        let all: Vec<_> = first.into_iter().chain(drain()).collect();
+        assert_eq!(all[late.0 as usize - 1].path, "<delegate A>");
     }
 }

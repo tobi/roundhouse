@@ -1443,6 +1443,9 @@ end
     crate::lower::rich_text::synthesize_record_model(&mut app);
 
     collect_binary_assets(vfs, dir, &mut app);
+    // Source the passes above synthesized (`delegate` forwarders), so
+    // their diagnostics render against their own text.
+    app.sources.extend(super::sources::drain());
 
     Ok(app)
 }
