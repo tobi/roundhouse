@@ -87,6 +87,9 @@ pub fn classify_add(lhs: &Expr, rhs: &Expr) -> AddCase {
     match (lhs_ty, rhs_ty) {
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => AddCase::Numeric,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => AddCase::NumericPromote,
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => {
+            AddCase::NumericPromote
+        }
         (Ty::Str, Ty::Str) => AddCase::StringConcat,
         _ => {
             // Collection `+` collection is *always* valid Ruby — it
