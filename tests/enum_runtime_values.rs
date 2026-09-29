@@ -111,3 +111,12 @@ fn scopes_and_instance_methods_can_be_disabled() {
     assert!(!out.contains("def on"), "got:\n{out}");
     assert!(!out.contains("def off"), "got:\n{out}");
 }
+
+/// `["draft", "active"].index_by(&:to_sym)` keys each string by its
+/// symbol and stores the string.
+#[test]
+fn indexing_a_string_list_by_symbol_maps_each_label_to_its_string() {
+    let out = account("  enum :status, [\"draft\", \"active\"].index_by(&:to_sym), default: :draft");
+    assert!(out.contains("def draft?"), "got:\n{out}");
+    assert!(out.contains("status == \"active\""), "got:\n{out}");
+}
