@@ -541,6 +541,28 @@ impl<'a> BodyTyper<'a> {
         expr.node.for_each_child(&mut |child| self.propagate_match_bindings(child, ctx, false));
     }
 
+    /// The type of `name` when it is an attribute of the class `self` is an
+    /// instance of: a column or an `attr_accessor`/`attr_reader`, its own or an
+    /// ancestor's. Such a read is a plain state read, which is what lets a
+    /// guard on it (`expires_at.present? && expires_at > now`) speak for
+    /// the reads that follow it the way a guard on a local does.
+    fn self_attribute_ty(&self, name: &Symbol, ctx: &Ctx) -> Option<Ty> {
+        let Some(Ty::Class { id, .. }) = &ctx.self_ty else {
+            return None;
+        };
+        let mut cursor = Some(id.clone());
+        // Bounded: a parent link that cycles must not hang the typer.
+        for _ in 0..16 {
+            let Some(cur) = cursor else { break };
+            let Some(info) = self.classes.get(&cur) else { break };
+            if let Some(ty) = info.attributes.fields.get(name) {
+                return Some(ty.clone());
+            }
+            cursor = info.parent.clone();
+        }
+        None
+    }
+
     fn compute(&self, expr: &mut Expr, ctx: &Ctx) -> Ty {
         let expr_span = expr.span;
         match &mut *expr.node {
@@ -843,7 +865,7 @@ impl<'a> BodyTyper<'a> {
                 let mut seeded = ctx.clone();
                 collect_var_assignments_into(left, &mut seeded.local_bindings);
                 self.propagate_match_bindings(left, &mut seeded, true);
-                let pred = narrowing::extract_narrowing(left);
+                let pred = narrowing::extract_narrowing_with(left, &|n| self.self_attribute_ty(n, ctx));
                 let right_ctx = match (&pred, &*op) {
                     (Some(p), crate::expr::BoolOpKind::And) => {
                         narrowing::apply_narrowing(&seeded, p, true)
@@ -1335,7 +1357,7 @@ impl<'a> BodyTyper<'a> {
 
             ExprNode::If { cond, then_branch, else_branch } => {
                 self.analyze_expr(cond, ctx);
-                let pred = narrowing::extract_narrowing(cond);
+                let pred = narrowing::extract_narrowing_with(cond, &|n| self.self_attribute_ty(n, ctx));
                 // Var assignments inside `cond` (e.g.
                 // `if (user = User.find_by(...)) && user.is_active?`)
                 // must flow into both branches: the assignment
@@ -1845,8 +1867,23 @@ impl<'a> BodyTyper<'a> {
                             _ => false,
                         };
                         if then_diverges && else_empty {
-                            if let Some(pred) = narrowing::extract_narrowing(cond) {
+                            if let Some(pred) = narrowing::extract_narrowing_with(cond, &|n| self.self_attribute_ty(n, ctx)) {
                                 local_ctx = narrowing::apply_narrowing(&local_ctx, &pred, false);
+                            }
+                        }
+                        // The mirror image is `unless`, which the ingest
+                        // spells `if cond; <nothing>; else <diverge>; end`:
+                        // `return false unless current` continues only when
+                        // `current` was truthy.
+                        let then_empty = match &*then_branch.node {
+                            ExprNode::Lit { value: crate::expr::Literal::Nil } => true,
+                            ExprNode::Seq { exprs } => exprs.is_empty(),
+                            _ => false,
+                        };
+                        let else_diverges = matches!(else_branch.ty.as_ref(), Some(Ty::Bottom));
+                        if else_diverges && then_empty {
+                            if let Some(pred) = narrowing::extract_narrowing_with(cond, &|n| self.self_attribute_ty(n, ctx)) {
+                                local_ctx = narrowing::apply_narrowing(&local_ctx, &pred, true);
                             }
                         }
                     }
