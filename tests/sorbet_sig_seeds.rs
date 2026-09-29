@@ -111,11 +111,12 @@ fn a_sig_declares_the_method_the_analyzer_could_not_infer() {
 
 #[test]
 fn a_signature_outside_the_grammar_is_dropped_whole() {
-    // `T.type_parameter` is Sorbet's generics, which this reader does
-    // not model. The method keeps whatever inference makes of it; what
+    // A shape with string keys (`{ "id" => Integer }`) is a hash whose keys
+    // are known, which a record with symbol-named fields cannot say. The
+    // method keeps whatever inference makes of it; what
     // must not happen is a half-read signature.
     let controller = r#"class ReportsController < ApplicationController
-  sig { type_parameters(:U).params(item: T.type_parameter(:U)).returns(T.type_parameter(:U)) }
+  sig { params(item: { "id" => Integer }).returns(Integer) }
   def echo(item)
     item
   end
