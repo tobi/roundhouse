@@ -3735,6 +3735,23 @@ fn falsy_part(ty: &Ty) -> Option<Ty> {
     }
 }
 
+/// The arms of `ty` a falsy value can come from -- `nil`, `false`, and
+/// anything not known to be truthy. `None` when there are none.
+fn falsy_part(ty: &Ty) -> Option<Ty> {
+    match ty {
+        Ty::Union { variants } => {
+            let kept: Vec<Ty> = variants.iter().filter_map(falsy_part).collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => Some(Ty::Union { variants: kept }),
+            }
+        }
+        t if never_falsy(t) => None,
+        t => Some(t.clone()),
+    }
+}
+
 /// Can this type NEVER be Ruby-falsy?
 ///
 /// Ruby's falsy set is exactly `nil` and `false`; every other object,
