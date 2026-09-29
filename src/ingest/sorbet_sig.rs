@@ -831,3 +831,9 @@ fn rbs_comment_text(source: &[u8], def_start: usize) -> Option<String> {
     }
     (!sig.is_empty()).then_some(sig)
 }
+
+/// A Sorbet type expression (`T.nilable(Foo)`, `T::Array[String]`, ...)
+/// read as a `Ty`, for `T.let(x, Type)`.
+pub(super) fn sorbet_type_node(node: &Node<'_>) -> Option<Ty> {
+    sorbet_ty(node, true, &HashMap::new())
+}

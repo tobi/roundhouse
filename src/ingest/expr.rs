@@ -345,13 +345,11 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     // in the catalog defines — and every use of the value below it is
     // untyped from there on.
     //
-    // Deliberately lossy: the declared type is discarded rather than
-    // read. Turning an annotation into a SEED is a separate question
-    // with its own policy (whether it wins over inference, what a
-    // contradiction means, what `T.untyped` does), and the unwrap has
-    // to be able to land without answering any of it.
+    // The declared type of `T.let` / `T.cast` rides along as a `Cast`
+    // (see `type_ascription`); the other assertions keep just the value.
     if let Some(inner) = sorbet_assertion_argument(node) {
-        return ingest_expr_strict(&inner, file);
+        let declared = super::type_ascription::sorbet_declared_type(node);
+        return Ok(super::type_ascription::ascribe(ingest_expr_strict(&inner, file)?, declared));
     }
 
     // `T.absurd(x)` is NOT an assertion that evaluates to its argument:
@@ -983,6 +981,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let raw = constant_id_str(&w.name());
             let name = raw.strip_prefix('@').unwrap_or(raw);
             let value = ingest_expr(&w.value(), file)?;
+            let value = super::type_ascription::ascribe(value, super::type_ascription::trailing_rbs_type(file, loc.end_offset()));
             ExprNode::Assign {
                 target: crate::expr::LValue::Ivar { name: Symbol::from(name) },
                 value,
@@ -992,6 +991,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let w = n.as_local_variable_write_node().unwrap();
             let name = Symbol::from(constant_id_str(&w.name()));
             let value = ingest_expr(&w.value(), file)?;
+            let value = super::type_ascription::ascribe(value, super::type_ascription::trailing_rbs_type(file, loc.end_offset()));
             ExprNode::Assign {
                 target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
                 value,
@@ -1132,6 +1132,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let raw = constant_id_str(&w.name());
             let name = Symbol::from(raw.strip_prefix('@').unwrap_or(raw));
             let value = ingest_expr(&w.value(), file)?;
+            let value = super::type_ascription::ascribe(value, super::type_ascription::trailing_rbs_type(file, loc.end_offset()));
             ExprNode::OpAssign {
                 target: crate::expr::LValue::Ivar { name },
                 op: crate::expr::OpAssignOp::OrOr,
