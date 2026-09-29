@@ -55,6 +55,10 @@ pub enum AddCase {
 }
 
 /// Classify a pair of operands for `+` emission.
+fn is_time(ty: &Ty) -> bool {
+    matches!(ty, Ty::Time) || matches!(ty, Ty::Class { id, .. } if id.0.as_str() == "Time")
+}
+
 pub fn classify_add(lhs: &Expr, rhs: &Expr) -> AddCase {
     let lhs_ty = lhs.ty.as_ref();
     let rhs_ty = rhs.ty.as_ref();
@@ -65,6 +69,15 @@ pub fn classify_add(lhs: &Expr, rhs: &Expr) -> AddCase {
     }
     // Not `Incompatible` (a raise) nor `ArrayConcat` (an Array, not a Set).
     if is_set_receiver(lhs_ty) {
+        return AddCase::Unknown;
+    }
+
+    // `Time + seconds` / `Time + Duration` is a Time; only `Time + Time`
+    // (and `Time + String`) is the TypeError.
+    if is_time(lhs_ty.unwrap()) && !is_time(rhs_ty.unwrap()) && !matches!(rhs_ty, Some(Ty::Str)) {
+        return AddCase::Unknown;
+    }
+    if super::operand::is_user_operator_receiver(lhs_ty) {
         return AddCase::Unknown;
     }
 
