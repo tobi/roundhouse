@@ -2051,6 +2051,9 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
         // JSON serialization of a collection is a String whatever the
         // elements are.
         "to_json" => Ty::Str,
+        // ActiveSupport `Array#as_json`: the JSON-primitive structure,
+        // an Array of whatever each element serializes to.
+        "as_json" => Ty::Array { elem: Box::new(Ty::Untyped) },
         "find" | "detect" => Ty::Union {
             variants: vec![elem.clone(), Ty::Nil],
         },
@@ -2363,6 +2366,8 @@ pub(super) fn hash_method(
         // value type — campfire's `Webhook#payload(message).to_json`
         // nests hashes three deep.
         "to_json" | "to_s" | "inspect" | "to_query" | "to_param" => Ty::Str,
+        // ActiveSupport `Hash#as_json`: string keys, JSON-primitive values.
+        "as_json" => Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
         _ => unknown(),
     }
 }
@@ -2475,6 +2480,17 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         | "squish" | "remove" | "indent" | "strip_heredoc"
         | "html_safe" | "to_query" | "to_param" => Ty::Str,
         "constantize" | "safe_constantize" => unknown(),
+        // ActiveSupport `String#to_date` / `to_time` / `to_datetime` /
+        // `in_time_zone` parse a date string. Date and DateTime fold into `Time` (see
+        // `time_method`), so all three answer it.
+        "to_date" | "to_time" | "to_datetime" | "in_time_zone" => Ty::Time,
+        // ActiveSupport `String#to_d` (BigDecimal). A decimal is
+        // modelled as `Float` throughout (decimal columns read as
+        // Float), so the conversion answers the same.
+        "to_d" => Ty::Float,
+        // `Object#to_json` / `Object#as_json` (ActiveSupport): a String
+        // serializes to a JSON String and is its own JSON-primitive form.
+        "to_json" | "as_json" => Ty::Str,
         // ActiveSupport boolean predicates (Object#blank? is universal
         // and lives there; String#starts_with? / ends_with? are
         // ActiveSupport's underscore-style aliases of start_with? /
