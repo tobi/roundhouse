@@ -50,6 +50,7 @@ pub fn ingest_sorbet_declarations(
     };
     let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
     let mut abstracts = HashMap::new();
+    let mut sides = MethodSides::new();
     walk(
         &program.statements().body().iter().collect::<Vec<_>>(),
         None,
@@ -58,10 +59,30 @@ pub fn ingest_sorbet_declarations(
         &HashMap::new(),
         &mut out,
         &mut abstracts,
+        &mut sides,
         source,
     );
+    // The table holds one signature per (class, name), read by both the
+    // instance and the singleton side. A class that defines `def
+    // self.to_entity(record)` beside `def to_entity(lookup: nil)` has
+    // two different signatures under one key, and whichever was read
+    // last used to type both bodies: the class method's `record` came out
+    // as the instance method's keyword `lookup`. A signature that would
+    // apply to the wrong side is worse than none, so a name defined on
+    // both sides keeps neither and is inferred as before.
+    for (class, methods) in out.iter_mut() {
+        methods.retain(|name, _| {
+            !sides
+                .get(&(class.clone(), name.clone()))
+                .is_some_and(|(instance, singleton)| *instance && *singleton)
+        });
+    }
     (out, abstracts)
 }
+
+/// Which sides of a class define each method name: `(instance,
+/// singleton)`.
+type MethodSides = HashMap<(ClassId, Symbol), (bool, bool)>;
 
 /// `in_singleton_class` is true while walking a `class << self` body.
 /// The methods there are the enclosing class's SINGLETON methods even
@@ -76,6 +97,7 @@ fn walk(
     rbs_aliases: &crate::rbs::AliasTable,
     out: &mut HashMap<ClassId, HashMap<Symbol, Ty>>,
     abstracts: &mut HashMap<ClassId, std::collections::HashSet<Symbol>>,
+    sides: &mut MethodSides,
     source: &[u8],
 ) {
     // The `sig` immediately above a `def` is the one that applies to
@@ -107,7 +129,7 @@ fn walk(
                     // matter; an enclosing scope's aliases stay visible.
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, class.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, source);
+                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -120,7 +142,7 @@ fn walk(
                     let statements = body.body().iter().collect::<Vec<_>>();
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, module.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, source);
+                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -135,13 +157,23 @@ fn walk(
         if let Some(singleton) = statement.as_singleton_class_node() {
             if let Some(body) = singleton.body() {
                 if let Some(body) = body.as_statements_node() {
-                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, rbs_aliases, out, abstracts, source);
+                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, rbs_aliases, out, abstracts, sides, source);
                 }
             }
             pending = None;
             continue;
         }
         if let Some(def) = statement.as_def_node() {
+            if let Some(scope) = scope {
+                let entry = sides
+                    .entry((ClassId(Symbol::new(scope)), Symbol::new(constant_id_str(&def.name()))))
+                    .or_default();
+                if in_singleton_class || def.receiver().is_some() {
+                    entry.1 = true;
+                } else {
+                    entry.0 = true;
+                }
+            }
             if let (Some(sig), Some(scope)) = (pending.take(), scope) {
                 if !in_singleton_class && def.receiver().is_none() && sig_is_abstract(&statements[sig]) {
                     abstracts
