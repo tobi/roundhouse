@@ -99,7 +99,7 @@ pub(in crate::analyze) fn register(
         }
         // What a key holds is whatever the request carried: a scalar
         // String, an Array (`ids[]=1&ids[]=2`, a JSON array), a nested
-        // Parameters (`order[a]=1`), or nothing. The element reads answer
+        // Parameters (`order[a]=1`), an uploaded file, or nothing. The element reads answer
         // that whole union (`param_value_ty`); union dispatch resolves a
         // send on whichever arms answer it, so `params[:id].to_i` still
         // reads as the String arm's Integer while `params[:ids].map` and
@@ -113,7 +113,19 @@ pub(in crate::analyze) fn register(
         for m in ["[]=", "expect"] {
             p.instance_methods.insert(Symbol::from(m), Ty::Str);
         }
+        // The class-level configuration (`always_permitted_parameters`,
+        // `permit_all_parameters`, `action_on_unpermitted_parameters`).
         p.class_methods.insert(Symbol::from("new"), params_ty.clone());
+        p.class_methods.insert(
+            Symbol::from("always_permitted_parameters"),
+            Ty::Array { elem: Box::new(Ty::Str) },
+        );
+        p.class_methods.insert(
+            Symbol::from("always_permitted_parameters="),
+            Ty::Array { elem: Box::new(Ty::Str) },
+        );
+        p.class_methods.insert(Symbol::from("permit_all_parameters"), Ty::Bool);
+        p.class_methods.insert(Symbol::from("permit_all_parameters="), Ty::Bool);
         classes.insert(params_id, p);
         app_ctrl.class_methods.insert(Symbol::from("params"), params_ty);
     }
@@ -472,7 +484,8 @@ pub(in crate::analyze) fn register(
 }
 
 /// The type of a value read out of an `ActionController::Parameters`:
-/// `String | Array[untyped] | ActionController::Parameters`, plus nil
+/// `String | Array[untyped] | ActionController::Parameters |
+/// ActionDispatch::Http::UploadedFile` (a multipart file part), plus nil
 /// when the key may be absent. Request data is untyped at the element
 /// level (`Array[untyped]`): nothing in the request constrains it.
 pub(crate) fn param_value_ty(nilable: bool) -> Ty {
@@ -480,6 +493,7 @@ pub(crate) fn param_value_ty(nilable: bool) -> Ty {
         Ty::Str,
         Ty::Array { elem: Box::new(Ty::Untyped) },
         Ty::Class { id: ClassId(Symbol::from("ActionController::Parameters")), args: vec![] },
+        Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Http::UploadedFile")), args: vec![] },
     ];
     if nilable {
         variants.push(Ty::Nil);

@@ -385,6 +385,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         uploaded.instance_methods.insert(Symbol::from("content_type"), Ty::Str);
         uploaded.instance_methods.insert(Symbol::from("read"), Ty::Str);
         uploaded.instance_methods.insert(Symbol::from("size"), Ty::Int);
+        // The file behind the part, as Rack hands it over: the Tempfile
+        // (`params[:file].tempfile`) and its path on disk. The Tempfile
+        // is not modelled, so it is a gradual boundary.
+        uploaded.instance_methods.insert(Symbol::from("tempfile"), Ty::Untyped);
+        uploaded.instance_methods.insert(Symbol::from("path"), Ty::Str);
         uploaded.instance_methods.insert(Symbol::from("to_s"), Ty::Str);
         let uploaded_id = ClassId(Symbol::from("ActionDispatch::Http::UploadedFile"));
         uploaded.class_methods.insert(

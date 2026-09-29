@@ -102,3 +102,15 @@ fn parameters_read_as_a_hash_of_param_values() {
     );
     assert!(f.is_empty(), "hash reading dispatch failures: {f:?}");
 }
+
+/// A multipart part arrives as an `UploadedFile` under the same key a
+/// text field would: `params[:file].read`, `.tempfile`,
+/// `.original_filename`. The class-level strong-parameters switches
+/// (`always_permitted_parameters`) are read and restored around a block.
+#[test]
+fn an_element_read_may_be_an_uploaded_file_and_parameters_carry_class_config() {
+    let f = failures(
+        "  def index\n    a = params[:file].read\n    b = params[:file]&.tempfile\n    c = params[:file].original_filename\n    prev = ActionController::Parameters.always_permitted_parameters\n    ActionController::Parameters.always_permitted_parameters = prev + [\"x\"]\n    render plain: \"x\"\n  end",
+    );
+    assert!(f.is_empty(), "uploaded file / class config dispatch failures: {f:?}");
+}

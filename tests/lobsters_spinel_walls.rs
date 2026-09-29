@@ -372,13 +372,13 @@ fn a_record_query_option_projects_to_param_and_the_empty_hash_drops() {
 /// A defaulted param holds its default whenever a caller leaves it out:
 /// the signature is OPTIONAL and includes the default's type, not just
 /// what the passing callers hand it (a params element, `String | Array |
-/// Parameters | nil`, alone).
+/// Parameters | UploadedFile | nil`, alone).
 #[test]
 fn a_defaulted_helper_param_is_optional_and_includes_its_default() {
     let tree = emitted();
     let rbs = file(&tree, "app/controllers/replies_controller.rbs");
     assert!(
-        rbs.contains("?(String | Array[untyped] | ActionController::Parameters | bool | nil) tree"),
+        rbs.contains("?(String | Array[untyped] | ActionController::Parameters | ActionDispatch::Http::UploadedFile | bool | nil) tree"),
         "{rbs}"
     );
 }
