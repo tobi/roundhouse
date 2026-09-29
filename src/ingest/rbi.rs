@@ -74,7 +74,7 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) 
         let Some(file) = path.file_name().and_then(|f| f.to_str()) else { continue };
         let Some(stem) = file.strip_suffix(".rbi") else { continue };
         let Some((name, version)) = stem.split_once('@') else { continue };
-        if !matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled) {
+        if lock.is_in_repo(name) || !matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled) {
             continue;
         }
         let Some(locked) = lock.version_of(name) else { continue };
