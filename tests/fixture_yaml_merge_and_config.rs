@@ -81,6 +81,52 @@ fn a_scalar_ignore_names_one_label() {
     assert_eq!(labels, ["one"]);
 }
 
+/// A redefined anchor: an alias after the second `&fr` means that one,
+/// as in Psych. serde_yaml_ng on its own gives the redefinition the id of
+/// the next new anchor (`&wallet` here), so `*fr` inside `wallet` reached
+/// `wallet` itself and the parse recursed to its limit (core's
+/// `payments/disputes.yml`).
+#[test]
+fn an_alias_after_a_redefined_anchor_takes_the_latest_definition() {
+    let f = fixture(
+        "base: &base\n  kind: dispute\n\
+         fr: &fr\n  <<: *base\n  currency: EUR\n\
+         fr_two: &fr\n  <<: *base\n  currency: EUR2\n\
+         wallet: &wallet\n  <<: *fr\n  order: wallet\n\
+         wallet_won:\n  <<: *wallet\n  status: won\n",
+    )
+    .expect("ingest");
+    assert_eq!(field(&f, "wallet", "currency").as_deref(), Some("EUR2"));
+    assert_eq!(field(&f, "wallet_won", "currency").as_deref(), Some("EUR2"));
+    assert_eq!(field(&f, "wallet_won", "kind").as_deref(), Some("dispute"));
+    assert_eq!(field(&f, "fr", "currency").as_deref(), Some("EUR"));
+}
+
+/// `b: &x` merging `*x` inside itself: Psych registers the anchor as the
+/// node starts, so the merge is of the half-built row and adds nothing.
+/// serde_yaml_ng on its own recursed to its depth limit (core's
+/// `payments/transfers.yml`).
+#[test]
+fn an_alias_inside_its_own_anchor_merges_nothing() {
+    let f = fixture(
+        "a: &x\n  kind: first\n\
+         b: &x\n  <<: *x\n  status: scheduled\n\
+         c:\n  <<: *x\n  extra: 1\n",
+    )
+    .expect("ingest");
+    assert_eq!(field(&f, "b", "kind"), None);
+    assert_eq!(field(&f, "b", "status").as_deref(), Some("scheduled"));
+    assert_eq!(field(&f, "c", "status").as_deref(), Some("scheduled"));
+}
+
+/// A row that sets a key twice takes the last value, as Psych does,
+/// rather than failing the file.
+#[test]
+fn a_repeated_key_takes_its_last_value() {
+    let f = fixture("one:\n  shop: first\n  shop: second\n").expect("ingest");
+    assert_eq!(field(&f, "one", "shop").as_deref(), Some("second"));
+}
+
 /// A YAML file under `test/fixtures` that isn't label → fields is data a
 /// test reads, not a fixture set. It is reported as such rather than as
 /// a parse error of the file.

@@ -147,8 +147,8 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
     // the way Psych does before Rails sees the rows. The top level is
     // label → field map; scalars are stringified at load time so the IR
     // stays format-simple, and round-trip tests catch precision loss.
-    let mut doc: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&split.yaml).map_err(|e| IngestError::Parse {
+    let LastWins(mut doc) =
+        serde_yaml_ng::from_str(&rename_redefined_anchors(&split.yaml)).map_err(|e| IngestError::Parse {
             file: file.clone(),
             message: format!("yaml: {e}"),
         })?;
@@ -255,6 +255,180 @@ fn resolve_slot(s: &str, values: &[Expr]) -> SlotMatch {
         }
     }
     SlotMatch::None
+}
+
+/// Rewrite anchors and aliases so serde_yaml_ng resolves them as Psych
+/// does, in two cases it gets wrong.
+///
+/// A redefined anchor: YAML lets a document redefine one and an alias
+/// means the latest definition before it, but serde_yaml_ng numbers
+/// anchors by how many names it has seen, so a redefinition shares its
+/// number with the next new anchor and an alias reaches the wrong node.
+/// Each redefinition gets a name of its own (`fr__rh1`).
+///
+/// An alias inside its own anchor's node (`b: &x` then `<<: *x` under
+/// it, meant for an earlier `&x`): Psych registers the anchor as the
+/// node starts, so the alias is the half-built node itself and the merge
+/// adds nothing. serde_yaml_ng recurses to its depth limit instead. The
+/// alias becomes `{}`, the same empty merge.
+///
+/// Shopify core's `payments/disputes.yml` and `payments/transfers.yml`
+/// have one of each. Anchors and aliases are found as `&name` / `*name`
+/// after whitespace, a line start or a flow indicator, and a node as the
+/// lines indented deeper than the anchor's own line.
+fn rename_redefined_anchors(src: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = src.as_bytes();
+    let indent_at = |pos: usize| {
+        let start = src[..pos].rfind('\n').map_or(0, |p| p + 1);
+        bytes[start..].iter().take_while(|&&c| c == b' ').count()
+    };
+    // Where the node an anchor at `pos` names ends: the first later line,
+    // not blank or a comment, indented no deeper than the anchor's line.
+    let node_end = |pos: usize| {
+        let indent = indent_at(pos);
+        let mut at = src[pos..].find('\n').map_or(src.len(), |p| pos + p + 1);
+        while at < src.len() {
+            let line_end = src[at..].find('\n').map_or(src.len(), |p| at + p);
+            let line = &src[at..line_end];
+            let body = line.trim_start_matches(' ');
+            if !body.is_empty() && !body.starts_with('#') && line.len() - body.len() <= indent {
+                return at;
+            }
+            at = line_end + 1;
+        }
+        src.len()
+    };
+
+    struct Token {
+        start: usize,
+        end: usize,
+        anchor: bool,
+        node_end: usize,
+    }
+    let mut tokens: Vec<Token> = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'&' && b != b'*' {
+            continue;
+        }
+        let after_break = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'[' | b'{' | b',');
+        if !after_break {
+            continue;
+        }
+        let end = bytes[i + 1..]
+            .iter()
+            .position(|c| c.is_ascii_whitespace() || matches!(c, b',' | b'[' | b']' | b'{' | b'}'))
+            .map_or(bytes.len(), |p| i + 1 + p);
+        if end > i + 1 {
+            let anchor = b == b'&';
+            let node_end = if anchor { node_end(i) } else { 0 };
+            tokens.push(Token { start: i + 1, end, anchor, node_end });
+        }
+    }
+
+    let mut out = String::new();
+    let mut last = 0;
+    // name -> (times defined so far, where the latest definition's node ends)
+    let mut seen: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new();
+    for t in &tokens {
+        let name = &src[t.start..t.end];
+        let replacement = if t.anchor {
+            let entry = seen.entry(name).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = t.node_end;
+            (entry.0 > 1).then(|| format!("{name}__rh{}", entry.0 - 1))
+        } else {
+            match seen.get(name) {
+                // Inside the node its anchor is still defining.
+                Some(&(_, end)) if t.start < end => {
+                    out.push_str(&src[last..t.start - 1]);
+                    out.push_str("{}");
+                    last = t.end;
+                    continue;
+                }
+                Some(&(n, _)) if n > 1 => Some(format!("{name}__rh{}", n - 1)),
+                _ => None,
+            }
+        };
+        if let Some(r) = replacement {
+            out.push_str(&src[last..t.start]);
+            out.push_str(&r);
+            last = t.end;
+        }
+    }
+    if last == 0 {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    out.push_str(&src[last..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// A YAML value read the way Psych reads it: a key a mapping repeats
+/// takes its last value, where `serde_yaml_ng::Value` rejects the file.
+/// Rails fixtures repeat keys in practice (Shopify core has rows that
+/// set `shop:` twice), and Rails loads them.
+struct LastWins(serde_yaml_ng::Value);
+
+impl<'de> serde::Deserialize<'de> for LastWins {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
+        use serde_yaml_ng::Value;
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = LastWins;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any YAML value")
+            }
+            fn visit_bool<E>(self, b: bool) -> Result<LastWins, E> {
+                Ok(LastWins(Value::Bool(b)))
+            }
+            fn visit_i64<E>(self, i: i64) -> Result<LastWins, E> {
+                Ok(LastWins(Value::Number(i.into())))
+            }
+            fn visit_u64<E>(self, u: u64) -> Result<LastWins, E> {
+                Ok(LastWins(Value::Number(u.into())))
+            }
+            fn visit_f64<E>(self, f: f64) -> Result<LastWins, E> {
+                Ok(LastWins(Value::Number(f.into())))
+            }
+            fn visit_str<E>(self, s: &str) -> Result<LastWins, E> {
+                Ok(LastWins(Value::String(s.to_owned())))
+            }
+            fn visit_string<E>(self, s: String) -> Result<LastWins, E> {
+                Ok(LastWins(Value::String(s)))
+            }
+            fn visit_unit<E>(self) -> Result<LastWins, E> {
+                Ok(LastWins(Value::Null))
+            }
+            fn visit_none<E>(self) -> Result<LastWins, E> {
+                Ok(LastWins(Value::Null))
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<LastWins, D::Error> {
+                serde::Deserialize::deserialize(d)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<LastWins, A::Error> {
+                let mut seq = Vec::new();
+                while let Some(LastWins(v)) = a.next_element()? {
+                    seq.push(v);
+                }
+                Ok(LastWins(Value::Sequence(seq)))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<LastWins, A::Error> {
+                let mut map = serde_yaml_ng::Mapping::new();
+                while let Some((LastWins(k), LastWins(v))) = a.next_entry()? {
+                    map.insert(k, v);
+                }
+                Ok(LastWins(Value::Mapping(map)))
+            }
+            fn visit_enum<A: EnumAccess<'de>>(self, a: A) -> Result<LastWins, A::Error> {
+                let (tag, contents) = a.variant::<String>()?;
+                let LastWins(value) = contents.newtype_variant()?;
+                let tag = serde_yaml_ng::value::Tag::new(tag);
+                Ok(LastWins(Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue { tag, value }))))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// Resolve YAML merge keys, innermost first: an anchor is copied where
