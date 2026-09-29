@@ -34,7 +34,6 @@ pub mod thread_mattr;
 pub mod model;
 mod model_macros;
 pub mod on_load_reopen;
-pub mod pattern;
 pub mod prism;
 pub mod rbi;
 pub mod rate_limit;
