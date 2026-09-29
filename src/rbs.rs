@@ -880,6 +880,61 @@ fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
                 .cloned()
                 .ok_or_else(|| format!("unresolved RBS type alias: {written}"))
         }
+        // `singleton(Foo)` is the class OBJECT. `Ty` has no class-object
+        // type: a constant read types as the class itself and dispatch
+        // consults both sides, so the class stands for it. Read by name
+        // rather than through `map_class_instance`, since
+        // `singleton(String)` is the class String, not a string.
+        Node::ClassSingletonType(class_type) => Ok(Ty::Class {
+            id: ClassId(Symbol::new(&qualify_class_ref(&class_type.name(), ctx.scope))),
+            args: Vec::new(),
+        }),
+        // `bot` is what `raise` and `exit` return: no value at all.
+        Node::BottomType(_) => Ok(Ty::Bottom),
+        // `top` is the supertype of everything, on which RBS lets you
+        // call nothing. Nothing dispatches on it, so `untyped` answers
+        // the same without inventing a class.
+        Node::TopType(_) => Ok(Ty::Untyped),
+        // A method-level type variable (`[T] (T) -> T`). The analyzer
+        // does not instantiate a signature's variables per call, so the
+        // variable is an unmodelled boundary: `untyped`, not a class
+        // called `T`. Stated here so it is one place to change.
+        Node::VariableType(_) => Ok(Ty::Untyped),
+        // `A & B` is a value with both surfaces, and `Ty` has no
+        // intersection. `Kernel` (`Enumerable[X] & Kernel` is how the
+        // proto generator spells "a collection") and `Object` add
+        // nothing every value lacks, so they drop out; a single
+        // remaining member is the type. Two real members would claim
+        // one surface and reject calls to the other, so that is
+        // `untyped`.
+        Node::IntersectionType(inter) => {
+            let members: Vec<Ty> = inter
+                .types()
+                .iter()
+                .map(|n| ty_from_node(&n, ctx))
+                .collect::<Result<_, _>>()?;
+            let real: Vec<&Ty> = members
+                .iter()
+                .filter(|t| {
+                    !matches!(t, Ty::Class { id, .. }
+                        if matches!(id.0.as_str(), "Kernel" | "Object" | "BasicObject"))
+                })
+                .collect();
+            Ok(match real.as_slice() {
+                [only] => (*only).clone(),
+                [] => members.into_iter().next().unwrap_or(Ty::Untyped),
+                _ => Ty::Untyped,
+            })
+        }
+        // A literal type (`:draft`, `"x"`, `1`, `true`) is a value of
+        // its class.
+        Node::LiteralType(lit) => match lit.literal() {
+            Node::Integer(_) => Ok(Ty::Int),
+            Node::String(_) => Ok(Ty::Str),
+            Node::Symbol(_) => Ok(Ty::Sym),
+            Node::Bool(_) => Ok(Ty::Bool),
+            _ => Err("unsupported RBS literal type".to_string()),
+        },
         other => Err(format!(
             "unsupported RBS type node: {}",
             type_node_kind(other)
