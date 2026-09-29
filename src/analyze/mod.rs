@@ -433,6 +433,7 @@ impl Analyzer {
             // `serialize :col, coder: …` — the column reads back as the
             // coder's object, not the storage text.
             register_serialized_columns(&model.body, &mut cls.instance_methods);
+            register_money_columns(&model.body, &mut cls.instance_methods);
             // `attribute :name, :type` virtual attributes (ActiveModel) —
             // backed by something other than a schema column, so absent
             // from `model.attributes` above.
@@ -6857,6 +6858,40 @@ fn register_serialized_columns(body: &[ModelBodyItem], methods: &mut HashMap<Sym
         for name in args.iter().map_while(symbol_arg) {
             methods.insert(name.clone(), Ty::Untyped);
             methods.insert(Symbol::from(format!("{}=", name.as_str())), Ty::Untyped);
+        }
+    }
+}
+
+/// `money_column :amount, currency_column: :currency` and
+/// `money_bags(attributes: [:total_price, …])` -- the money gems' column
+/// DSLs. The schema holds a decimal/integer, the attribute reads back
+/// as the gem's `Money` / `MoneyBag` value object (`total_price.
+/// shop_money`), which is not modeled here: an unmodeled gem boundary,
+/// hence gradual rather than the storage number.
+fn register_money_columns(body: &[ModelBodyItem], methods: &mut HashMap<Symbol, Ty>) {
+    for item in body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+        let mut names: Vec<Symbol> = Vec::new();
+        match method.as_str() {
+            "money_column" => names.extend(args.iter().map_while(symbol_arg).cloned()),
+            "money_bags" => {
+                for arg in args {
+                    let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+                    for (k, v) in entries {
+                        if symbol_arg(k).is_some_and(|k| k.as_str() == "attributes") {
+                            if let ExprNode::Array { elements, .. } = &*v.node {
+                                names.extend(elements.iter().filter_map(symbol_arg).cloned());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => continue,
+        }
+        for name in names {
+            methods.insert(Symbol::from(format!("{}=", name.as_str())), Ty::Untyped);
+            methods.insert(name, Ty::Untyped);
         }
     }
 }
