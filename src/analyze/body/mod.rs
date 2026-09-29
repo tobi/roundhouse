@@ -481,6 +481,16 @@ impl<'a> BodyTyper<'a> {
                     {
                         return ty;
                     }
+                    // The constants Ruby itself defines on `Float` are Floats,
+                    // not classes named `Float::INFINITY`: `x < Float::INFINITY`
+                    // is a number comparison and `Float::INFINITY - 1` is
+                    // arithmetic. (An app's own `Float` would have answered
+                    // through `constants` above.)
+                    if written == "Float"
+                        && matches!(last.as_str(), "INFINITY" | "NAN" | "EPSILON" | "MAX" | "MIN")
+                    {
+                        return Ty::Float;
+                    }
                     // A nested class is not a `constants` entry: `Adapters::Vendor::TokenError`
                     // written inside `Auth` is `Auth::Adapters::Vendor::TokenError`, and the
                     // as-written path names no registered class. Answer with the expanded id
