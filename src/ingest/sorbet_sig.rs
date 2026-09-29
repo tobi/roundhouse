@@ -638,3 +638,9 @@ fn named_ty(name: &str) -> Ty {
         _ => Ty::Class { id: ClassId(Symbol::new(name)), args: Vec::new() },
     }
 }
+
+/// A Sorbet type expression (`T.nilable(Foo)`, `T::Array[String]`, ...)
+/// read as a `Ty`, for `T.let(x, Type)`.
+pub(super) fn sorbet_type_node(node: &Node<'_>) -> Option<Ty> {
+    sorbet_ty(node, true, &HashMap::new())
+}
