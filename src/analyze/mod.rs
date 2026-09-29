@@ -282,6 +282,31 @@ impl Analyzer {
             cls.class_methods.insert(Symbol::from("attribute_names"), Ty::Array { elem: Box::new(Ty::Str) });
             cls.class_methods.insert(Symbol::from("column_names"), Ty::Array { elem: Box::new(Ty::Str) });
             cls.class_methods.insert(Symbol::from("columns_hash"), Ty::Untyped);
+            // The rest of the schema-reflection surface every model has:
+            // `columns` is the list of `ActiveRecord::ConnectionAdapters::Column`
+            // objects (not modelled, so their elements stay untyped), the
+            // `sanitize_sql*` family builds a SQL fragment string, and
+            // `base_class` is the STI root, a class.
+            cls.class_methods.insert(Symbol::from("columns"), Ty::Array { elem: Box::new(Ty::Untyped) });
+            for sanitizer in ["sanitize_sql", "sanitize_sql_array", "sanitize_sql_for_conditions", "sanitize_sql_like"] {
+                cls.class_methods.insert(Symbol::from(sanitizer), Ty::Str);
+            }
+            cls.class_methods.insert(Symbol::from("base_class"), Ty::Class { id: ClassId(Symbol::from("Class")), args: vec![] });
+            let class_ty = Ty::Class { id: ClassId(Symbol::from("Class")), args: vec![] };
+            for family in ["descendants", "subclasses"] {
+                cls.class_methods.insert(Symbol::from(family), Ty::Array { elem: Box::new(class_ty.clone()) });
+            }
+            for text in ["quoted_table_name", "inheritance_column", "sti_name"] {
+                cls.class_methods.insert(Symbol::from(text), Ty::Str);
+            }
+            for flag in ["abstract_class?", "table_exists?"] {
+                cls.class_methods.insert(Symbol::from(flag), Ty::Bool);
+            }
+            // `ActiveModel::Name`, the `Type::Value`s and the enum table are
+            // objects the registry does not model.
+            for opaque in ["model_name", "attribute_types", "type_for_attribute", "defined_enums", "reset_column_information"] {
+                cls.class_methods.insert(Symbol::from(opaque), Ty::Untyped);
+            }
             // The rest of the class-side query surface — everything
             // from here to the `ids` seed below reads or writes the
             // database, so it is gated on `is_ar_model` for the same
