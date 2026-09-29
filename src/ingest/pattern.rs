@@ -403,6 +403,19 @@ fn compile_hash(
             compile(&pv, &value, out, file)?;
         }
     }
+    // `{}` is Ruby's empty-hash pattern. A nonempty pattern permits
+    // extra keys unless it has `**nil`, and `{ ** }` explicitly accepts
+    // any hash. Merely checking the receiver's class loses this special
+    // case and selects the empty arm for nonempty input.
+    if n_keys == 0 && h.rest().is_none() {
+        out.tests.push(mk(ExprNode::Send {
+            recv: Some(pairs.clone()),
+            method: Symbol::from("empty?"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        }));
+    }
     if let Some(rest) = h.rest() {
         if rest.as_no_keywords_parameter_node().is_some() {
             out.tests.push(send(send(pairs.clone(), "size", vec![]), "==", vec![int(n_keys)]));
