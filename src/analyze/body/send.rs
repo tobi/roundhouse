@@ -2555,7 +2555,24 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
         // ActiveSupport byte-size helpers — like the duration helpers,
         // they yield a Numeric-ish value we don't model structurally.
         "bytes" | "kilobytes" | "megabytes" | "gigabytes" | "terabytes"
-        | "petabytes" | "exabytes" => Ty::Untyped,
+        | "petabytes" | "exabytes" | "byte" | "kilobyte" | "megabyte"
+        | "gigabyte" | "terabyte" | "petabyte" | "exabyte" => Ty::Untyped,
+        // Integer's own protocol, which `Comparable`, `Numeric` and
+        // `Integer` give it and which the table above left out.
+        // `clamp` answers one of its bounds or the receiver: Integer for
+        // Integer bounds, the common shape (`page.clamp(1, 100)`).
+        "clamp" | "to_int" | "size" | "bit_length" | "gcd" | "lcm" | "div"
+        | "modulo" | "remainder" | "ceildiv" | "pow" | "ord" | "magnitude" => Ty::Int,
+        "between?" | "integer?" | "finite?" | "infinite?" | "nan?" | "allbits?"
+        | "anybits?" | "nobits?" => Ty::Bool,
+        "fdiv" => Ty::Float,
+        "divmod" | "digits" => Ty::Array { elem: Box::new(Ty::Int) },
+        "nonzero?" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
+        // `upto` / `downto` / `step` return the receiver with a block and
+        // an Enumerator without one; the two are not told apart here.
+        // `to_d` / `to_r` / `to_c` build BigDecimal / Rational / Complex,
+        // which the registry does not model.
+        "upto" | "downto" | "step" | "to_d" | "to_r" | "to_c" | "rationalize" | "coerce" => Ty::Untyped,
         // ActiveSupport Numeric duration helpers — `1.day`, `2.hours`,
         // `30.minutes`, etc. Each returns an ActiveSupport::Duration
         // instance; we don't model that structurally so propagate
