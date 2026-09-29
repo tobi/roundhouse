@@ -33,6 +33,50 @@ fn register_connection_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
             cls.instance_methods.entry(m.clone()).or_insert_with(|| ty.clone());
         }
     }
+    // Beyond what the runtime implements, the connection a program gets is
+    // Rails' `AbstractAdapter`, and code that reaches for the adapter
+    // (`quote_column_name` in a hand-built query, `transaction_open?` in a
+    // guard) calls its documented surface. Those names were reported as
+    // unknown methods of `ActiveRecord::Connection`. The runtime's own
+    // signatures above win where both speak; what is added has plain Ruby
+    // result types, and the adapter objects it hands out (the transaction
+    // manager, the pool, the current transaction) stay untyped.
+    let str = Ty::Str;
+    let untyped_rows = Ty::Array { elem: Box::new(Ty::Array { elem: Box::new(Ty::Untyped) }) };
+    let untyped_list = Ty::Array { elem: Box::new(Ty::Untyped) };
+    let cls = classes.entry(ClassId(Symbol::from("ActiveRecord::Connection"))).or_default();
+    for (name, ty) in [
+        ("quote_column_name", str.clone()),
+        ("quote_table_name", str.clone()),
+        ("quoted_date", str.clone()),
+        ("quoted_true", str.clone()),
+        ("quoted_false", str.clone()),
+        ("transaction_open?", Ty::Bool),
+        ("table_exists?", Ty::Bool),
+        ("column_exists?", Ty::Bool),
+        ("index_exists?", Ty::Bool),
+        ("active?", Ty::Bool),
+        ("supports_json?", Ty::Bool),
+        ("open_transactions", Ty::Int),
+        ("select_rows", untyped_rows),
+        ("select_values", untyped_list.clone()),
+        ("select_one", Ty::Untyped),
+        ("select_value", Ty::Untyped),
+        ("tables", Ty::Array { elem: Box::new(Ty::Str) }),
+        ("columns", untyped_list.clone()),
+        ("indexes", untyped_list),
+        ("insert", Ty::Untyped),
+        ("update", Ty::Int),
+        ("delete", Ty::Int),
+        ("transaction", Ty::Untyped),
+        ("current_transaction", Ty::Untyped),
+        ("transaction_manager", Ty::Untyped),
+        ("pool", Ty::Untyped),
+        ("raw_connection", Ty::Untyped),
+        ("database_version", Ty::Untyped),
+    ] {
+        cls.instance_methods.entry(Symbol::from(name)).or_insert(ty);
+    }
 }
 
 /// The class-side calls that run a block against a chosen database
