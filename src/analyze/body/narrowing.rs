@@ -48,6 +48,12 @@ pub(super) enum NarrowPred {
     IsTruthy(VarKey),
     /// Negated truthiness (`if !x` / `unless x`).
     IsFalsy(VarKey),
+    /// `x.present?` — Rails' `!blank?`. A present value is never nil, so the
+    /// then side drops the nil arm; the else side is only "nil, false or
+    /// empty", which says nothing certain about the type.
+    IsPresent(VarKey),
+    /// `x.blank?` / `!x.present?` — the inverse: the else side is non-nil.
+    IsBlank(VarKey),
 }
 
 pub(super) fn extract_narrowing(cond: &Expr) -> Option<NarrowPred> {
@@ -72,6 +78,8 @@ pub(super) fn extract_narrowing(cond: &Expr) -> Option<NarrowPred> {
         ExprNode::Send { recv: Some(target), method, args, .. } => {
             match (method.as_str(), args.as_slice()) {
                 ("nil?", []) => var_key(target).map(NarrowPred::IsNil),
+                ("present?", []) => var_key(target).map(NarrowPred::IsPresent),
+                ("blank?", []) => var_key(target).map(NarrowPred::IsBlank),
                 ("==", [arg]) if is_nil_lit(arg) => {
                     var_key(target).map(NarrowPred::IsNil)
                 }
@@ -127,6 +135,8 @@ fn negate_pred(p: NarrowPred) -> NarrowPred {
         NarrowPred::IsNotA(k, t) => NarrowPred::IsA(k, t),
         NarrowPred::IsTruthy(k) => NarrowPred::IsFalsy(k),
         NarrowPred::IsFalsy(k) => NarrowPred::IsTruthy(k),
+        NarrowPred::IsPresent(k) => NarrowPred::IsBlank(k),
+        NarrowPred::IsBlank(k) => NarrowPred::IsPresent(k),
     }
 }
 
@@ -220,6 +230,12 @@ pub(super) fn apply_narrowing(ctx: &Ctx, pred: &NarrowPred, then_branch: bool) -
                     remove_variant(current, ty)
                 }
             });
+        }
+        NarrowPred::IsPresent(k) | NarrowPred::IsBlank(k) => {
+            let is_present = matches!(pred, NarrowPred::IsPresent(_));
+            if is_present == then_branch {
+                narrow_binding(&mut new_ctx, k, |current| remove_nil(current));
+            }
         }
         NarrowPred::IsTruthy(k) | NarrowPred::IsFalsy(k) => {
             // Only narrow the truthy side. The falsy side would
