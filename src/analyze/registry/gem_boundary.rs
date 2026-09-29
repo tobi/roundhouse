@@ -60,9 +60,6 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
             !RUBY_CORE.contains(&top) && !classes.contains_key(*id)
         })
         .collect();
-    if fresh.is_empty() {
-        return;
-    }
 
     // Names resolve against the union of what was already known and
     // what is being added, so gem classes may refer to each other.
@@ -171,6 +168,63 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
         info.open = open.contains(&id);
         classes.insert(id, info);
     }
+
+    // A class the catalog or stdlib registers and an RBI also describes
+    // (`Rack::Utils`, `Rack::Mime`) gains the RBI's methods it lacks. The
+    // registered entry wins wherever both speak, and a class the app
+    // itself declares is never touched: its source is the whole truth.
+    let app_owned: HashSet<&ClassId> = app
+        .models
+        .iter()
+        .map(|m| &m.name)
+        .chain(app.controllers.iter().map(|c| &c.name))
+        .chain(app.library_classes.iter().map(|lc| &lc.name))
+        .collect();
+    let reopened: Vec<&ClassId> = declared
+        .keys()
+        .filter(|id| !fresh.contains(*id) && !app_owned.contains(*id) && classes.contains_key(*id))
+        .filter(|id| {
+            let name = id.0.as_str();
+            !RUBY_CORE.contains(&name.split("::").next().unwrap_or(name))
+        })
+        .collect();
+    for id in reopened {
+        let gem = &declared[id];
+        let scope = id.0.as_str();
+        let known = |c: &ClassId| classes.contains_key(c);
+        let mut add_instance = Vec::new();
+        let mut add_class = Vec::new();
+        for (name, ty) in &gem.instance_methods {
+            add_instance.push((name.clone(), prune_ty(ty, &|c| resolve_in(&known, c, scope))));
+        }
+        for (name, ty) in &gem.class_methods {
+            add_class.push((name.clone(), prune_ty(ty, &|c| resolve_in(&known, c, scope))));
+        }
+        if let Some(info) = classes.get_mut(id) {
+            for (name, ty) in add_instance {
+                info.instance_methods.entry(name).or_insert(ty);
+            }
+            for (name, ty) in add_class {
+                info.class_methods.entry(name).or_insert(ty);
+            }
+        }
+    }
+}
+
+/// `written` as a registered class, from `scope` outward.
+fn resolve_in(known: &dyn Fn(&ClassId) -> bool, written: &ClassId, scope: &str) -> Option<ClassId> {
+    if known(written) {
+        return Some(written.clone());
+    }
+    let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
+    while !parts.is_empty() {
+        let candidate = ClassId(Symbol::new(&format!("{}::{}", parts.join("::"), written.0.as_str())));
+        if known(&candidate) {
+            return Some(candidate);
+        }
+        parts.pop();
+    }
+    None
 }
 
 /// `ty` with every class name resolved through `resolve`; a name that
