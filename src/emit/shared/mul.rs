@@ -60,6 +60,10 @@ pub fn classify_mul<'a>(lhs: &'a Expr, rhs: &'a Expr) -> MulCase<'a> {
     let lhs_ty = lhs_ty.unwrap();
     let rhs_ty = rhs_ty.unwrap();
 
+    if super::operand::is_user_operator_receiver(Some(lhs_ty)) {
+        return MulCase::Unknown;
+    }
+
     match (lhs_ty, rhs_ty) {
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => MulCase::Numeric,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => MulCase::NumericPromote,
