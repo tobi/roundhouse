@@ -3261,6 +3261,15 @@ impl Analyzer {
     /// its parameters and so does the `MethodDef`, and for keyword
     /// arguments the two orders can differ.
     ///
+    /// `positional` is the parameter's index among the method's
+    /// POSITIONAL parameters, or `None` for a keyword or rest one. The
+    /// position fallback counts only the declared positional parameters:
+    /// the table is keyed by name alone, so a signature may belong to a
+    /// different arity (a concern's instance method and the class method
+    /// it contributes share a name), and reading a declared KEYWORD
+    /// parameter as the def's first positional one typed `variants` as
+    /// `bool`.
+    ///
     /// Used only where inference has nothing better — see the call
     /// sites. A declaration is worth reading where inference runs out,
     /// which for a parameter is the common case: its type is a fact
@@ -3270,7 +3279,7 @@ impl Analyzer {
         &self,
         class_id: &ClassId,
         method: &Symbol,
-        index: usize,
+        positional: Option<usize>,
         name: &Symbol,
     ) -> Option<Ty> {
         let cls = self.classes.get(class_id)?;
@@ -3279,7 +3288,13 @@ impl Analyzer {
             .get(method)
             .or_else(|| cls.class_methods.get(method))?;
         let Ty::Fn { params, .. } = ty else { return None };
-        let found = params.iter().find(|p| p.name == *name).or_else(|| params.get(index))?;
+        let found = params.iter().find(|p| p.name == *name).or_else(|| {
+            let n = positional?;
+            params
+                .iter()
+                .filter(|p| matches!(p.kind, crate::ty::ParamKind::Required | crate::ty::ParamKind::Optional))
+                .nth(n)
+        })?;
         (!matches!(found.ty, Ty::Var { .. } | Ty::Untyped)).then(|| found.ty.clone())
     }
 
@@ -3293,7 +3308,7 @@ impl Analyzer {
         &self,
         class_id: &ClassId,
         method: &Symbol,
-        index: usize,
+        positional: Option<usize>,
         name: &Symbol,
     ) -> bool {
         if !self.declared_signatures.contains(&(class_id.clone(), method.clone())) {
@@ -3308,7 +3323,13 @@ impl Analyzer {
         params
             .iter()
             .find(|p| p.name == *name)
-            .or_else(|| params.get(index))
+            .or_else(|| {
+                let n = positional?;
+                params
+                    .iter()
+                    .filter(|p| matches!(p.kind, crate::ty::ParamKind::Required | crate::ty::ParamKind::Optional))
+                    .nth(n)
+            })
             .is_some_and(|p| matches!(p.ty, Ty::Untyped))
     }
 
@@ -3322,15 +3343,19 @@ impl Analyzer {
         let observed = self.inferred_params.get(&key);
         let mut ctx = base.clone();
         ctx.class_side = matches!(method.receiver, crate::dialect::MethodReceiver::Class);
+        let mut positional_seen = 0usize;
         for (i, param) in method.params.iter().enumerate() {
-            if self.declared_untyped_param(class_id, &method.name, i, &param.name) {
+            let is_positional = !param.keyword && !param.rest && !param.from_keyword;
+            let positional = is_positional.then_some(positional_seen);
+            positional_seen += usize::from(is_positional);
+            if self.declared_untyped_param(class_id, &method.name, positional, &param.name) {
                 ctx.local_bindings.insert(param.name.clone(), Ty::Untyped);
                 continue;
             }
             let from_sites = observed.and_then(|v| v.get(i)).cloned();
             let seeded = param_ty_with_default(from_sites, param);
             let ty = prefer_declared(
-                self.declared_param_ty(class_id, &method.name, i, &param.name),
+                self.declared_param_ty(class_id, &method.name, positional, &param.name),
                 seeded,
             );
             if let Some(ty) = ty {
@@ -3366,7 +3391,7 @@ impl Analyzer {
             origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone())));
         let mut ctx = base.clone();
         for (i, name) in params.fields.keys().enumerate() {
-            if self.declared_untyped_param(class_id, action_name, i, name) {
+            if self.declared_untyped_param(class_id, action_name, Some(i), name) {
                 ctx.local_bindings.insert(name.clone(), Ty::Untyped);
                 continue;
             }
@@ -3377,7 +3402,7 @@ impl Analyzer {
                 .filter(|t| !matches!(t, Ty::Var { .. }))
                 .reduce(unify_param_ty);
             let ty = prefer_declared(
-                self.declared_param_ty(class_id, action_name, i, name),
+                self.declared_param_ty(class_id, action_name, Some(i), name),
                 observed,
             );
             if let Some(ty) = ty {
@@ -3389,12 +3414,12 @@ impl Analyzer {
         // index to read an observation from. The declaration is the
         // only source, which is the case the signature readers exist
         // for.
-        for (i, (name, _)) in kw_params.iter().enumerate() {
+        for (name, _) in kw_params.iter() {
             if ctx.local_bindings.contains_key(name) {
                 continue;
             }
             if let Some(ty) =
-                self.declared_param_ty(class_id, action_name, params.fields.len() + i, name)
+                self.declared_param_ty(class_id, action_name, None, name)
             {
                 ctx.local_bindings.insert(name.clone(), ty);
             }
