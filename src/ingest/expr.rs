@@ -755,13 +755,22 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                         parenthesized: true,
                     }
                 }
+                // `defined?(Foo)`, `defined?(Foo::Bar)`, `defined?(obj.meth)`,
+                // `defined?(super)` — the operand is carried into the
+                // marker Send as the expression it is, as the ivar form
+                // above does. Ruby does not evaluate it (it asks whether
+                // it COULD be), and the Ruby emitter prints the operand
+                // back inside `defined?(…)`, which is exactly that
+                // question.
                 None => {
-                    return Err(IngestError::Unsupported {
-                        file: file.into(),
-                        message: format!(
-                            "`defined?` only supports bareword targets today: {inner:?}"
-                        ),
-                    });
+                    let operand = ingest_expr(&inner, file)?;
+                    ExprNode::Send {
+                        recv: None,
+                        method: Symbol::from("defined?"),
+                        args: vec![operand],
+                        block: None,
+                        parenthesized: true,
+                    }
                 }
             }
         }
