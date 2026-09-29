@@ -13,7 +13,7 @@
 //! declares. A gem's methods are not the app's to declare, so they are
 //! carried here and only the analyzer's dispatch registry reads them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,11 +24,31 @@ use crate::ty::Ty;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GemBoundary {
     pub classes: HashMap<ClassId, GemClass>,
+    /// For each gem whose RBI was read: the qualified names of the
+    /// classes and modules it actually defines something in (methods,
+    /// constants, ancestry). A gem in here has told us exactly what it
+    /// owns; a bare namespace container (`module Shopify` opened only
+    /// to nest a class) owns nothing beside what it nests.
+    #[serde(default)]
+    pub namespaces: HashMap<String, BTreeSet<String>>,
 }
 
 impl GemBoundary {
     pub fn is_empty(&self) -> bool {
         self.classes.is_empty()
+    }
+
+    /// Whether `gem`'s RBI accounts for the constant `path`: it defines
+    /// it, defines something inside it, or `path` sits inside something
+    /// it defines. `None` when its RBI was not read: nothing is known
+    /// either way.
+    pub fn declares_path(&self, gem: &str, path: &str) -> Option<bool> {
+        let owned = self.namespaces.get(gem)?;
+        let inside = format!("{path}::");
+        if owned.contains(path) || owned.range(inside.clone()..).next().is_some_and(|n| n.starts_with(&inside)) {
+            return Some(true);
+        }
+        Some(path.match_indices("::").any(|(i, _)| owned.contains(&path[..i])))
     }
 }
 
