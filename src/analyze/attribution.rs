@@ -290,7 +290,9 @@ pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
         match &d.kind {
             DiagnosticKind::SendDispatchFailed { method, recv_ty } => {
                 if let Some(path) = recv_root_path(recv_ty) {
-                    if let Some(g) = crate::gems::gem_owning_constant(&census, &path) {
+                    if let Some(g) = crate::gems::gem_owning_constant_with(&census, &path, &|gem, path| {
+                        app.gem_boundary.declares_path(gem, path)
+                    }) {
                         return Some(g);
                     }
                 }

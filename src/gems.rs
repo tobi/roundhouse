@@ -546,6 +546,21 @@ fn camelize(gem: &str) -> String {
 /// The unknown gem (in `lock`) whose namespace `constant_path` sits
 /// under, if any: `Redcarpet::Markdown` → `redcarpet`.
 pub fn gem_owning_constant<'a>(census: &'a GemCensus, constant_path: &str) -> Option<&'a str> {
+    gem_owning_constant_with(census, constant_path, &|_, _| None)
+}
+
+/// [`gem_owning_constant`], refined by what gems have declared.
+/// `declares(gem, path)` answers whether the gem's own declarations
+/// (its RBI) account for the constant `path`, or `None` when they are
+/// unknown. A gem that has declared what it defines and does not
+/// account for `path` cannot own it, so the first-segment guess
+/// (`shopify-adt` -> `Shopify`) is not made for it: that guess is only
+/// for gems that cannot say.
+pub fn gem_owning_constant_with<'a>(
+    census: &'a GemCensus,
+    constant_path: &str,
+    declares: &dyn Fn(&str, &str) -> Option<bool>,
+) -> Option<&'a str> {
     let head = constant_path.split("::").next().unwrap_or(constant_path);
     // Two passes, so a full-name match always beats a first-segment
     // one: two house gems under the same prefix both answer to `Acme`,
@@ -562,7 +577,10 @@ pub fn gem_owning_constant<'a>(census: &'a GemCensus, constant_path: &str) -> Op
             }
             census
                 .unknown()
-                .find(|g| namespace_candidates(&g.name).iter().any(|c| c == head))
+                .find(|g| {
+                    namespace_candidates(&g.name).iter().any(|c| c == head)
+                        && declares(&g.name, constant_path) != Some(false)
+                })
         })
         .map(|g| g.name.as_str())
 }
