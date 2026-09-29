@@ -291,16 +291,27 @@ pub(super) fn ingest_model_with_enum_constants(
                 });
             }
             if let Some(sc) = stmt.as_singleton_class_node() {
-                match ingest_singleton_class_methods(&sc, file, &visibility) {
-                    Ok(methods) => {
+                match ingest_singleton_class_body(&sc, &owner, file, &visibility) {
+                    Ok(singleton) => {
                         let mut leading = leading;
                         let mut blank = leading_blank;
-                        for method in methods {
-                            let mut item = ModelBodyItem::Method {
+                        let items = singleton
+                            .methods
+                            .into_iter()
+                            .map(|method| ModelBodyItem::Method {
                                 method,
-                                leading_comments: std::mem::take(&mut leading),
+                                leading_comments: Vec::new(),
                                 leading_blank_line: false,
-                            };
+                            })
+                            .chain(singleton.class_body.into_iter().map(|expr| {
+                                ModelBodyItem::Unknown {
+                                    expr,
+                                    leading_comments: Vec::new(),
+                                    leading_blank_line: false,
+                                }
+                            }));
+                        for mut item in items {
+                            *item.leading_comments_mut() = std::mem::take(&mut leading);
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
@@ -1489,87 +1500,18 @@ fn enum_affixes(elements: &ruby_prism::NodeList<'_>, column: &str) -> (String, S
     (prefix, suffix)
 }
 
-/// Expand a model's `class << self … end` into the class methods it
-/// declares. Visibility has already been resolved in lexical order;
-/// unsupported singleton statements still fail rather than disappearing.
-fn ingest_singleton_class_methods(
+/// Expand the singleton body while retaining the enclosing visibility decisions.
+fn ingest_singleton_class_body(
     sc: &ruby_prism::SingletonClassNode<'_>,
+    owner: &ClassId,
     file: &str,
     visibility: &Visibility,
-) -> IngestResult<Vec<crate::dialect::MethodDef>> {
-    use crate::dialect::MethodReceiver;
-
-    let Some(body) = sc.body() else { return Ok(Vec::new()) };
-    let mut methods: Vec<crate::dialect::MethodDef> = Vec::new();
-    for statement in super::util::flatten_statements(body) {
-        let definition = visibility::definition(&statement).map(|d| d.as_node());
-        let stmt = definition.as_ref().unwrap_or(&statement);
-        if let Some(call) = stmt.as_call_node() {
-            if visibility::marker(&call) {
-                continue;
-            }
-            // `deprecate(name: { message: …, deprecator: … })` — pure
-            // call-site metadata (ActiveSupport::Deprecation wraps the
-            // method to warn; callers still dispatch through it), no
-            // singleton-scope state to carry. `ChangeOrderRequest`,
-            // `ChangeOrderPackage`, and `PotentialChangeOrder` all
-            // deprecate a class method exactly this way. Dropped like
-            // an unknown-call annotation elsewhere, rather than
-            // refused — refusing killed the whole model's ingest for
-            // one annotation on an otherwise-modeled class method.
-            if call.receiver().is_none()
-                && call.block().is_none()
-                && constant_id_str(&call.name()) == "deprecate"
-            {
-                continue;
-            }
-            // `alias_method :new_name, :old_name` — the other call
-            // shape the corpus uses here (`PaymentApplicationMarkup
-            // LineItem` aliases `vattr` to `virtual_attribute`).
-            // Unlike the marker/annotation cases above, this DOES need
-            // modeling: `vattr` is called from sibling class methods.
-            // Clone the already-ingested target — `alias_method`
-            // always follows its target in this corpus — under the
-            // new name. A target ingested outside this singleton
-            // block, or not found, falls through to the refusal below
-            // rather than silently doing nothing.
-            if call.receiver().is_none()
-                && call.block().is_none()
-                && constant_id_str(&call.name()) == "alias_method"
-            {
-                if let Some(args) = call.arguments() {
-                    let args: Vec<_> = args.arguments().iter().collect();
-                    if let [new_name, old_name] = &args[..] {
-                        if let (Some(new_name), Some(old_name)) =
-                            (symbol_value(new_name), symbol_value(old_name))
-                        {
-                            if let Some(target) =
-                                methods.iter().find(|m| m.name.as_str() == old_name)
-                            {
-                                let mut alias = target.clone();
-                                alias.name = Symbol::from(new_name);
-                                alias.name_span = Span::synthetic();
-                                visibility.apply(&statement, &mut alias);
-                                methods.push(alias);
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let Some(def) = stmt.as_def_node() else {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: format!("unsupported statement inside `class << self`: {stmt:?}"),
-            });
-        };
-        let mut method = ingest_method(&def, file)?;
-        method.receiver = MethodReceiver::Class;
-        visibility.apply(&statement, &mut method);
-        methods.push(method);
-    }
-    Ok(methods)
+) -> IngestResult<super::singleton_class::SingletonBody> {
+    super::singleton_class::ingest_singleton_body(sc, owner, file, &|def| {
+        let mut method = ingest_method(def, file)?;
+        visibility.apply(&def.as_node(), &mut method);
+        Ok(method)
+    })
 }
 
 pub(super) fn ingest_method(
@@ -2680,7 +2622,7 @@ mod singleton_visibility_tests {
     fn a_real_statement_in_a_singleton_block_still_refuses() {
         let err = ingest(
             "class Thing < ApplicationRecord\n  \
-             class << self\n    attr_accessor :cache\n  end\nend\n",
+             class << self\n    memoize_everything :cache\n  end\nend\n",
         );
         assert!(err.is_err(), "an unmodeled singleton statement is still an error: {err:?}");
     }

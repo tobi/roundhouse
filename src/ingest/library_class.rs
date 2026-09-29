@@ -1186,7 +1186,7 @@ impl DeclBody {
 /// `include T::Struct::ActsAsComparable` is deliberately NOT here: it
 /// gives a struct its `==`, which is behavior, and it goes when the
 /// struct itself is lowered.
-fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
+pub(super) fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
     let name = call.name();
     if !matches!(constant_id_str(&name), "extend" | "include") {
         return false;
@@ -1232,7 +1232,7 @@ fn constant_path_written(path: &ruby_prism::ConstantPathNode<'_>) -> String {
 /// constructor and a reader, not an annotation, and deleting it would
 /// leave a class that cannot be built. Those need lowering, not
 /// dropping.
-const SORBET_ANNOTATIONS: &[&str] = &[
+pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "sig",
     "abstract!",
     "interface!",
@@ -1979,7 +1979,7 @@ pub(super) fn alias_keyword_name(node: &ruby_prism::Node<'_>) -> Option<String> 
         .map(|call| constant_id_str(&call.name()).to_string())
 }
 
-fn alias_source(
+pub(super) fn alias_source(
     call: &ruby_prism::CallNode<'_>,
     methods: &[MethodDef],
     class_side: bool,
