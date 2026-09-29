@@ -969,7 +969,8 @@ fn enum_label_values(
     match constant_id_str(&call.name()) {
         // `%w[ invisible nothing ].index_by(&:itself)`,
         // `STATUSES.index_with(&:itself)` — the labels ARE the stored
-        // strings. (`&:to_s` on symbols or strings is the same string.)
+        // strings. (`&:to_s`/`&:to_sym` on symbols or strings name the
+        // same label.)
         "index_by" | "index_with" if is_identity_proc(&call) => {
             Ok(labels().map(identity))
         }
@@ -979,8 +980,10 @@ fn enum_label_values(
     }
 }
 
-/// `&:itself` / `&:to_s` as the only argument: the block maps a label
-/// to its own string.
+/// `&:itself` / `&:to_s` / `&:to_sym` as the only argument: the block maps
+/// a label to itself. (`["draft", "active"].index_by(&:to_sym)` keys by
+/// symbol and stores the string; the label text and the stored value are
+/// the same either way.)
 fn is_identity_proc(call: &ruby_prism::CallNode<'_>) -> bool {
     let Some(block) = call.block().and_then(|b| b.as_block_argument_node()) else {
         return false;
@@ -988,7 +991,7 @@ fn is_identity_proc(call: &ruby_prism::CallNode<'_>) -> bool {
     block
         .expression()
         .and_then(|e| symbol_value(&e))
-        .is_some_and(|s| s == "itself" || s == "to_s")
+        .is_some_and(|s| s == "itself" || s == "to_s" || s == "to_sym")
 }
 
 /// `{ |x| [x, x.to_s] }` / `{ |x| [x, x] }`: a `to_h` block pairing each
