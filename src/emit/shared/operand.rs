@@ -50,6 +50,19 @@ pub fn is_user_operator_receiver(t: Option<&Ty>) -> bool {
     matches!(t, Some(Ty::Class { id, .. }) if id.0.as_str() != "Set")
 }
 
+/// An ordered number: `Int`, `Float`, `Numeric`/`BigDecimal`/`Rational`, or
+/// a union whose every arm is one (`Float | Integer`, `Numeric | Integer`).
+/// Ruby's arithmetic and comparison are defined between any two of them, so
+/// for these the classifiers treat the pair like `Int` and `Float`.
+pub fn is_number(ty: &Ty) -> bool {
+    match ty {
+        Ty::Int | Ty::Float => true,
+        Ty::Class { id, .. } => matches!(id.0.as_str(), "Numeric" | "BigDecimal" | "Rational"),
+        Ty::Union { variants } => !variants.is_empty() && variants.iter().all(is_number),
+        _ => false,
+    }
+}
+
 /// Only the lhs is checked: `Array - Set` raises `TypeError` in Ruby.
 pub fn is_set_receiver(t: Option<&Ty>) -> bool {
     matches!(t, Some(Ty::Class { id, .. }) if id.0.as_str() == "Set")

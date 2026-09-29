@@ -46,6 +46,9 @@ pub fn classify_div_pow(lhs: &Expr, rhs: &Expr) -> DivPowCase {
     match (lhs_ty, rhs_ty) {
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => DivPowCase::Numeric,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => DivPowCase::NumericPromote,
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => {
+            DivPowCase::NumericPromote
+        }
         _ => DivPowCase::Incompatible,
     }
 }
