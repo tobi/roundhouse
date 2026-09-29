@@ -1194,6 +1194,12 @@ end
         }
     }
 
+    if vfs.is_dir(&models_dir) {
+        let files = read_rb_files(vfs, &models_dir)?;
+        app.generated_helper_methods =
+            super::generated_helpers::ingest_generated_helpers(&app, vfs, dir, &files);
+    }
+
     let routes_path = dir.join("config/routes.rb");
     if vfs.exists(&routes_path) {
         if let Some(source) = read_or_ledger(vfs, &routes_path)? {

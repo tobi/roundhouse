@@ -143,6 +143,15 @@ pub struct App {
     /// that live on the CONTROLLER.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub view_visible_controller_methods: BTreeSet<Symbol>,
+    /// Methods of a helper object the app builds at load time from a
+    /// YAML table (`WebUrlHelpers = WebUrlHelpersFactory.create(
+    /// YAML.load_file(…)["paths"])`), keyed by the constant. The names
+    /// come from the table's keys and the factory's `define_method`
+    /// suffixes — see [`crate::ingest::generated_helpers`]. A registry
+    /// fact for the analyzer only: the constant's initializer still
+    /// builds the object at runtime, so nothing is emitted for it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub generated_helper_methods: BTreeMap<ClassId, BTreeSet<Symbol>>,
     /// Model class names a `GlobalID::Locator.locate(gid, only: K)`
     /// call site names, collected by [`crate::lower::global_id_locate`]
     /// as it rewrites each site to a per-model `locate_<model>`.
@@ -684,6 +693,7 @@ impl App {
             inferred_method_params: HashMap::new(),
             helper_method_index: HashMap::new(),
             view_visible_controller_methods: BTreeSet::new(),
+            generated_helper_methods: BTreeMap::new(),
             global_id_locate_models: BTreeSet::new(),
             attachable_unsigned_models: Vec::new(),
             load_hook_class_macros: Vec::new(),
