@@ -1011,6 +1011,16 @@ impl<'a> BodyTyper<'a> {
                         if let Some(ty) = self.lookup_in_module(module_id, method) {
                             return subst(&ty);
                         }
+                        // A module the app never registered (a gem's
+                        // `ApiVersioning::ApiClient`) contributes methods
+                        // this walk cannot see, class-side ones too
+                        // (`mixes_in_class_methods`, an `included` hook that
+                        // extends). Ruby's own and the frameworks' modules
+                        // are known ground: their absence from the registry
+                        // is not evidence of unknown members.
+                        if !self.classes().contains_key(module_id) && !is_known_module(module_id) {
+                            unknown_named_ancestor = true;
+                        }
                     }
                     current_id = cls.parent.as_ref();
                 }
@@ -2658,4 +2668,14 @@ pub(super) fn object_protocol_method(
         "<=>" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
         _ => return None,
     })
+}
+
+/// Modules of Ruby itself and of the frameworks the analyzer models by
+/// convention; an `include` of one that is not in the registry adds no
+/// unknown methods.
+fn is_known_module(id: &ClassId) -> bool {
+    let root = id.0.as_str().trim_start_matches("::");
+    let root = root.split("::").next().unwrap_or(root);
+    super::RUBY_TOP_LEVEL.contains(&root)
+        || matches!(root, "ActiveSupport" | "ActiveModel" | "ActiveRecord" | "ActiveJob" | "ActionView" | "ActionController" | "ActionDispatch" | "ActionMailer" | "Rails" | "T" | "Sorbet")
 }
