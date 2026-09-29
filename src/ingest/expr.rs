@@ -1861,6 +1861,10 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // hit — stops them from inflating every descent frame.
             ingest_multi_write(&n.as_multi_write_node().unwrap(), span, file)?
         }
+        // `case … in` pattern matching: see `pattern.rs`.
+        n if n.as_case_match_node().is_some() => {
+            return super::pattern::ingest_case_match(&n.as_case_match_node().unwrap(), span, file);
+        }
         n if n.as_case_node().is_some() => {
             // `case scrutinee when :a, :b then body ... [else else_body] end`
             // Each WhenNode contributes one Arm per pattern (multi-pattern
