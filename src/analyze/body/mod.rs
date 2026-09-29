@@ -671,13 +671,23 @@ impl<'a> BodyTyper<'a> {
                     }
                     if let Some(name) = &rc.binding {
                         // An unregistered class (a gem's error) stays StandardError: typed as itself, even `e.message` would fail.
-                        let rescued = match rc.classes.as_slice() {
-                            [c] => match &c.ty {
-                                Some(ty @ Ty::Class { id, .. }) if self.classes().contains_key(id) => Some(ty.clone()),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
+                        // `rescue A, B => e` binds the union: `e` is one of them. One unregistered
+                        // class in the list makes the whole binding StandardError again.
+                        let mut rescued: Option<Ty> = None;
+                        for c in rc.classes.iter() {
+                            match &c.ty {
+                                Some(ty @ Ty::Class { id, .. }) if self.classes().contains_key(id) => {
+                                    rescued = Some(match rescued.take() {
+                                        Some(prev) => union_of(prev, ty.clone()),
+                                        None => ty.clone(),
+                                    });
+                                }
+                                _ => {
+                                    rescued = None;
+                                    break;
+                                }
+                            }
+                        }
                         let mut inner = ctx.clone();
                         inner.local_bindings.insert(
                             name.clone(),
