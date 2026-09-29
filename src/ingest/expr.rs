@@ -227,7 +227,7 @@ fn absurd_raise(span: Span, value: Expr) -> ExprNode {
             span,
             ExprNode::Send {
                 recv: Some(Expr::new(
-                    span,
+                    Span::synthetic(),
                     ExprNode::Const { path: vec![Symbol::from("TypeError")] },
                 )),
                 method: Symbol::from("new"),

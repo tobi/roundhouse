@@ -63,18 +63,24 @@ registries:
   `yield` renders content and types `Str` (the Yield arm in
   `src/analyze/body/mod.rs`).
 - `super(...)` parent-method tracking — typed `Ty::Untyped`.
-- Constants are partially covered. Module-level frozen Hash/Array
-  constants in framework Ruby are tracked (`parse_module_constants`
-  in `src/runtime_src.rs`), and `Analyzer::build_constant_registry`
-  builds a whole-app name→type registry from `CONST = …` assignments
-  in model/controller class bodies — with its own small fixpoint, so
-  a constant defined in terms of another resolves once its dependency
-  does. Constant shapes outside those channels still fall through.
+- Constants remain partially covered. Rubydex indexes the Ruby files in
+  `App.sources` once. It also indexes Ruby sources in `runtime/ruby/`
+  and `runtime/spinel/`, plus RBS declarations for Ruby core classes.
+  It resolves each source reference in its Ruby lexical scope, without
+  invented suffix aliases.
+  Roundhouse keeps compact answers keyed by source position and
+  releases the Rubydex graph before its typing passes.
+  `Analyzer::build_constant_registry` infers each constant's value
+  type and stores it under its Rubydex declaration ID. A small
+  fixpoint resolves dependencies between those values.
+  Generated expressions use the typed local scope because they have
+  no source reference.
+- The analyzer reports an error for an unresolved source constant.
+  It does not select another class by a matching name suffix.
+  `parse_module_constants` types literal constants in framework Ruby.
 
-Each gap lands when a fixture forces it; the analyzer never fails, it
-either leaves a `Ty::Var(n)` placeholder (inference gap, surfaced as
-an `UnresolvedType` Warning) or a `Ty::Untyped` (RBS-declared gradual
-escape, surfaced as a `GradualUntyped` Warning).
+Other inference gaps leave `Ty::Var(n)` or RBS `Ty::Untyped`.
+The analyzer reports these as warnings.
 
 ### Type variants worth knowing about
 

@@ -122,6 +122,46 @@ fn a_lambda_target_before_action_gates_the_action_it_guards() {
         .assert_passes();
 }
 
+/// An inner class wins over another class with the same last segment.
+#[test]
+fn a_bare_inner_class_runs_after_resolution() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/ui/selector.rb",
+            "module UI\n  class Selector\n    class Mode\n      def self.value\n        \"selected\"\n      end\n    end\n    def self.value\n      Mode.value\n    end\n  end\n  class Other\n    class Mode\n    end\n  end\nend\n",
+        )
+        .run_ruby("raise 'wrong inner class' unless UI::Selector.value == 'selected'")
+        .assert_passes();
+}
+
+/// `class UI::ExplicitSelector` does not lexically include `UI`, even
+/// though emitted Ruby nests it there. Keep a top-level same-suffix class
+/// distinct from the one inside UI after source-backed resolution.
+#[test]
+fn a_compact_class_uses_its_source_lexical_constant() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/ui/explicit_selector.rb",
+            "class SourceScopeResolution\n  def self.value\n    \"top-level\"\n  end\nend\nmodule UI\n  class SourceScopeResolution\n    def self.value\n      \"nested\"\n    end\n  end\nend\nclass UI::ExplicitSelector\n  def self.value\n    SourceScopeResolution.value\n  end\nend\n",
+        )
+        .run_ruby(
+            "raise 'wrong lexical constant' unless UI::ExplicitSelector.value == 'top-level'",
+        )
+        .assert_passes();
+}
+
+/// The runtime defines this exception in `active_support_ext.rb`.
+#[test]
+fn framework_exception_resolves_from_real_runtime_source() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/signature_probe.rb",
+            "class SignatureProbe\n  def self.call\n    begin\n      raise ActiveSupport::MessageVerifier::InvalidSignature\n    rescue ActiveSupport::MessageVerifier::InvalidSignature\n      \"handled\"\n    end\n  end\nend\n",
+        )
+        .run_ruby("raise 'signature error was not caught' unless SignatureProbe.call == 'handled'")
+        .assert_passes();
+}
+
 /// #139 typed `Model.human_attribute_name` as a String, which took the
 /// call from an error to clean, but no runtime defines it, so every
 /// page rendering the form raises `undefined method

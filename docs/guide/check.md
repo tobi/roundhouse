@@ -116,6 +116,10 @@ look at an unfamiliar codebase.
 `ROUNDHOUSE_INGEST_SURVEY=1` in the environment is the same as
 `--continue`; useful where the command line is not yours to edit.
 
+## Measure a slow check
+
+Set `ROUNDHOUSE_TIMINGS=1` before `roundhouse check`. The command prints elapsed time for ingest, analysis, diagnosis, and each inference round. It also prints peak RSS on macOS and Linux. The command does not print measurements by default.
+
 ## A clean run
 
 The Rails Guides store — the app the *Getting Started with Rails*

@@ -2,7 +2,7 @@
 name = "roundhouse"
 version = "2026.9.18"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 authors = ["Sam Ruby <sam@rubyred.us>"]
 description = "Rails as a specification; deployment is a build flag"
 license = "MIT OR Apache-2.0"
@@ -30,6 +30,10 @@ indexmap = { version = "2", features = ["serde"] }
 ruby-prism = "1.9.0"
 ruby-rbs = "0.3"
 yaml-rust2 = { version = "0.13.0", default-features = false }
+rubydex = "=0.2.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 
