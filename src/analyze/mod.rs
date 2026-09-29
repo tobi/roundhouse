@@ -5954,6 +5954,26 @@ pub(crate) fn is_setter_name(name: &Symbol) -> bool {
         && n.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
 }
 
+/// A body that is nothing but `raise NotImplementedError` — the abstract
+/// hook a concern or base class declares for its includer or subclass
+/// to implement (`def set_class; raise NotImplementedError, "..."; end`).
+fn is_abstract_body(body: &Expr) -> bool {
+    match &*body.node {
+        ExprNode::Seq { exprs } => exprs.len() == 1 && is_abstract_body(&exprs[0]),
+        ExprNode::Send { recv: None, method, args, .. } if matches!(method.as_str(), "raise" | "fail") => {
+            let names_it = |e: &Expr| match &*e.node {
+                ExprNode::Const { path } => path.last().is_some_and(|s| s.as_str() == "NotImplementedError"),
+                ExprNode::Send { recv: Some(r), method, .. } if method.as_str() == "new" => {
+                    matches!(&*r.node, ExprNode::Const { path } if path.last().is_some_and(|s| s.as_str() == "NotImplementedError"))
+                }
+                _ => false,
+            };
+            args.first().is_some_and(names_it)
+        }
+        _ => false,
+    }
+}
+
 fn effective_return_ty(body: &Expr) -> Option<Ty> {
     let mut tys: Vec<Ty> = Vec::new();
     let mut saw_return = false;
@@ -5977,6 +5997,12 @@ fn effective_return_ty(body: &Expr) -> Option<Ty> {
         // which is what "it returns something we can't name" means.
         if saw_return && matches!(body.ty, Some(Ty::Bottom)) {
             return Some(crate::analyze::body::unknown());
+        }
+        // An abstract hook returns whatever its implementation does, not
+        // `Bottom`: harvesting that made every call on the result (`set_class.new`)
+        // a dispatch failure on an unreachable type.
+        if !saw_return && is_abstract_body(body) {
+            return Some(Ty::Untyped);
         }
         // Nothing usable collected — preserve prior behavior so the
         // `Var`/`Bottom`/`None` fallbacks downstream are unchanged.
