@@ -757,7 +757,46 @@ fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
     }
 }
 
+/// Sorbet's `T::` generics and `T::Boolean`, read as the types they
+/// are. Sorbet's RBS-comment reader accepts them next to plain RBS
+/// (`#: (T::Array[Foo], T::Boolean) -> T::Hash[Symbol, Foo]`), and
+/// Shopify core writes ~2,800 of them, so a signature reader that took
+/// `T::Array` for a class of that name typed a list as an object with
+/// no `each`, and `T::Boolean` as a class nobody defines.
+///
+/// `None` when `name` is not one of them (or has the wrong arity), so
+/// the caller falls back to an ordinary class reference. Shared by the
+/// RBS reader and the `sig { … }` reader so the two spell the same
+/// type the same way.
+pub(crate) fn sorbet_generic_ty(name: &str, args: &[Ty]) -> Option<Ty> {
+    let plain = |id: &str| Ty::Class { id: ClassId(Symbol::new(id)), args: args.to_vec() };
+    Some(match (name, args) {
+        ("T::Boolean", []) => Ty::Bool,
+        ("T::Array", [elem]) => Ty::Array { elem: Box::new(elem.clone()) },
+        ("T::Hash", [key, value]) => Ty::Hash {
+            key: Box::new(key.clone()),
+            value: Box::new(value.clone()),
+        },
+        ("T::Set", [_]) => plain("Set"),
+        ("T::Range", [_]) => plain("Range"),
+        ("T::Enumerable", [_]) => plain("Enumerable"),
+        ("T::Enumerator", [_]) => plain("Enumerator"),
+        // `T::Class[Foo]` is the class object whose instances are Foo.
+        // `Ty` has no class-object type — a constant read types as the
+        // class itself (`Ty::Class`), and dispatch consults both sides
+        // — so the argument's class stands for it, the same reading
+        // `singleton(Foo)` gets.
+        ("T::Class", [Ty::Class { .. }]) => args[0].clone(),
+        ("T::Class", [_]) => plain("Class"),
+        ("T::Module", [_]) => plain("Module"),
+        _ => return None,
+    })
+}
+
 fn map_class_instance(name: &str, args: Vec<Ty>) -> Ty {
+    if let Some(ty) = sorbet_generic_ty(name, &args) {
+        return ty;
+    }
     match (name, args.as_slice()) {
         ("Integer", []) => Ty::Int,
         ("Float", []) => Ty::Float,

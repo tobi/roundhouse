@@ -604,14 +604,7 @@ fn sorbet_ty(
                 .iter()
                 .map(|a| sorbet_ty(&a, self_is_instance, aliases))
                 .collect::<Option<_>>()?;
-            return match (container.as_str(), args.as_slice()) {
-                ("T::Array", [elem]) => Some(Ty::Array { elem: Box::new(elem.clone()) }),
-                ("T::Hash", [key, value]) => Some(Ty::Hash {
-                    key: Box::new(key.clone()),
-                    value: Box::new(value.clone()),
-                }),
-                _ => None,
-            };
+            return crate::rbs::sorbet_generic_ty(&container, &args);
         }
         // `T.nilable(X)`, `T.any(A, B)`, `T.untyped`
         let receiver = index.receiver()?;
