@@ -2471,6 +2471,23 @@ fn splice_concerns_into_controllers(app: &mut App) {
         filters.extend(methods);
         controller.body = filters;
     }
+    // The `sig` above a module's `def` describes the COPY as well: the
+    // includer's method is that `def`, and inference over the copy would
+    // otherwise replace the declared return with whatever the body
+    // happens to end in.
+    for (controller, origins) in &spliced_origin {
+        for (name, module) in origins {
+            let Some(sig) = app.rbs_signatures.get(module).and_then(|m| m.get(name)).cloned()
+            else {
+                continue;
+            };
+            app.rbs_signatures
+                .entry(controller.clone())
+                .or_default()
+                .entry(name.clone())
+                .or_insert(sig);
+        }
+    }
     app.concern_spliced_actions = spliced_origin;
 }
 
