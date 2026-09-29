@@ -43,11 +43,74 @@ pub(in crate::analyze) fn register(
     // Hardcoded ApplicationController-ish surface. Real inheritance chains
     // and per-controller overrides land when a fixture forces them.
     let mut app_ctrl = ClassInfo::default();
-    let params_ty = Ty::Hash {
-        key: Box::new(Ty::Sym),
-        value: Box::new(Ty::Str),
-    };
-    app_ctrl.class_methods.insert(Symbol::from("params"), params_ty);
+    // `params` is an `ActionController::Parameters` — NOT a Hash. It
+    // answers the Hash-like reads (`[]`, `fetch`, `key?`, `to_h`), the
+    // strong-parameters chain (`require`/`permit`/`expect`, each
+    // answering a Parameters again or the value under the key), and the
+    // typed_parameters gem's `fetch_type`/`require_type`/`require_hash`/
+    // `permit_types`. What a key holds is whatever the request carried
+    // (String, Array, nested Parameters, nil), so element reads are
+    // gradual; the chain methods keep the receiver's class.
+    {
+        let params_id = ClassId(Symbol::from("ActionController::Parameters"));
+        let params_ty = Ty::Class { id: params_id.clone(), args: vec![] };
+        let mut p = ClassInfo::default();
+        let hash_str_untyped = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) };
+        for m in [
+            // strong parameters
+            "permit", "permit!", "except", "slice", "merge", "merge!", "reverse_merge",
+            "reverse_merge!", "with_defaults", "with_defaults!", "deep_dup", "dup", "clone",
+            "compact", "compact_blank", "select", "reject", "filter", "keep_if", "delete_if",
+            "transform_values", "transform_keys", "deep_transform_keys", "extract!", "update",
+            "slice!", "except!",
+            // typed_parameters: answers the Parameters restricted to the schema
+            "permit_types", "require_hash", "require",
+        ] {
+            p.instance_methods.insert(Symbol::from(m), params_ty.clone());
+        }
+        for m in [
+            // typed_parameters answers the value under a key, typed by the schema
+            // argument: gradual until that schema is modeled.
+            "delete", "required", "fetch_type", "require_type", "required_type",
+            "instance_variable_get",
+        ] {
+            p.instance_methods.insert(Symbol::from(m), Ty::Untyped);
+        }
+        for m in [
+            "key?", "has_key?", "include?", "member?", "empty?", "blank?", "present?",
+            "permitted?", "nil?", "any?", "none?", "all?", "eql?", "==", "!", "!=",
+            "value?", "has_value?", "frozen?", "respond_to?", "is_a?", "kind_of?",
+            "instance_of?", "equal?",
+        ] {
+            p.instance_methods.insert(Symbol::from(m), Ty::Bool);
+        }
+        for m in ["to_h", "to_unsafe_h", "to_hash", "to_unsafe_hash", "to_hwia"] {
+            p.instance_methods.insert(Symbol::from(m), hash_str_untyped.clone());
+        }
+        p.instance_methods.insert(
+            Symbol::from("keys"),
+            Ty::Array { elem: Box::new(Ty::Str) },
+        );
+        for m in ["to_query", "to_param", "to_s", "inspect", "to_json"] {
+            p.instance_methods.insert(Symbol::from(m), Ty::Str);
+        }
+        for m in ["hash", "object_id"] {
+            p.instance_methods.insert(Symbol::from(m), Ty::Int);
+        }
+        // An element read is `String | Array | Parameters | nil`; it types
+        // as the String reading every scalar read wants, and a
+        // Parameters-only method sent to it selects the Parameters arm
+        // (`BodyTyper::parameters_arm_ty`). `expect(:id)` is the scalar form.
+        let str_or_nil = Ty::Union { variants: vec![Ty::Str, Ty::Nil] };
+        p.instance_methods.insert(Symbol::from("[]"), str_or_nil.clone());
+        p.instance_methods.insert(Symbol::from("dig"), str_or_nil);
+        for m in ["[]=", "expect"] {
+            p.instance_methods.insert(Symbol::from(m), Ty::Str);
+        }
+        p.class_methods.insert(Symbol::from("new"), params_ty.clone());
+        classes.insert(params_id, p);
+        app_ctrl.class_methods.insert(Symbol::from("params"), params_ty);
+    }
     app_ctrl.class_methods.insert(Symbol::from("session"),
         Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) });
     app_ctrl.class_methods.insert(Symbol::from("render"), Ty::Nil);
