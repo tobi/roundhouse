@@ -168,3 +168,24 @@ fn strict_ingest_still_refuses_an_unreadable_singleton_statement() {
     assert!(err.is_err(), "a real gap is not silently dropped in strict mode");
 }
 
+
+/// `attr_accessor :cache` in the block synthesizes a writer whose body
+/// reads its `value` parameter. Nothing in the source is at that node, so
+/// a "local read `value` has unresolved type" warning could not be found
+/// or fixed by the author: the residual-unresolved check skips nodes with
+/// a synthetic span.
+#[test]
+fn a_synthesized_accessor_body_reports_no_unresolved_warning() {
+    let mut app = ingest_app_from_tree(tree(&[(
+        "app/models/gauge.rb",
+        "class Gauge < ApplicationRecord\n  class << self\n    attr_accessor :cache\n  end\nend\n",
+    )]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let noise: Vec<String> = roundhouse::analyze::diagnose(&app)
+        .into_iter()
+        .map(|d| d.to_string())
+        .filter(|d| d.contains("`value`"))
+        .collect();
+    assert!(noise.is_empty(), "{noise:?}");
+}
