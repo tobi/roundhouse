@@ -1178,7 +1178,8 @@ impl<'a> BodyTyper<'a> {
                 // A value declared as a class the app never registered
                 // (`Money`, `CSV::Row`) has no method table: a send on
                 // it is an unmodeled gem boundary, not a failure. A
-                // written constant (`CSV.generate`) is not such a value. Only the app
+                // written class name (`CSV.generate`) is not such a value; a
+                // constant that HOLDS one (`MIN = Money.new(1)`; `MIN.currency`) is. Only the app
                 // analyzer applies this: the runtime-source typer (no
                 // inquirers) holds framework code to full typing.
                 if matches!(answered, Ty::Var { .. }) && self.inquirers.is_some() {
@@ -1193,8 +1194,7 @@ impl<'a> BodyTyper<'a> {
                         other => other,
                     };
                     if let (Some(Ty::Class { id, .. }), Some(r)) = (held, recv.as_ref()) {
-                        if !matches!(&*r.node, ExprNode::Const { .. })
-                            && !self.classes.contains_key(id)
+                        if !names_the_class(r, id) && !self.classes.contains_key(id)
                         {
                             // A rescued gem error is still an Exception.
                             let exception = self
@@ -3354,4 +3354,19 @@ fn literal_extremum_ty(recv: Option<&Expr>, recv_ty: &Ty, method: &Symbol, args:
         }
         other => other.clone(),
     })
+}
+
+/// Is `recv` a constant that names the class `id` — `CSV` in
+/// `CSV.generate`, the class object — rather than a value that merely
+/// has that class? `MIN = Money.new(1, "USD")` reads as `Class { Money }`
+/// too (the type does not tell class object from instance), but what it
+/// is written as is `MIN`: a class object is written as the class it is,
+/// so the written name's last segment is the class's own.
+fn names_the_class(recv: &Expr, id: &ClassId) -> bool {
+    match &*recv.node {
+        ExprNode::Const { path } => path
+            .last()
+            .is_some_and(|last| id.0.as_str().rsplit("::").next() == Some(last.as_str())),
+        _ => false,
+    }
 }
