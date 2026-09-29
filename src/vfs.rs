@@ -25,6 +25,11 @@ pub trait Vfs {
     fn is_dir(&self, path: &Path) -> bool;
     /// Return whether `path` is a symbolic link, without following it.
     fn is_symlink(&self, path: &Path) -> bool;
+    /// The real location of `path` after resolving symlinks, when the
+    /// backing store has such a notion. An in-memory tree does not.
+    fn canonical(&self, _path: &Path) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Real-filesystem-backed `Vfs`. Used by the CLI and tests.
@@ -68,6 +73,10 @@ impl Vfs for FsVfs {
     }
     fn is_symlink(&self, path: &Path) -> bool {
         std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    }
+
+    fn canonical(&self, path: &Path) -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok()
     }
 }
 

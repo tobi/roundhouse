@@ -345,7 +345,7 @@ fn literal_ty(node: &Node<'_>) -> Option<Ty> {
     None
 }
 
-fn symbol_name(node: &Node<'_>) -> Option<String> {
+pub(super) fn symbol_name(node: &Node<'_>) -> Option<String> {
     let symbol = node.as_symbol_node()?;
     Some(String::from_utf8_lossy(symbol.value_loc()?.as_slice()).into_owned())
 }
@@ -368,13 +368,13 @@ fn sig_is_abstract(sig: &Node<'_>) -> bool {
     false
 }
 
-fn is_sig_call(call: &ruby_prism::CallNode<'_>) -> bool {
+pub(super) fn is_sig_call(call: &ruby_prism::CallNode<'_>) -> bool {
     let name = call.name();
     constant_id_str(&name) == "sig" && call.receiver().is_none() && call.block().is_some()
 }
 
 /// `Foo`, `Foo::Bar` — the class's own path as written.
-fn constant_path_name(node: &Node<'_>) -> String {
+pub(super) fn constant_path_name(node: &Node<'_>) -> String {
     if let Some(read) = node.as_constant_read_node() {
         return constant_id_str(&read.name()).to_string();
     }
@@ -391,7 +391,7 @@ fn constant_path_name(node: &Node<'_>) -> String {
     String::new()
 }
 
-fn qualify(scope: Option<&str>, name: &str) -> String {
+pub(super) fn qualify(scope: Option<&str>, name: &str) -> String {
     match scope {
         Some(scope) if !name.is_empty() => format!("{scope}::{name}"),
         _ => name.to_string(),
@@ -509,7 +509,7 @@ fn signature_ty(
 /// The def's own parameters, in order, with the kind Ruby gives them —
 /// the sig names them all the same way, so the def is what says whether
 /// `x` is positional, optional or keyword.
-fn def_parameters(
+pub(super) fn def_parameters(
     parameters: &ruby_prism::ParametersNode<'_>,
 ) -> Option<Vec<(String, ParamKind)>> {
     let mut out = Vec::new();
@@ -563,7 +563,7 @@ fn def_parameters(
 /// parameter declared with one typed as a class nobody defines. The
 /// emit already drops these constants for having no runtime; this is
 /// the other half, reading what they were for.
-fn collect_type_aliases(
+pub(super) fn collect_type_aliases(
     statements: &[Node<'_>],
     outer: &HashMap<String, Ty>,
 ) -> HashMap<String, Ty> {
@@ -608,7 +608,7 @@ fn collect_type_aliases(
 /// cannot spell, so it stays unread. `T.attached_class` needs no such
 /// test — it MEANS "an instance of the attached class" and sorbet only
 /// admits it where that is what it is.
-fn sorbet_ty(
+pub(super) fn sorbet_ty(
     node: &Node<'_>,
     self_is_instance: bool,
     aliases: &HashMap<String, Ty>,
