@@ -65,3 +65,38 @@ end
     ]);
     assert_eq!(failures, vec!["bogus_from_key".to_string()]);
 }
+
+/// A signature is matched to its parameters by name, and by position
+/// only among positional parameters.
+///
+/// The table is keyed by method name alone, so a signature can belong to
+/// a method of a different arity: a concern's `def memoize(use_caches:
+/// false)` and the class method it contributes, `def memoize(variants,
+/// use_caches: false)`. Falling back to "the parameter at the same index"
+/// read the declared KEYWORD `use_caches` as the class method's first
+/// positional `variants` and typed it `bool`.
+#[test]
+fn a_declared_keyword_is_never_read_as_a_positional_parameter() {
+    let failures = dispatch_failures(&[
+        SCHEMA,
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        ("sig/x.rbs", "class XController\n  def memoize: (?use_caches: bool) -> void\nend\n"),
+        (
+            "app/controllers/x_controller.rb",
+            r#"class XController < ApplicationController
+  def show
+    memoize([1])
+  end
+
+  def memoize(variants, use_caches: false)
+    variants.first
+  end
+end
+"#,
+        ),
+    ]);
+    assert!(failures.is_empty(), "{failures:?}");
+}
