@@ -868,7 +868,15 @@ impl<'a> BodyTyper<'a> {
                     }
                     narrowing::remove_nil(&lt)
                 } else {
-                    lt
+                    // `a && b` answers `a` only when `a` was falsy, so only
+                    // the arms of `a` that CAN be falsy belong to the result:
+                    // `params[:id] && params[:id].to_i` (which is how `&.`
+                    // reads) is `Integer | nil`, not `String | Integer | nil`
+                    // -- a String is never the falsy value that stopped it.
+                    match falsy_part(&lt) {
+                        Some(f) => f,
+                        None => return rt,
+                    }
                 };
                 union_of(lt_peeled, rt)
             }
@@ -3260,6 +3268,23 @@ mod tests {
             other => panic!("expected a union, got {other:?}"),
         };
         assert_eq!(spines, 1, "hash spines must merge, got {via_nil_first:?}");
+    }
+}
+
+/// The arms of `ty` a falsy value can come from -- `nil`, `false`, and
+/// anything not known to be truthy. `None` when there are none.
+fn falsy_part(ty: &Ty) -> Option<Ty> {
+    match ty {
+        Ty::Union { variants } => {
+            let kept: Vec<Ty> = variants.iter().filter_map(falsy_part).collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => Some(Ty::Union { variants: kept }),
+            }
+        }
+        t if never_falsy(t) => None,
+        t => Some(t.clone()),
     }
 }
 
