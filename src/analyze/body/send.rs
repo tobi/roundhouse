@@ -1961,7 +1961,7 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
             Ty::Float => Ty::Float,
             _ => Ty::Untyped,
         },
-        "exclude?" => Ty::Bool,
+        "exclude?" | "intersect?" => Ty::Bool,
         // `Set` isn't parameterized, so the element type can't be carried.
         "to_set" => Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![] },
         // JSON serialization of a collection is a String whatever the
@@ -2112,7 +2112,7 @@ pub(super) fn hash_method(
         },
         "length" | "size" | "count" => Ty::Int,
         "values" => Ty::Array { elem: Box::new(value.clone()) },
-        "empty?" | "any?" | "none?" | "key?" | "has_key?" | "include?" => Ty::Bool,
+        "empty?" | "any?" | "none?" | "all?" | "one?" | "key?" | "has_key?" | "include?" => Ty::Bool,
         "keys" => Ty::Array { elem: Box::new(key.clone()) },
         // `Hash#fetch(k, default)` answers `default` when the key is
         // missing, so the result is `value | typeof(default)` — a Nil
