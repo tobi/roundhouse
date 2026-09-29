@@ -1,0 +1,80 @@
+//! A rescued exception is an Exception, whichever class the program
+//! names.
+//!
+//! `rescue Stripe::CardError => e` binds `e` to that class. When the
+//! class comes from a gem the app never registered, the binding used to
+//! fall back to `StandardError`, and then `e.response` / `e.status`
+//! (which the gem's error defines) were reported as unknown methods of a
+//! class the program never rescued. The binding now keeps the class the
+//! program wrote: sends on it are the unmodelled-gem boundary, with the
+//! `Exception` surface (`message`, `cause`, `backtrace`, `full_message`)
+//! still answered with its Ruby types.
+
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static RUN: AtomicUsize = AtomicUsize::new(0);
+
+fn check(files: &[(&str, &str)]) -> String {
+    let dir = std::env::temp_dir()
+        .join(format!("rh_rescued_exception_{}_{}", std::process::id(), RUN.fetch_add(1, Ordering::SeqCst)));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (path, src) in files {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, src).unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["check", "--continue"])
+        .arg(&dir)
+        .output()
+        .expect("spawn roundhouse");
+    let _ = std::fs::remove_dir_all(&dir);
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+const RECORD: &str = "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n";
+
+fn service(rescue_line: &str, body: &str) -> String {
+    format!("class Charger < ApplicationRecord\n  def go\n    raise \"x\"\n  {rescue_line}\n{body}\n  end\nend\n")
+}
+
+#[test]
+fn a_gem_error_keeps_its_own_methods() {
+    let src = service(
+        "rescue Stripe::CardError => e",
+        "    e.response\n    e.status\n    e.http_body.to_s\n    e.message.upcase",
+    );
+    let err = check(&[("app/models/application_record.rb", RECORD), ("app/models/charger.rb", &src)]);
+    assert!(err.contains(" 0 error(s)"), "{err}");
+}
+
+#[test]
+fn a_union_with_a_gem_error_answers_the_exception_surface() {
+    let src = service(
+        "rescue ArgumentError, Stripe::CardError => e",
+        "    e.message.upcase\n    e.cause",
+    );
+    let err = check(&[("app/models/application_record.rb", RECORD), ("app/models/charger.rb", &src)]);
+    assert!(err.contains(" 0 error(s)"), "{err}");
+}
+
+/// `cause` is the exception being handled when this one was raised, or
+/// nil; the rest of the Exception surface is typed, not untyped.
+#[test]
+fn the_exception_surface_includes_cause() {
+    let src = service(
+        "rescue StandardError => e",
+        "    e.cause&.message\n    e.backtrace_locations\n    e.detailed_message.upcase\n    e.exception",
+    );
+    let err = check(&[("app/models/application_record.rb", RECORD), ("app/models/charger.rb", &src)]);
+    assert!(err.contains(" 0 error(s)"), "{err}");
+}
+
+/// A registered exception is still checked against its own surface.
+#[test]
+fn a_registered_exception_is_still_checked() {
+    let src = service("rescue ArgumentError => e", "    e.no_such_exception_method");
+    let err = check(&[("app/models/application_record.rb", RECORD), ("app/models/charger.rb", &src)]);
+    assert!(err.contains("no_such_exception_method"), "{err}");
+}

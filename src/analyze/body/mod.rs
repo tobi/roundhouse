@@ -640,13 +640,17 @@ impl<'a> BodyTyper<'a> {
                         self.analyze_expr(c, ctx);
                     }
                     if let Some(name) = &rc.binding {
-                        // An unregistered class (a gem's error) stays StandardError: typed as itself, even `e.message` would fail.
-                        // `rescue A, B => e` binds the union: `e` is one of them. One unregistered
-                        // class in the list makes the whole binding StandardError again.
+                        // `rescue A, B => e` binds the union: `e` is one of them. A class
+                        // the app never registered (a gem's error) binds as itself:
+                        // sends on it are the gradual boundary every unregistered class
+                        // is, with the Exception surface (`message`, `cause`) answered
+                        // from `StandardError`. Binding it as `StandardError` instead
+                        // reported `e.response` / `e.status` as unknown methods of a
+                        // class the program never rescued.
                         let mut rescued: Option<Ty> = None;
                         for c in rc.classes.iter() {
                             match &c.ty {
-                                Some(ty @ Ty::Class { id, .. }) if self.classes().contains_key(id) => {
+                                Some(ty @ Ty::Class { .. }) => {
                                     rescued = Some(match rescued.take() {
                                         Some(prev) => union_of(prev, ty.clone()),
                                         None => ty.clone(),
@@ -1192,6 +1196,14 @@ impl<'a> BodyTyper<'a> {
                         if !matches!(&*r.node, ExprNode::Const { .. })
                             && !self.classes.contains_key(id)
                         {
+                            // A rescued gem error is still an Exception.
+                            let exception = self
+                                .classes
+                                .get(&ClassId(Symbol::from("StandardError")))
+                                .and_then(|c| c.instance_methods.get(method));
+                            if let Some(t) = exception {
+                                return t.clone();
+                            }
                             return Ty::Untyped;
                         }
                     }
