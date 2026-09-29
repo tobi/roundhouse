@@ -67,6 +67,9 @@ pub fn classify_mul<'a>(lhs: &'a Expr, rhs: &'a Expr) -> MulCase<'a> {
     match (lhs_ty, rhs_ty) {
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => MulCase::Numeric,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => MulCase::NumericPromote,
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => {
+            MulCase::NumericPromote
+        }
         (Ty::Str, Ty::Int) => MulCase::StringRepeat,
         (Ty::Array { elem }, Ty::Int) => MulCase::ArrayRepeat { elem: elem.as_ref() },
         (Ty::Array { elem }, Ty::Str) => MulCase::ArrayJoin { elem: elem.as_ref() },

@@ -52,6 +52,9 @@ pub fn classify_modulo(lhs: &Expr, rhs: &Expr) -> ModuloCase {
     match (lhs_ty, rhs_ty) {
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => ModuloCase::Numeric,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => ModuloCase::NumericPromote,
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => {
+            ModuloCase::NumericPromote
+        }
         // Str % anything typed (Array of args, Hash, single value) is
         // string formatting in Ruby. Reject Str % Str as that's not
         // meaningful (but Ruby allows it — `"%" % "foo"` is a no-op).
