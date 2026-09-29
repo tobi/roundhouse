@@ -97,48 +97,6 @@ impl<'a> BodyTyper<'a> {
         })
     }
 
-    /// See the call site: a Parameters-only method sent to an element read
-    /// of a `Parameters` dispatches on the Parameters arm of the element's
-    /// `String | Array | Parameters | nil` union.
-    pub(super) fn parameters_arm_ty(
-        &self,
-        recv: Option<&Expr>,
-        method: &Symbol,
-        block_ret: Option<&Ty>,
-        args: &[Expr],
-    ) -> Option<Ty> {
-        const PARAMETERS_ONLY: &[&str] = &[
-            "permit", "permit!", "permit_types", "require_type", "required_type",
-            "require_hash", "fetch_type", "to_unsafe_h", "to_unsafe_hash", "to_h",
-            "to_hash", "except", "slice", "expect", "require", "permitted?", "key?",
-            "has_key?", "merge", "deep_dup",
-            "reverse_merge", "with_defaults", "compact_blank", "transform_values",
-        ];
-        if !PARAMETERS_ONLY.contains(&method.as_str()) {
-            return None;
-        }
-        let read = recv?;
-        let ExprNode::Send { recv: Some(owner), method: reader, .. } = &*read.node else {
-            return None;
-        };
-        if !matches!(reader.as_str(), "[]" | "fetch" | "dig") {
-            return None;
-        }
-        let params_id = |t: &Ty| matches!(t, Ty::Class { id, .. } if id.0.as_str() == "ActionController::Parameters");
-        let owner_is_params = match owner.ty.as_ref()? {
-            Ty::Union { variants } => variants.iter().any(|v| params_id(v)),
-            t => params_id(t),
-        };
-        if !owner_is_params {
-            return None;
-        }
-        let params_ty = Ty::Class {
-            id: crate::ident::ClassId(Symbol::from("ActionController::Parameters")),
-            args: vec![],
-        };
-        Some(self.dispatch(Some(&params_ty), method, block_ret, args))
-    }
-
     /// `rel.group(:col).count` — Rails' GROUPED count, a Hash of
     /// group-key => COUNT rather than the scalar Integer.
     ///
@@ -659,6 +617,20 @@ impl<'a> BodyTyper<'a> {
         block_ret: Option<&Ty>,
         args: &[crate::expr::Expr],
     ) -> Ty {
+        // `Parameters` is a Hash-shaped bag: what its own class does not
+        // answer (`fetch`, `each`, `map`, `count`, ...) is the Hash
+        // reading over the params model's Symbol -> String. Done here,
+        // not only where a `params` receiver is typed, so the Parameters
+        // arm of an element read's union answers the same surface.
+        if let Some(Ty::Class { id, .. }) = recv_ty {
+            if id.0.as_str() == "ActionController::Parameters"
+                && method.as_str() != "new"
+                && !self.classes().get(id).is_some_and(|c| c.instance_methods.contains_key(method))
+            {
+                let as_hash = Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) };
+                return self.dispatch(Some(&as_hash), method, block_ret, args);
+            }
+        }
         // A tuple (a method returning `[a, b]` of mixed types — see
         // `tuple_return_ty`) is still an Array at runtime: anything but
         // destructuring reads it as one, over the union of its slots.
