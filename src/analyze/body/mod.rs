@@ -1255,6 +1255,31 @@ impl<'a> BodyTyper<'a> {
                 {
                     return Ty::Array { elem: Box::new(unknown()) };
                 }
+                // A value declared as a class the app never registered
+                // (`Money`, `CSV::Row`) has no method table: a send on
+                // it is an unmodeled gem boundary, not a failure. A
+                // written constant (`CSV.generate`) is not such a value. Only the app
+                // analyzer applies this: the runtime-source typer (no
+                // inquirers) holds framework code to full typing.
+                if matches!(dispatched, Ty::Var { .. }) && self.inquirers.is_some() {
+                    let held = match recv_ty.as_ref() {
+                        Some(Ty::Union { variants }) => {
+                            let mut rest = variants.iter().filter(|v| !matches!(v, Ty::Nil));
+                            match (rest.next(), rest.next()) {
+                                (Some(one), None) => Some(one),
+                                _ => None,
+                            }
+                        }
+                        other => other,
+                    };
+                    if let (Some(Ty::Class { id, .. }), Some(r)) = (held, recv.as_ref()) {
+                        if !matches!(&*r.node, ExprNode::Const { .. })
+                            && !self.classes.contains_key(id)
+                        {
+                            return Ty::Untyped;
+                        }
+                    }
+                }
                 dispatched
             }
 
