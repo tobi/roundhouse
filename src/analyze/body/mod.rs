@@ -1294,6 +1294,14 @@ impl<'a> BodyTyper<'a> {
                 {
                     return Ty::Array { elem: Box::new(unknown()) };
                 }
+                // What every object and every module answers, when the
+                // receiver's own table did not. App analyzer only, like
+                // the gradual escape below.
+                if matches!(dispatched, Ty::Var { .. }) && self.inquirers.is_some() && recv.is_some() {
+                    if let Some(t) = send::object_protocol_method(recv_ty.as_ref(), method, block_ret.as_ref()) {
+                        return t;
+                    }
+                }
                 // A value declared as a class the app never registered
                 // (`Money`, `CSV::Row`) has no method table: a send on
                 // it is an unmodeled gem boundary, not a failure. A

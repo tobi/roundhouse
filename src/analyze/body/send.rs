@@ -2855,3 +2855,52 @@ fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
         _ => return None,
     })
 }
+
+/// Ruby's own object protocol, answered for any receiver whose type
+/// table has no entry for `method`.
+///
+/// Every object is a `Kernel`/`Object` and every class is a `Module`,
+/// so the reflective surface (`instance_variable_get`,
+/// `define_singleton_method`, `singleton_class`, `extend`) and
+/// ActiveSupport's `Object` extensions (`in?`, `as_json`, `to_param`,
+/// `instance_values`) exist on an `Integer`, a `Symbol`, a rescued
+/// `StandardError` and an app model alike. The per-type tables model
+/// what a type adds; none of them repeats what all of them inherit, so
+/// a send that reaches the end of a table without a hit tries this one
+/// before it is called unknown. Consulted AFTER the receiver's own
+/// dispatch, so an app class that defines `send` or `in?` itself, or a
+/// table that types `Symbol#in?` more precisely, wins.
+pub(super) fn object_protocol_method(
+    recv_ty: Option<&Ty>,
+    method: &Symbol,
+    block_ret: Option<&Ty>,
+) -> Option<Ty> {
+    let sym_list = || Ty::Array { elem: Box::new(Ty::Sym) };
+    let recv = || recv_ty.cloned().unwrap_or(Ty::Untyped);
+    let block = || block_ret.filter(|t| !matches!(t, Ty::Var { .. })).cloned().unwrap_or(Ty::Untyped);
+    Some(match method.as_str() {
+        // Kernel / Object reflection.
+        "instance_variable_get" | "instance_variable_set" | "method" | "instance_method"
+        | "public_instance_method" | "const_get" | "class_variable_get" | "class_variable_set"
+        | "enum_for" | "to_enum" | "with_options" | "as_json" => Ty::Untyped,
+        "instance_variable_defined?" | "in?" | "acts_like?" | "method_defined?"
+        | "public_method_defined?" | "private_method_defined?" | "const_defined?"
+        | "class_variable_defined?" | "include?" => Ty::Bool,
+        "instance_variables" | "methods" | "public_methods" | "private_methods"
+        | "protected_methods" | "singleton_methods" | "instance_methods"
+        | "public_instance_methods" | "private_instance_methods" | "constants" => sym_list(),
+        "define_singleton_method" | "define_method" | "alias_method" => Ty::Sym,
+        "singleton_class" => Ty::Class { id: ClassId(Symbol::from("Class")), args: vec![] },
+        "extend" | "remove_method" | "undef_method" | "dup" | "clone" => recv(),
+        "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval"
+        | "module_exec" => block(),
+        "display" => Ty::Nil,
+        // ActiveSupport's Object extensions.
+        "to_json" | "to_param" | "to_query" | "to_yaml" | "pretty_inspect" => Ty::Str,
+        "instance_values" => Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
+        "presence_in" => Ty::Untyped,
+        "===" | "!~" => Ty::Bool,
+        "<=>" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
+        _ => return None,
+    })
+}
