@@ -97,6 +97,48 @@ impl<'a> BodyTyper<'a> {
         })
     }
 
+    /// See the call site: a Parameters-only method sent to an element read
+    /// of a `Parameters` dispatches on the Parameters arm of the element's
+    /// `String | Array | Parameters | nil` union.
+    pub(super) fn parameters_arm_ty(
+        &self,
+        recv: Option<&Expr>,
+        method: &Symbol,
+        block_ret: Option<&Ty>,
+        args: &[Expr],
+    ) -> Option<Ty> {
+        const PARAMETERS_ONLY: &[&str] = &[
+            "permit", "permit!", "permit_types", "require_type", "required_type",
+            "require_hash", "fetch_type", "to_unsafe_h", "to_unsafe_hash", "to_h",
+            "to_hash", "except", "slice", "expect", "require", "permitted?", "key?",
+            "has_key?", "merge", "deep_dup",
+            "reverse_merge", "with_defaults", "compact_blank", "transform_values",
+        ];
+        if !PARAMETERS_ONLY.contains(&method.as_str()) {
+            return None;
+        }
+        let read = recv?;
+        let ExprNode::Send { recv: Some(owner), method: reader, .. } = &*read.node else {
+            return None;
+        };
+        if !matches!(reader.as_str(), "[]" | "fetch" | "dig") {
+            return None;
+        }
+        let params_id = |t: &Ty| matches!(t, Ty::Class { id, .. } if id.0.as_str() == "ActionController::Parameters");
+        let owner_is_params = match owner.ty.as_ref()? {
+            Ty::Union { variants } => variants.iter().any(|v| params_id(v)),
+            t => params_id(t),
+        };
+        if !owner_is_params {
+            return None;
+        }
+        let params_ty = Ty::Class {
+            id: crate::ident::ClassId(Symbol::from("ActionController::Parameters")),
+            args: vec![],
+        };
+        Some(self.dispatch(Some(&params_ty), method, block_ret, args))
+    }
+
     /// `rel.group(:col).count` — Rails' GROUPED count, a Hash of
     /// group-key => COUNT rather than the scalar Integer.
     ///
@@ -2308,6 +2350,18 @@ pub(super) fn hash_method(
             key: Box::new(key.clone()),
             value: Box::new(block_ret.cloned().unwrap_or_else(|| value.clone())),
         },
+        // ActiveSupport key conversions: the same values under Symbol /
+        // String keys (`params.permit(:x).to_h.symbolize_keys`).
+        "symbolize_keys" | "deep_symbolize_keys" | "symbolize_keys!"
+        | "deep_symbolize_keys!" => Ty::Hash {
+            key: Box::new(Ty::Sym),
+            value: Box::new(value.clone()),
+        },
+        "stringify_keys" | "deep_stringify_keys" | "stringify_keys!"
+        | "deep_stringify_keys!" | "with_indifferent_access" => Ty::Hash {
+            key: Box::new(Ty::Str),
+            value: Box::new(value.clone()),
+        },
         // `transform_keys { |k| ... }` → Hash[U, V].
         "transform_keys" | "transform_keys!" => Ty::Hash {
             key: Box::new(block_ret.cloned().unwrap_or_else(|| key.clone())),
@@ -2386,7 +2440,7 @@ pub(super) fn hash_method(
         // JSON/string renderings of a Hash are Strings whatever the
         // value type — campfire's `Webhook#payload(message).to_json`
         // nests hashes three deep.
-        "to_json" | "to_s" | "inspect" => Ty::Str,
+        "to_json" | "to_s" | "inspect" | "to_query" | "to_param" => Ty::Str,
         _ => unknown(),
     }
 }
