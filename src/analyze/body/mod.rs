@@ -625,19 +625,68 @@ impl<'a> BodyTyper<'a> {
                         // Then the ancestors: a subclass reads the constants its
                         // superclass and mixins contain (`Helper` in `Sub < Base`
                         // is `Base::Helper`), which is what Ruby does after the
-                        // lexical scopes and before the top level.
-                        let mut cursor = Some(self_id.clone());
-                        for _ in 0..16 {
-                            let Some(info) = cursor.as_ref().and_then(|c| self.classes().get(c)) else { break };
-                            for owner in info.includes.iter().chain(info.parent.iter()) {
+                        // lexical scopes and before the top level. The ancestors
+                        // are ALL of them, so a module a mixin itself includes
+                        // counts too: a concern method typed inside the
+                        // controller that includes `WithCarts`, which includes
+                        // `HeadersHelper`, reads `HeadersHelper::Parser` by its
+                        // bare name. Nearest first (breadth-first), bounded.
+                        let mut queue = std::collections::VecDeque::from([self_id.clone()]);
+                        let mut seen = std::collections::HashSet::from([self_id.clone()]);
+                        let mut mixins: Vec<ClassId> = Vec::new();
+                        while let Some(cursor) = queue.pop_front() {
+                            if seen.len() > 256 {
+                                break;
+                            }
+                            let Some(info) = self.classes().get(&cursor) else { continue };
+                            for (owner, is_mixin) in info
+                                .includes
+                                .iter()
+                                .map(|m| (m, true))
+                                .chain(info.parent.iter().map(|p| (p, false)))
+                            {
                                 let candidate =
                                     ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), last.as_str())));
                                 if self.classes().contains_key(&candidate) {
                                     *path = candidate.0.as_str().split("::").map(Symbol::from).collect();
                                     return Ty::Class { id: candidate, args: vec![] };
                                 }
+                                if seen.insert(owner.clone()) {
+                                    queue.push_back(owner.clone());
+                                    if is_mixin {
+                                        mixins.push(owner.clone());
+                                    }
+                                }
                             }
-                            cursor = info.parent.clone();
+                        }
+                        // A mixin's method is typed here, in the including
+                        // class, but Ruby resolves its constants from where
+                        // the METHOD was written: the mixin's own lexical
+                        // scope. `EmailMismatchValidator` inside
+                        // `A::Concerns::OneTimeCode` is
+                        // `A::Concerns::EmailMismatchValidator`, whatever
+                        // controller includes the concern. So each mixin's
+                        // enclosing namespaces are tried last, nearest
+                        // mixin first -- and only for a name the top level
+                        // does not answer. The method being typed may as
+                        // well have been written in `self`'s own class,
+                        // where a bare `Theme` or `Set` is the top-level
+                        // one, not `OnlineStore::Types::Theme` from the
+                        // namespace of some mixin it includes.
+                        let top_level = RUBY_TOP_LEVEL.contains(&last.as_str())
+                            || self.classes().contains_key(&ClassId(last.clone()));
+                        for mixin in mixins.iter().filter(|_| !top_level) {
+                            let mut scope: Vec<&str> = mixin.0.as_str().split("::").collect();
+                            scope.pop();
+                            while !scope.is_empty() {
+                                let candidate =
+                                    ClassId(Symbol::from(format!("{}::{}", scope.join("::"), last.as_str())));
+                                if self.classes().contains_key(&candidate) {
+                                    *path = candidate.0.as_str().split("::").map(Symbol::from).collect();
+                                    return Ty::Class { id: candidate, args: vec![] };
+                                }
+                                scope.pop();
+                            }
                         }
                     }
                 }

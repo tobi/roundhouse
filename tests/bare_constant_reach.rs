@@ -98,3 +98,74 @@ fn a_subclass_reads_a_class_nested_in_its_superclass() {
     );
     assert!(found.is_empty(), "{found:?}");
 }
+
+#[test]
+fn a_class_nested_in_a_mixin_of_a_mixin_resolves() {
+    // `Parser` is read inside a concern method, which is typed in the
+    // controller that includes `WithCarts`; `WithCarts` includes
+    // `HeadersHelper`, which declares `Parser`. Ruby reaches it through
+    // the controller's ancestors, the transitive ones included.
+    let files: Vec<(&str, &str)> = vec![
+        (
+            "app/controllers/concerns/headers_helper.rb",
+            "module HeadersHelper\n  extend ActiveSupport::Concern\n\n  def header_value\n    Parser.parse(\"?1\")\n  end\n\n  class Parser\n    class << self\n      def parse(value)\n        value == \"?1\"\n      end\n    end\n  end\nend\n",
+        ),
+        (
+            "app/controllers/concerns/with_carts.rb",
+            "module WithCarts\n  include(HeadersHelper)\n\n  def cart_header\n    header_value\n  end\nend\n",
+        ),
+        (
+            "app/controllers/carts_controller.rb",
+            "class CartsController < ApplicationController\n  include WithCarts\n\n  def show\n    @a = cart_header\n  end\nend\n",
+        ),
+    ];
+    let found = diagnostics(&files, "    @a = 1");
+    assert!(found.iter().all(|d| !d.contains("parse")), "{found:?}");
+}
+
+#[test]
+fn a_mixin_method_reads_constants_from_the_mixins_own_namespace() {
+    // `OneTimeCode#verify` is typed in `Auth::SessionsController`, but
+    // Ruby resolves `Validator` where the method was written, inside
+    // `Auth::Concerns`, so it is `Auth::Concerns::Validator`.
+    let files: Vec<(&str, &str)> = vec![
+        (
+            "app/models/auth/concerns/validator.rb",
+            "module Auth\n  module Concerns\n    module Validator\n      class << self\n        def ok?(email)\n          email.present?\n        end\n      end\n    end\n  end\nend\n",
+        ),
+        (
+            "app/controllers/auth/concerns/one_time_code.rb",
+            "module Auth\n  module Concerns\n    module OneTimeCode\n      def verify(email)\n        Validator.ok?(email)\n      end\n    end\n  end\nend\n",
+        ),
+        (
+            "app/controllers/auth/sessions_controller.rb",
+            "module Auth\n  class SessionsController < ApplicationController\n    include Concerns::OneTimeCode\n\n    def show\n      @a = verify(\"a@b.c\")\n    end\n  end\nend\n",
+        ),
+    ];
+    let found = diagnostics(&files, "    @a = 1");
+    assert!(found.iter().all(|d| !d.contains("ok?")), "{found:?}");
+}
+
+#[test]
+fn a_top_level_class_beats_a_class_in_a_mixins_namespace() {
+    // `Thing` inside `Thing#sibling` is the top-level model, even though
+    // the model includes `Catalog::Types::Lookup` and `Catalog::Types`
+    // declares a `Thing` of its own (core's `OnlineStoreEditor::Session`
+    // reading `Theme` while including `OnlineStore::Types::Lens`).
+    let files: Vec<(&str, &str)> = vec![
+        (
+            "app/models/thing.rb",
+            "class Thing < ApplicationRecord\n  include Catalog::Types::Lookup\n\n  def self.fetch_by_name(name); find_by(name: name); end\n\n  def sibling\n    Thing.fetch_by_name(\"x\")\n  end\nend\n",
+        ),
+        (
+            "app/models/catalog/types/thing.rb",
+            "module Catalog\n  module Types\n    module Thing\n      def label; \"t\"; end\n    end\n  end\nend\n",
+        ),
+        (
+            "app/models/catalog/types/lookup.rb",
+            "module Catalog\n  module Types\n    module Lookup\n      def look; 1; end\n    end\n  end\nend\n",
+        ),
+    ];
+    let found = diagnostics(&files, "    @a = Thing.new.sibling");
+    assert!(found.iter().all(|d| !d.contains("fetch_by_name")), "{found:?}");
+}
