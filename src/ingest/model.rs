@@ -75,9 +75,19 @@ pub fn ingest_table_name_prefixes(source: &[u8], file: &str) -> TablePrefixes {
 /// had no `shop_id` at all. Only a literal string or symbol counts; a
 /// computed name would have to run to be known.
 fn explicit_table_name(body: ruby_prism::Node<'_>) -> Option<String> {
+    explicit_class_setting(body, "table_name=")
+}
+
+/// `self.table_name_prefix = "three_d_secure_"` in a model body: the
+/// class's own prefix, which wins over any namespace module's.
+fn explicit_table_prefix(body: ruby_prism::Node<'_>) -> Option<String> {
+    explicit_class_setting(body, "table_name_prefix=")
+}
+
+fn explicit_class_setting(body: ruby_prism::Node<'_>, setter: &str) -> Option<String> {
     for stmt in flatten_statements(body) {
         let Some(call) = stmt.as_call_node() else { continue };
-        if constant_id_str(&call.name()) != "table_name=" {
+        if constant_id_str(&call.name()) != setter {
             continue;
         }
         if call.receiver().and_then(|r| r.as_self_node()).is_none() {
@@ -132,8 +142,8 @@ pub fn ingest_model(
     } else {
         let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
         segments.pop();
-        let mut prefix = String::new();
-        while !segments.is_empty() {
+        let mut prefix = class.body().and_then(explicit_table_prefix).unwrap_or_default();
+        while prefix.is_empty() && !segments.is_empty() {
             if let Some(p) = prefixes.get(&segments.join("::")) {
                 prefix = p.clone();
                 break;
