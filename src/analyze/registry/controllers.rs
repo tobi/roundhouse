@@ -268,6 +268,10 @@ pub(in crate::analyze) fn register(
             "host", "host_with_port", "domain", "protocol", "scheme", "port_string",
             "request_method", "method", "raw_post", "uuid", "request_id", "base_url",
             "script_name", "path_info", "query_string", "media_type",
+            // The cookie-jar salts (`Request::Cookies`), read where an app
+            // builds its own MessageVerifier off the request.
+            "signed_cookie_salt", "encrypted_cookie_salt",
+            "encrypted_signed_cookie_salt", "authenticated_encrypted_cookie_salt",
         ] {
             request.instance_methods.insert(Symbol::from(m), Ty::Str);
         }
@@ -308,7 +312,10 @@ pub(in crate::analyze) fn register(
         request.instance_methods.insert(Symbol::from("content_length"), Ty::Int);
         for m in ["headers", "env", "cookie_jar", "session", "params", "query_parameters",
                   "request_parameters", "path_parameters", "format", "body", "variant",
-                  "flash", "subdomains", "accepts", "mime_type", "authorization"] {
+                  "flash", "subdomains", "accepts", "mime_type", "authorization",
+                  // The app's key generator, and the controller CLASS the
+                  // request routed to (`Request#controller_class`).
+                  "key_generator", "controller_class"] {
             request.instance_methods.insert(Symbol::from(m), Ty::Untyped);
         }
         classes.insert(request_id.clone(), request);
