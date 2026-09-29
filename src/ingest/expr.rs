@@ -467,6 +467,21 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             };
             let block = match c.block() {
                 Some(block_node) => ingest_call_block(&block_node, file, &method)?,
+                // `foo(...)` passes the caller's block on too: `...` is
+                // `*rest, **kw, &blk`, and the def side bound `blk` to the
+                // same `__blk` an anonymous `&` gets.
+                None if c.arguments().is_some_and(|a| {
+                    a.arguments().iter().any(|x| x.as_forwarding_arguments_node().is_some())
+                }) =>
+                {
+                    Some(Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Var {
+                            id: crate::ident::VarId(0),
+                            name: Symbol::from(super::util::FORWARDED_BLOCK),
+                        },
+                    ))
+                }
                 None => None,
             };
             // Two shapes a paren-less call can't hold once lowered, both
@@ -1936,6 +1951,19 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             };
             ExprNode::Splat { value }
         }
+        // `...` in an argument list (`def m(...) = foo(...)`): the forwarded
+        // positionals, spread. Keywords ride in them as a trailing Hash, the
+        // convention `*args, **opts` already follows; the block is passed
+        // on by the enclosing call (see its `block` above).
+        n if n.as_forwarding_arguments_node().is_some() => ExprNode::Splat {
+            value: Expr::new(
+                span,
+                ExprNode::Var {
+                    id: crate::ident::VarId(0),
+                    name: Symbol::from(super::util::FORWARDED_REST),
+                },
+            ),
+        },
         n if n.as_multi_write_node().is_some() => {
             // Handled out-of-line: `ingest_expr_strict` recurses once per
             // expression-nesting level, so its stack frame is on the hot
