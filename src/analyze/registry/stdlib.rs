@@ -158,6 +158,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("base58", Ty::Str), ("uuid", Ty::Str), ("alphanumeric", Ty::Str),
         ("random_bytes", Ty::Str), ("random_number", Ty::Untyped),
     ], &[]);
+    // `Benchmark` (the `benchmark` stdlib default gem): `realtime`
+    // answers the block's wall time as a Float, and ActiveSupport's
+    // core extension adds `ms` (the same, in milliseconds).
+    // `measure`/`bm` answer report objects nobody types.
+    register_stdlib_class(classes, "Benchmark", &[
+        ("realtime", Ty::Float), ("ms", Ty::Float),
+        ("measure", Ty::Untyped), ("bm", Ty::Untyped), ("bmbm", Ty::Untyped),
+    ], &[]);
     // `Random` carries the same `Random::Formatter` surface as
     // SecureRandom since Ruby 3.3 (`Random.uuid` is campfire's test
     // notification body); `rand`/`random_number` answer Int or Float
