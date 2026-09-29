@@ -768,6 +768,34 @@ impl Analyzer {
             }
         }
 
+        // A class named in a signature means the lexically nearest one
+        // (`Capabilities::Charge` inside `ShopifyPayments::Capability`),
+        // which is only knowable once every class is registered.
+        let resolved: Vec<(ClassId, Symbol, Ty, Ty)> = app
+            .rbs_signatures
+            .iter()
+            .flat_map(|(class_id, methods)| {
+                methods.iter().map(|(name, ty)| {
+                    let scoped = ty.map_class_ids(&|id| {
+                        body::lexical_class(id, class_id.0.as_str(), &classes)
+                            .unwrap_or_else(|| id.clone())
+                    });
+                    (class_id.clone(), name.clone(), ty.clone(), scoped)
+                })
+            })
+            .filter(|(_, _, before, after)| before != after)
+            .collect();
+        for (class_id, name, before, after) in resolved {
+            if let Some(slot) = classes
+                .get_mut(&class_id)
+                .and_then(|c| c.instance_methods.get_mut(&name))
+            {
+                if *slot == before {
+                    *slot = after;
+                }
+            }
+        }
+
         Self {
             classes,
             inferred_params: HashMap::new(),

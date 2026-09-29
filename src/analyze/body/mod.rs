@@ -224,6 +224,27 @@ pub struct ClassInfo {
 /// app where a dozen components each declare their own `Mode`. Walking
 /// the nesting is what tells them apart; a suffix match over the class
 /// registry cannot, and gives up on the ambiguity instead.
+/// A class name written inside `scope` (a qualified class name),
+/// resolved lexically: `scope::name`, then each enclosing namespace,
+/// and finally the name as written. `None` when no registered class
+/// answers, so an unknown name (a gem's class) is left as written.
+pub(crate) fn lexical_class(
+    written: &ClassId,
+    scope: &str,
+    classes: &HashMap<ClassId, ClassInfo>,
+) -> Option<ClassId> {
+    let name = written.0.as_str();
+    let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
+    while !parts.is_empty() {
+        let candidate = ClassId(Symbol::from(format!("{}::{name}", parts.join("::")).as_str()));
+        if classes.contains_key(&candidate) {
+            return Some(candidate);
+        }
+        parts.pop();
+    }
+    classes.contains_key(written).then(|| written.clone())
+}
+
 fn resolve_owner_path(
     written: &str,
     ctx: &Ctx,
@@ -1715,7 +1736,16 @@ impl<'a> BodyTyper<'a> {
                 // `target_ty` regardless of what the value's flow
                 // type computed to.
                 let _ = self.analyze_expr(value, ctx);
-                target_ty.clone()
+                // A class named inside a namespace means the lexically
+                // nearest one (`Capabilities::Charge` in
+                // `ShopifyPayments::Capability` is
+                // `ShopifyPayments::Capabilities::Charge`).
+                match &ctx.self_ty {
+                    Some(Ty::Class { id: scope, .. }) => target_ty.map_class_ids(&|id| {
+                        lexical_class(id, scope.0.as_str(), self.classes).unwrap_or_else(|| id.clone())
+                    }),
+                    _ => target_ty.clone(),
+                }
             }
         }
     }
