@@ -228,16 +228,27 @@ pub fn ingest_model(
             // can't. Library classes get the same treatment one level
             // down, in `walk_decl_body`.
             if let Some(sc) = stmt.as_singleton_class_node() {
-                match ingest_singleton_class_methods(&sc, file) {
-                    Ok(methods) => {
+                match ingest_singleton_class_body(&sc, &owner, file) {
+                    Ok(singleton) => {
                         let mut leading = leading;
                         let mut blank = leading_blank;
-                        for method in methods {
-                            let mut item = ModelBodyItem::Method {
+                        let items = singleton
+                            .methods
+                            .into_iter()
+                            .map(|method| ModelBodyItem::Method {
                                 method,
-                                leading_comments: std::mem::take(&mut leading),
+                                leading_comments: Vec::new(),
                                 leading_blank_line: false,
-                            };
+                            })
+                            .chain(singleton.class_body.into_iter().map(|expr| {
+                                ModelBodyItem::Unknown {
+                                    expr,
+                                    leading_comments: Vec::new(),
+                                    leading_blank_line: false,
+                                }
+                            }));
+                        for mut item in items {
+                            *item.leading_comments_mut() = std::mem::take(&mut leading);
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
@@ -1056,56 +1067,14 @@ fn enum_affixes(elements: &ruby_prism::NodeList<'_>, column: &str) -> (String, S
     (prefix, suffix)
 }
 
-/// Expand a model's `class << self … end` into the class methods it
-/// declares. Only `def`s are recognized: a visibility marker or an
-/// `attr_accessor` in there means something about the *singleton*
-/// scope that a flattened list of methods can't carry, so refuse it
-/// loudly rather than silently apply it to the instance side.
-fn ingest_singleton_class_methods(
+/// Expand a model's `class << self … end` into the class methods and
+/// class-body statements it declares — see [`super::singleton_class`].
+fn ingest_singleton_class_body(
     sc: &ruby_prism::SingletonClassNode<'_>,
+    owner: &ClassId,
     file: &str,
-) -> IngestResult<Vec<crate::dialect::MethodDef>> {
-    use crate::dialect::MethodReceiver;
-
-    let Some(body) = sc.body() else { return Ok(Vec::new()) };
-    let mut methods = Vec::new();
-    for stmt in super::util::flatten_statements(body) {
-        // A bare `private` (or `protected` / `public`) inside the
-        // singleton block is a VISIBILITY MARKER, not a statement with
-        // a body. Visibility is not modeled on a lowered class method
-        // (everything a body can reach, it reaches), so the marker is
-        // skipped rather than refused — and refusing it dropped the
-        // WHOLE MODEL at ingest, since `ingest_model` propagates the
-        // error for the file.
-        //
-        // Found by an STI probe: campfire's `Rooms::Direct` writes one
-        // above `find_for`, and it only surfaced once that class was
-        // classified as a model rather than a library class (the
-        // library-class walk has always tolerated the marker). Any
-        // model with a `class << self … private … end` block hits it.
-        if let Some(call) = stmt.as_call_node() {
-            let bare_marker = call.receiver().is_none()
-                && call.arguments().is_none()
-                && call.block().is_none()
-                && matches!(
-                    std::str::from_utf8(call.name().as_slice()).unwrap_or(""),
-                    "private" | "protected" | "public"
-                );
-            if bare_marker {
-                continue;
-            }
-        }
-        let Some(def) = stmt.as_def_node() else {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: format!("unsupported statement inside `class << self`: {stmt:?}"),
-            });
-        };
-        let mut method = ingest_method(&def, file)?;
-        method.receiver = MethodReceiver::Class;
-        methods.push(method);
-    }
-    Ok(methods)
+) -> IngestResult<super::singleton_class::SingletonBody> {
+    super::singleton_class::ingest_singleton_body(sc, owner, file, &|def| ingest_method(def, file))
 }
 
 pub(super) fn ingest_method(
@@ -1892,7 +1861,7 @@ mod singleton_visibility_tests {
     fn a_real_statement_in_a_singleton_block_still_refuses() {
         let err = ingest(
             "class Thing < ApplicationRecord\n  \
-             class << self\n    attr_accessor :cache\n  end\nend\n",
+             class << self\n    memoize_everything :cache\n  end\nend\n",
         );
         assert!(err.is_err(), "an unmodeled singleton statement is still an error: {err:?}");
     }
