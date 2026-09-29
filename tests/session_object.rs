@@ -37,3 +37,17 @@ fn session_answers_its_own_surface() {
     assert!(diags.is_empty(), "{diags:?}");
 }
 
+
+#[test]
+fn a_session_read_stays_a_nilable_string() {
+    // The blank-predicate grounding of `(rd = session[:k]).present?`
+    // needs a nilable String receiver.
+    let diags = dispatch_failures("    rd = session[:redirect_to]\n    rd.upcase if rd.present?");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn rack_request_accessors_dispatch() {
+    let diags = dispatch_failures("    request.POST\n    request.original_fullpath.upcase\n    request.get_header(\"HTTP_X\")\n    request.request_method_symbol");
+    assert!(diags.is_empty(), "{diags:?}");
+}

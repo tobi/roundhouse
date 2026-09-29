@@ -122,7 +122,14 @@ pub(in crate::analyze) fn register(
         // modeled, so a method this table does not list stays gradual instead
         // of failing dispatch.
         session.parent = Some(ClassId(Symbol::from("Rack::Session::Abstract::SessionHash")));
-        for m in ["[]", "fetch", "dig", "delete"] {
+        // Reads keep the String-or-nil answer the Hash typing gave: the
+        // blank-predicate grounding of `(rd = session[:k]).present?` needs a
+        // nilable String receiver to lower.
+        session.instance_methods.insert(
+            Symbol::from("[]"),
+            Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
+        );
+        for m in ["fetch", "dig", "delete"] {
             session.instance_methods.insert(Symbol::from(m), Ty::Untyped);
         }
         for m in ["[]=", "store", "clear", "destroy", "update", "merge!", "each", "reload!"] {
@@ -265,6 +272,21 @@ pub(in crate::analyze) fn register(
             request.instance_methods.insert(Symbol::from(m), Ty::Bool);
         }
         request.instance_methods.insert(Symbol::from("port"), Ty::Int);
+        // Rack env accessors and the parameter/header views Rails exposes on every
+        // request. `POST`/`GET` are the raw form/query hashes; the header
+        // readers are Rack env lookups.
+        for m in ["POST", "GET", "session_options"] {
+            request.instance_methods.insert(
+                Symbol::from(m),
+                Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
+            );
+        }
+        for m in ["get_header", "set_header", "delete_header", "cookies"] {
+            request.instance_methods.insert(Symbol::from(m), Ty::Untyped);
+        }
+        request.instance_methods.insert(Symbol::from("original_fullpath"), Ty::Str);
+        request.instance_methods.insert(Symbol::from("request_method_symbol"), Ty::Sym);
+        request.instance_methods.insert(Symbol::from("route_uri_pattern"), str_or_nil());
         request.instance_methods.insert(Symbol::from("content_length"), Ty::Int);
         for m in ["headers", "env", "cookie_jar", "session", "params", "query_parameters",
                   "request_parameters", "path_parameters", "format", "body", "variant",
