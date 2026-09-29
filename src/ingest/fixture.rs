@@ -196,25 +196,32 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
         let mut field_map: IndexMap<Symbol, FixtureValue> = IndexMap::new();
         for (k, v) in fields {
             let k = yaml_scalar_as_string(&k).unwrap_or_default();
-            let s = yaml_scalar_as_string(&v).ok_or_else(|| IngestError::Unsupported {
-                file: file.clone(),
-                message: format!("fixture field {label}.{k} is not a scalar"),
-            })?;
+            // A hash or array is a value for a JSON or serialized column:
+            // Rails casts it through the column type on insert (JSON for
+            // `json`, a YAML dump otherwise). JSON text serves both, since
+            // YAML reads JSON. A key JSON can't hold is still reported.
+            let s = yaml_scalar_as_string(&v)
+                .or_else(|| match &v {
+                    serde_yaml_ng::Value::Mapping(_) | serde_yaml_ng::Value::Sequence(_) => {
+                        serde_json::to_string(&v).ok()
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| IngestError::Unsupported {
+                    file: file.clone(),
+                    message: format!("fixture field {label}.{k} is not a scalar"),
+                })?;
             let value = match resolve_slot(&s, &values) {
                 SlotMatch::None => FixtureValue::Scalar(s),
                 SlotMatch::Whole(expr) => FixtureValue::Ruby(expr),
                 // `body: "hi <%= name %>"` — the tag is one part of a
                 // larger scalar, so the value is a string built at
-                // runtime rather than the tag's own result. Reachable
-                // Rails, but nothing we ingest writes it; report the
-                // field rather than guessing at concatenation.
+                // runtime: ERB writes each tag's `to_s` into the text,
+                // which is what interpolating it into a Ruby string does.
                 SlotMatch::Embedded => {
-                    return Err(IngestError::Unsupported {
-                        file: file.clone(),
-                        message: format!(
-                            "fixture field {label}.{k}: ERB tag interpolated into a larger scalar"
-                        ),
-                    });
+                    let src = interpolated_source(&s, &split.values);
+                    let tag_file = format!("{file} ({label}.{k} with ERB)");
+                    FixtureValue::Ruby(super::expr::ingest_ruby_program(&src, &tag_file)?)
                 }
             };
             field_map.insert(Symbol::from(k.as_str()), value);
@@ -242,6 +249,26 @@ enum SlotMatch {
     Whole(Expr),
     /// The scalar contains a slot alongside other text.
     Embedded,
+}
+
+/// A scalar holding ERB slots among other text, as the source of a Ruby
+/// string that interpolates each slot's expression.
+fn interpolated_source(s: &str, values: &[String]) -> String {
+    let mut lit = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '\\' => lit.push_str("\\\\"),
+            '"' => lit.push_str("\\\""),
+            '#' => lit.push_str("\\#"),
+            '\n' => lit.push_str("\\n"),
+            _ => lit.push(c),
+        }
+    }
+    // Highest slot first, so `_1_` can't match inside `_12_`'s name.
+    for (idx, src) in values.iter().enumerate().rev() {
+        lit = lit.replace(&erb_slot(idx), &format!("#{{({src})}}"));
+    }
+    format!("\"{lit}\"")
 }
 
 fn resolve_slot(s: &str, values: &[Expr]) -> SlotMatch {

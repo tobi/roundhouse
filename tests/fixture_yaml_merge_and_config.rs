@@ -181,3 +181,51 @@ fn yaml_under_file_fixtures_is_not_a_fixture_set() {
     let names: Vec<&str> = app.fixtures.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["widgets"]);
 }
+
+/// A hash or array value is for a JSON or serialized column. It is kept
+/// as JSON text, which a `json` column stores as is and a YAML coder
+/// reads back as the same value.
+#[test]
+fn a_nested_value_is_kept_as_json() {
+    let f = fixture("one:\n  metadata:\n    source: web\n    tags: [a, b]\n  ids: [1, 2]\n")
+        .expect("ingest");
+    assert_eq!(field(&f, "one", "metadata").as_deref(), Some(r#"{"source":"web","tags":["a","b"]}"#));
+    assert_eq!(field(&f, "one", "ids").as_deref(), Some("[1,2]"));
+}
+
+/// The JSON text reaches the emitted loader as a string literal.
+#[test]
+fn a_nested_value_is_emitted_as_a_string_literal() {
+    let app = app(&[
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema.define(version: 1) do\n  \
+             create_table :widgets do |t|\n    t.json :metadata\n  end\nend\n",
+        ),
+        ("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n"),
+        ("test/fixtures/widgets.yml", "one:\n  metadata:\n    source: web\n"),
+    ]);
+    let loader = roundhouse::emit::ruby::emit_spinel(&app)
+        .into_iter()
+        .find(|f| f.path.to_string_lossy() == "test/fixtures/widgets.rb")
+        .map(|f| f.content)
+        .expect("test/fixtures/widgets.rb");
+    assert!(loader.contains(r#""{\"source\":\"web\"}""#), "{loader}");
+}
+
+/// An ERB tag inside a larger scalar builds the string at load time, as
+/// ERB writing the tag's `to_s` into the text does.
+#[test]
+fn an_erb_tag_inside_a_scalar_interpolates() {
+    let app = app(&[
+        ("db/schema.rb", SCHEMA),
+        ("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n"),
+        ("test/fixtures/widgets.yml", "one:\n  name: \"w-<%= 1 + 1 %> \\\"q\\\" #x\"\n"),
+    ]);
+    let loader = roundhouse::emit::ruby::emit_spinel(&app)
+        .into_iter()
+        .find(|f| f.path.to_string_lossy() == "test/fixtures/widgets.rb")
+        .map(|f| f.content)
+        .expect("test/fixtures/widgets.rb");
+    assert!(loader.contains(r#""w-#{1 + 1} \"q\" \#x""#), "{loader}");
+}
