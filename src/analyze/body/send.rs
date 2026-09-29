@@ -2554,7 +2554,27 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         "=~" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
         // `index`/`rindex` → the substring position or nil.
         "index" | "rindex" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
-        "chars" | "lines" | "split" | "bytes" | "scan" => Ty::Array { elem: Box::new(Ty::Str) },
+        "chars" | "lines" | "split" | "bytes" | "scan" | "each_char" => Ty::Array { elem: Box::new(Ty::Str) },
+        // `String#count(chars)` — how many of the given characters occur.
+        "count" => Ty::Int,
+        // `String#ascii_only?` and ActiveSupport's `exclude?` (the
+        // negation of `include?`).
+        "ascii_only?" | "exclude?" => Ty::Bool,
+        // `String#insert(index, str)` mutates and answers the receiver;
+        // `to_str` is the implicit-conversion spelling of itself;
+        // `encode` re-encodes; ActiveSupport's `first(n)` / `last(n)`
+        // are the leading / trailing slice.
+        "insert" | "to_str" | "encode" | "first" | "last" => Ty::Str,
+        // The in-place forms answer the receiver, or nil when nothing
+        // changed.
+        "gsub!" | "sub!" | "strip!" | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "squeeze!"
+        | "downcase!" | "upcase!" | "capitalize!" | "slice!" | "tr!" | "delete!" | "squish!" => {
+            Ty::Union { variants: vec![Ty::Str, Ty::Nil] }
+        }
+        // `String#unpack` decodes into an Array of whatever the
+        // template names; `unpack1` its first element.
+        "unpack" => Ty::Array { elem: Box::new(Ty::Untyped) },
+        "unpack1" => Ty::Untyped,
         "empty?" | "blank?" | "present?" | "include?" | "start_with?"
         | "end_with?" | "match?" => Ty::Bool,
         // ActiveSupport `Object#presence_in(collection)` — the receiver
