@@ -3325,16 +3325,10 @@ impl Analyzer {
             }
             let from_sites = observed.and_then(|v| v.get(i)).cloned();
             let seeded = param_ty_with_default(from_sites, param);
-            // A declared type fills in where the call sites said
-            // nothing. Strictly additive: an observed type that IS
-            // something keeps winning, so nothing that resolves today
-            // resolves differently.
-            let ty = match &seeded {
-                Some(t) if !matches!(t, Ty::Var { .. }) => seeded.clone(),
-                _ => self
-                    .declared_param_ty(class_id, &method.name, i, &param.name)
-                    .or_else(|| seeded.clone()),
-            };
+            let ty = prefer_declared(
+                self.declared_param_ty(class_id, &method.name, i, &param.name),
+                seeded,
+            );
             if let Some(ty) = ty {
                 ctx.local_bindings.insert(param.name.clone(), ty);
             }
@@ -3378,8 +3372,10 @@ impl Analyzer {
                 .filter_map(|v| v.get(i).cloned())
                 .filter(|t| !matches!(t, Ty::Var { .. }))
                 .reduce(unify_param_ty);
-            let ty = observed
-                .or_else(|| self.declared_param_ty(class_id, action_name, i, name));
+            let ty = prefer_declared(
+                self.declared_param_ty(class_id, action_name, i, name),
+                observed,
+            );
             if let Some(ty) = ty {
                 ctx.local_bindings.insert(name.clone(), ty);
             }
@@ -6044,6 +6040,30 @@ fn captured_block_ty() -> Ty {
         block: None,
         ret: Box::new(Ty::Untyped),
         effects: crate::effect::EffectSet::default(),
+    }
+}
+
+/// What a parameter is typed as inside its method, given what its
+/// signature declares and what the call sites were seen to pass.
+///
+/// A declaration that is fully spelled out IS the parameter's type: the
+/// method body is written against it, and a call site that disagrees
+/// (a `nil` the analysis inferred because the only value it saw assigned
+/// was `nil`, an empty `[]` literal) is a fact about the caller, not
+/// about the parameter. Before this, the observation won whenever there
+/// was one, so `#: (FatalError error) -> void` above a helper that one
+/// caller passed a nil-typed attribute to typed `error` as `nil`, and
+/// `error.message` failed to dispatch on it.
+///
+/// A declaration that leaves something `untyped` (`Hash[Symbol,
+/// untyped]`, a bare `Array`) is a hint the observation may sharpen, so
+/// there the observation still wins when it is something, and the
+/// declaration fills in where the call sites said nothing.
+fn prefer_declared(declared: Option<Ty>, observed: Option<Ty>) -> Option<Ty> {
+    match (declared, observed) {
+        (Some(d), _) if !d.mentions_unknown() => Some(d),
+        (_, Some(o)) if !matches!(o, Ty::Var { .. }) => Some(o),
+        (d, o) => d.or(o),
     }
 }
 
