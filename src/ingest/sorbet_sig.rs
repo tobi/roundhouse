@@ -425,7 +425,11 @@ fn signature_ty(
             }
             // Modifiers carry no type: `override`, `overridable`,
             // `abstract`, `final`, `checked(:never)`, `type_parameters`.
-            "override" | "overridable" | "abstract" | "final" | "checked" => {}
+            // `type_parameters(:U)` only DECLARES the variables a
+            // `T.type_parameter(:U)` below names; `bind(Foo)` says what
+            // `self` is inside a block the method takes.
+            "override" | "overridable" | "abstract" | "final" | "checked" | "type_parameters"
+            | "bind" => {}
             _ => return None,
         }
         link = call.receiver();
@@ -582,6 +586,42 @@ fn sorbet_ty(
         }
         return Some(named_ty(&name));
     }
+    // `{ max_per_pod: Integer, in: Duration }` — a shape, the hash
+    // whose keys are known. The same thing RBS spells `{ key: T }`.
+    if let Some(hash) = node.as_hash_node() {
+        let mut fields = indexmap::IndexMap::new();
+        for element in hash.elements().iter() {
+            let assoc = element.as_assoc_node()?;
+            let key = assoc.key();
+            let key = key.as_symbol_node()?;
+            let name = String::from_utf8_lossy(key.value_loc()?.as_slice()).into_owned();
+            fields.insert(
+                Symbol::new(&name),
+                sorbet_ty(&assoc.value(), self_is_instance, aliases)?,
+            );
+        }
+        return Some(Ty::Record { row: crate::ty::Row { fields, rest: None } });
+    }
+    // `[Integer, String]` — a tuple.
+    if let Some(array) = node.as_array_node() {
+        let elems: Vec<Ty> = array
+            .elements()
+            .iter()
+            .map(|e| sorbet_ty(&e, self_is_instance, aliases))
+            .collect::<Option<_>>()?;
+        return Some(Ty::Tuple { elems });
+    }
+    // `(Foo)` around a type is the type.
+    if let Some(parens) = node.as_parentheses_node() {
+        let body = parens.body()?.as_statements_node()?;
+        let mut statements = body.body().iter();
+        let only = statements.next()?;
+        return if statements.next().is_none() {
+            sorbet_ty(&only, self_is_instance, aliases)
+        } else {
+            None
+        };
+    }
     // `T::Array[String]`, `T::Hash[Symbol, Integer]`, `T::Set[X]`
     if let Some(index) = node.as_call_node() {
         let name = index.name();
@@ -623,6 +663,33 @@ fn sorbet_ty(
             // it. `dispatch` substitutes it there.
             "attached_class" => Some(Ty::SelfInstance),
             "self_type" if self_is_instance => Some(Ty::SelfInstance),
+            // A class object. `Ty` has no class-object type — a
+            // constant read types as the class itself and dispatch
+            // consults both sides — so the class stands for it, named
+            // as written (`T.class_of(String)` is the class String).
+            "class_of" => {
+                let argument = index.arguments()?.arguments().iter().next()?;
+                let id = constant_path_name(&argument);
+                (!id.is_empty()).then(|| Ty::Class { id: ClassId(Symbol::new(&id)), args: Vec::new() })
+            }
+            // What `raise` returns: no value.
+            "noreturn" => Some(Ty::Bottom),
+            // The supertype of everything; nothing can be called on it,
+            // so `untyped` answers the same.
+            "anything" => Some(Ty::Untyped),
+            // `T.type_parameter(:U)`, declared by `type_parameters(:U)`.
+            // The analyzer does not instantiate a signature's variables
+            // per call: an unmodelled boundary, so `untyped`.
+            "type_parameter" => Some(Ty::Untyped),
+            "all" => {
+                let members: Vec<Ty> = index
+                    .arguments()?
+                    .arguments()
+                    .iter()
+                    .map(|a| sorbet_ty(&a, self_is_instance, aliases))
+                    .collect::<Option<_>>()?;
+                (!members.is_empty()).then(|| crate::rbs::intersection_ty(members))
+            }
             "nilable" => {
                 let inner =
                     sorbet_ty(&index.arguments()?.arguments().iter().next()?, self_is_instance, aliases)?;
