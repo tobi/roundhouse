@@ -187,28 +187,11 @@ pub(super) fn ingest_model_with_enum_constants(
     let visibility = Visibility::resolve(class.body().as_ref(), file, None)?;
     if let Some(class_body) = class.body() {
         let mut prev_end: Option<usize> = None;
-        // Constants the class body assigns, for `enum :x, CONST`.
+        // Constants the class body assigns, for `enum :x, CONST` and for
+        // labels spelled with a constant (`NAME => NAME`).
         let stmts = flatten_statements(class_body);
-        let mut class_consts: std::collections::HashMap<String, Vec<(String, Literal)>> =
-            std::collections::HashMap::new();
-        for stmt in &stmts {
-            if let Some(cw) = stmt.as_constant_write_node() {
-                // Keep the existing class-local folding boundary: qualified
-                // cross-file constants are enum inputs, not arbitrary aliases.
-                if let Some(labels) = enum_label_values(&cw.value(), &|node| {
-                    class_consts.get(constant_id_str(&node.as_constant_read_node()?.name())).cloned()
-                }) {
-                    class_consts.insert(constant_id_str(&cw.name()).to_string(), labels);
-                }
-            }
-        }
-        let resolve_constant = |node: &Node<'_>| {
-            if let Some(read) = node.as_constant_read_node() {
-                class_consts.get(constant_id_str(&read.name())).cloned()
-            } else {
-                enum_constants.resolve(node, &enum_owners)
-            }
-        };
+        let class_consts = ClassConsts::collect(&stmts, file);
+        let resolve_constant = |node: &Node<'_>| enum_constants.resolve(node, &enum_owners);
         for statement in stmts {
             let definition = visibility::definition(&statement).map(|d| d.as_node());
             let stmt = definition.as_ref().unwrap_or(&statement);
@@ -246,12 +229,14 @@ pub(super) fn ingest_model_with_enum_constants(
             // scope + predicate + bang writer per label, so it expands
             // in the walk loop for the same reason `class << self` does.
             if let Some(call) = stmt.as_call_node() {
-                match expand_enum_decl(&call, file, &leading, &resolve_constant) {
+                match expand_enum_decl(&call, file, &leading, &class_consts, &resolve_constant) {
                     Ok(Some(expanded)) => {
-                        if let Some(d) = expanded.default {
-                            enum_defaults.insert(expanded.column.clone(), d);
+                        if let Some(default) = expanded.default {
+                            enum_defaults.insert(expanded.column.clone(), default);
                         }
-                        enums.insert(expanded.column, expanded.mapping);
+                        if let Some(mapping) = expanded.mapping {
+                            enums.insert(expanded.column, mapping);
+                        }
                         let mut blank = leading_blank;
                         for mut item in expanded.items {
                             item.set_leading_blank_line(std::mem::take(&mut blank));
@@ -786,9 +771,13 @@ pub(super) fn ingest_model_body_item(
 /// :deactivated)` sites) is a separate, type-aware pass.
 pub(super) struct EnumExpansion {
     pub column: Symbol,
-    /// Label → stored value, in declaration order.
-    pub mapping: Vec<(String, Literal)>,
-    /// The stored value `default:` names.
+    /// Label → stored value, in declaration order. `None` when some
+    /// stored value is only known at runtime (`Status::ARCHIVED` from
+    /// another file): the scopes and predicates still carry it as an
+    /// expression, but the label → literal table other passes rewrite
+    /// hand-written sites with (`where(status: :archived)`) must be
+    /// complete or absent, so a partial one is never recorded.
+    pub mapping: Option<Vec<(String, Literal)>>,
     pub default: Option<Literal>,
     pub items: Vec<ModelBodyItem>,
 }
@@ -804,6 +793,7 @@ struct EnumDeclaration<'pr> {
     /// column default. Computed here because only this parse sees the
     /// options hash.
     default_label: Option<String>,
+    generate: EnumGenerate,
 }
 
 fn enum_declaration<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<EnumDeclaration<'pr>> {
@@ -818,19 +808,20 @@ fn enum_declaration<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<EnumDeclara
     // Two spellings: `enum :status, <mapping>, **opts` (Rails 7) and the
     // older `enum status: <mapping>, **opts`, where the column and its
     // mapping are the first pair of one keyword hash.
-    let (column, mapping_node, prefix, suffix, default_label) = match symbol_value(&first) {
+    let (column, mapping_node, prefix, suffix, generate, default_label) = match symbol_value(&first) {
         Some(col) => {
             let column: String = col;
             let mapping = iter.next();
             let opts = iter.next();
-            let (prefix, suffix, default_label) = match opts.as_ref().and_then(|o| o.as_keyword_hash_node()) {
+            let (prefix, suffix, generate, default_label) = match opts.as_ref().and_then(|o| o.as_keyword_hash_node()) {
                 Some(kh) => {
-                    let (p, s) = enum_affixes(&kh.elements(), &column);
-                    (p, s, enum_default_label(&kh.elements()))
+                    let els = kh.elements();
+                    let (p, s) = enum_affixes(&els, &column);
+                    (p, s, EnumGenerate::from_options(&els), enum_default_label(&els))
                 }
-                None => (String::new(), String::new(), None),
+                None => (String::new(), String::new(), EnumGenerate::default(), None),
             };
-            (column, mapping, prefix, suffix, default_label)
+            (column, mapping, prefix, suffix, generate, default_label)
         }
         None => {
             let kh = first.as_keyword_hash_node()?;
@@ -838,11 +829,12 @@ fn enum_declaration<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<EnumDeclara
             let pair = elements.iter().next()?.as_assoc_node()?;
             let column = symbol_value(&pair.key())?;
             let (prefix, suffix) = enum_affixes(&elements, &column);
+            let generate = EnumGenerate::from_options(&elements);
             let default_label = enum_default_label(&elements);
-            (column, Some(pair.value()), prefix, suffix, default_label)
+            (column, Some(pair.value()), prefix, suffix, generate, default_label)
         }
     };
-    Some(EnumDeclaration { column, mapping: mapping_node?, prefix, suffix, default_label })
+    Some(EnumDeclaration { column, mapping: mapping_node?, prefix, suffix, default_label, generate })
 }
 
 fn enum_mapping_error(file: &str, column: &str) -> IngestError {
@@ -888,31 +880,43 @@ pub(super) fn expand_enum_decl(
     call: &ruby_prism::CallNode<'_>,
     file: &str,
     leading_comments: &[crate::dialect::Comment],
+    class_consts: &ClassConsts,
     resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
 ) -> IngestResult<Option<EnumExpansion>> {
     use crate::dialect::{MethodDef, MethodReceiver, Scope};
     use crate::effect::EffectSet;
 
-    let Some(EnumDeclaration { column, mapping: mapping_node, prefix, suffix, default_label }) =
+    let Some(EnumDeclaration { column, mapping: mapping_node, prefix, suffix, default_label, generate }) =
         enum_declaration(call)
         else { return Ok(None) };
     // `enum :status, STATUSES` — the mapping named by a constant the class
-    // body assigned above (`STATUSES = %i[…].freeze`) — and everything
-    // else `enum_label_values` resolves, now including a computed
-    // mapping over that same constant (`enum :x, STATUSES.map { |s|
-    // [s, s.to_s] }.to_h`).
-    // A Sorbet serialize-pair returns a HASH, not an array operand for the
-    // legacy recursive transformations. Admit it only as a complete mapping.
-    let labels = serialized_enum_receiver(&mapping_node)
-        .and_then(|receiver| resolve_constant(&receiver))
-        .or_else(|| enum_label_values(&mapping_node, resolve_constant))
-        .ok_or_else(|| enum_mapping_error(file, &column))?;
+    // body assigned above (`STATUSES = %i[…].freeze`).
+    let labels = if let Some(receiver) = serialized_enum_receiver(&mapping_node) {
+        resolve_constant(&receiver).map(|mapping| mapping.into_iter().map(|(label, value)| (label, EnumStored::Lit(value))).collect())
+    } else { match mapping_node.as_constant_read_node() {
+        Some(cr) => class_consts.mappings.get(constant_id_str(&cr.name())).cloned(),
+        None => enum_label_values(&mapping_node, file, class_consts, resolve_constant)?,
+    }}
+    .ok_or_else(|| IngestError::Unsupported {
+        file: file.into(),
+        message: format!(
+            "enum :{} mapping must be an array or hash literal (or `%w[…].index_by(&:itself)`)",
+            column
+        ),
+    })?;
     let all_labels = labels.clone();
-    let default = default_label.and_then(|d| labels.iter().find(|(l, _)| *l == d).map(|(_, v)| v.clone()));
+    let default = default_label.and_then(|d| labels.iter().find(|(l, _)| *l == d).and_then(|(_, v)| {
+        match v { EnumStored::Lit(value) => Some(value.clone()), EnumStored::Expr(_) => None }
+    }));
+    let literal_mapping = all_labels.iter().map(|(label, stored)| match stored {
+        EnumStored::Lit(value) => Some((label.clone(), value.clone())),
+        EnumStored::Expr(_) => None,
+    }).collect::<Option<Vec<_>>>();
+    let reads_label = literal_mapping.as_ref().is_some_and(|m| crate::dialect::enum_mapping_reads_label(m));
     // A label that is not a Ruby identifier (`32bits`, `64bits`) has no
     // predicate, scope or bang writer Ruby could name: Rails reaches them
     // through `send`, which the emit has no equivalent of. Skipped.
-    let labels: Vec<(String, Literal)> = labels
+    let labels: Vec<(String, EnumStored)> = labels
         .into_iter()
         .filter(|(l, _)| {
             l.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
@@ -935,14 +939,16 @@ pub(super) fn expand_enum_decl(
         )
     };
     let mut items = Vec::new();
-    // Not the stored value: the reader answers the label, as Rails' does.
-    let reads_label = crate::dialect::enum_mapping_reads_label(&labels);
-    for (label, value) in labels.iter().cloned() {
+    for (label, stored) in labels.iter().cloned() {
         let base = format!("{prefix}{label}{suffix}");
+        let stored_expr = || match &stored {
+            EnumStored::Lit(value) => Expr::new(span, ExprNode::Lit { value: value.clone() }),
+            EnumStored::Expr(e) => e.clone(),
+        };
         let pair = Expr::new(
             span,
             ExprNode::Hash {
-                entries: vec![(sym(&column), Expr::new(span, ExprNode::Lit { value: value.clone() }))],
+                entries: vec![(sym(&column), stored_expr())],
                 kwargs: true,
             },
         );
@@ -980,59 +986,64 @@ pub(super) fn expand_enum_decl(
             leading_blank_line: false,
         };
 
-        items.push(ModelBodyItem::Scope {
-            scope: Scope {
-                name: Symbol::from(base.as_str()),
-                params: Vec::new(),
-                body: call_with_pair("where"),
-            },
-            // The declaration's own comments ride the first item it
-            // expands to, so a documented `enum` keeps its docs.
-            leading_comments: if items.is_empty() {
-                leading_comments.to_vec()
-            } else {
-                Vec::new()
-            },
-            leading_blank_line: false,
-        });
-        // `not_published`: Rails generates the negative scope beside each positive one.
-        let where_not = Expr::new(
-            span,
-            ExprNode::Send {
-                recv: Some(Expr::new(
-                    span,
-                    ExprNode::Send { recv: None, method: Symbol::from("where"), args: vec![], block: None, parenthesized: false },
-                )),
-                method: Symbol::from("not"),
-                args: vec![pair.clone()],
-                block: None,
-                parenthesized: true,
-            },
-        );
-        items.push(ModelBodyItem::Scope {
-            scope: Scope { name: Symbol::from(format!("not_{base}")), params: Vec::new(), body: where_not },
-            leading_comments: Vec::new(),
-            leading_blank_line: false,
-        });
-        items.push(method_def(
-            format!("{base}?"),
-            Expr::new(
-                span,
-                ExprNode::Send {
-                    recv: Some(column_read()),
-                    method: Symbol::from("=="),
-                    args: vec![Expr::new(
-                        span,
-                        ExprNode::Lit {
-                            value: if reads_label { Literal::Str { value: all_labels.iter().find(|(_, stored)| stored == &value).map(|(canonical, _)| canonical.clone()).unwrap_or_else(|| label.clone()) } } else { value },
-                        },
-                    )],
-                    block: None,
-                    parenthesized: false,
+        if generate.scopes {
+            items.push(ModelBodyItem::Scope {
+                scope: Scope {
+                    name: Symbol::from(base.as_str()),
+                    params: Vec::new(),
+                    body: call_with_pair("where"),
                 },
-            ),
-        ));
-        items.push(method_def(format!("{base}!"), call_with_pair("update!")));
+                // The declaration's own comments ride the first item it
+                // expands to, so a documented `enum` keeps its docs.
+                leading_comments: if items.is_empty() {
+                    leading_comments.to_vec()
+                } else {
+                    Vec::new()
+                },
+                leading_blank_line: false,
+    });
+    let where_not = Expr::new(span, ExprNode::Send {
+        recv: Some(Expr::new(span, ExprNode::Send {
+            recv: None, method: Symbol::from("where"), args: vec![], block: None, parenthesized: false,
+        })),
+        method: Symbol::from("not"), args: vec![pair.clone()], block: None, parenthesized: true,
+    });
+    items.push(ModelBodyItem::Scope {
+        scope: Scope { name: Symbol::from(format!("not_{base}")), params: Vec::new(), body: where_not },
+        leading_comments: Vec::new(), leading_blank_line: false,
+    });
+}
+if generate.instance_methods {
+            // Aliases share their stored value and therefore their
+            // canonical reader label. Every alias predicate is true
+            // for that value, even though the reader names only the first.
+            let predicate_label = literal_mapping.as_ref().and_then(|mapping| {
+                let EnumStored::Lit(value) = &stored else { return None };
+                mapping.iter().find(|(_, v)| v == value).map(|(label, _)| label.clone())
+            }).unwrap_or_else(|| label.clone());
+            let mut predicate = method_def(
+                format!("{base}?"),
+                Expr::new(
+                    span,
+                    ExprNode::Send {
+                        recv: Some(column_read()),
+                        method: Symbol::from("=="),
+                        args: vec![if reads_label {
+                            Expr::new(span, ExprNode::Lit { value: Literal::Str { value: predicate_label } })
+                        } else { stored_expr() }],
+                        block: None,
+                        parenthesized: false,
+                    },
+                ),
+            );
+            if items.is_empty() {
+                if let ModelBodyItem::Method { leading_comments: lc, .. } = &mut predicate {
+                    *lc = leading_comments.to_vec();
+                }
+            }
+            items.push(predicate);
+            items.push(method_def(format!("{base}!"), call_with_pair("update!")));
+        }
     }
     // `Model.statuses`: every label, identifier or not, keyed by String as Rails' mapping is.
     let mapping_hash = Expr::new(
@@ -1043,7 +1054,7 @@ pub(super) fn expand_enum_decl(
                 .map(|(label, value)| {
                     (
                         Expr::new(span, ExprNode::Lit { value: Literal::Str { value: label.clone() } }),
-                        Expr::new(span, ExprNode::Lit { value: value.clone() }),
+                        match value { EnumStored::Lit(value) => Expr::new(span, ExprNode::Lit { value: value.clone() }), EnumStored::Expr(expr) => expr.clone() },
                     )
                 })
                 .collect(),
@@ -1071,143 +1082,304 @@ pub(super) fn expand_enum_decl(
         leading_comments: Vec::new(),
         leading_blank_line: false,
     });
-    Ok(Some(EnumExpansion { column: Symbol::from(column.as_str()), mapping: labels, default, items }))
+    let mapping = all_labels
+        .iter()
+        .map(|(l, v)| match v {
+            EnumStored::Lit(lit) => Some((l.clone(), lit.clone())),
+            EnumStored::Expr(_) => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    Ok(Some(EnumExpansion { column: Symbol::from(column.as_str()), mapping, default, items }))
+}
+
+/// Whether an `enum` declaration generates its scopes and its
+/// predicate/bang-writer methods. Rails' `scopes: false` and
+/// `instance_methods: false` (and the pre-7 `_scopes:` /
+/// `_instance_methods:` spellings) switch each family off; both are on
+/// by default.
+struct EnumGenerate {
+    scopes: bool,
+    instance_methods: bool,
+}
+
+impl Default for EnumGenerate {
+    fn default() -> Self {
+        EnumGenerate { scopes: true, instance_methods: true }
+    }
+}
+
+impl EnumGenerate {
+    fn from_options(elements: &ruby_prism::NodeList<'_>) -> Self {
+        let mut out = EnumGenerate::default();
+        for el in elements.iter() {
+            let Some(assoc) = el.as_assoc_node() else { continue };
+            let Some(key) = symbol_value(&assoc.key()) else { continue };
+            if assoc.value().as_false_node().is_none() {
+                continue;
+            }
+            match key.trim_start_matches('_') {
+                "scopes" => out.scopes = false,
+                "instance_methods" => out.instance_methods = false,
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// The stored value of one enum label. A literal is what Rails' own
+/// table holds and what other passes rewrite hand-written sites with; an
+/// expression (`Status::ARCHIVED`, `Eligibility::Paused.serialize`)
+/// is a value only the running program knows. The generated scope and
+/// predicate use it either way — they compare against the column, not
+/// against a constant folded at ingest.
+#[derive(Clone)]
+enum EnumStored {
+    Lit(Literal),
+    Expr(Expr),
+}
+
+/// Constants a class body assigns that an `enum` declaration below them
+/// may name: the mapping itself (`enum :status, STATUSES`), a label
+/// (`NAME => NAME`, `"#{PENDING}": 1`) or a stored value
+/// (`active: ACTIVE`). Collected in source order so an alias
+/// (`ASSOCIATE = POS_USER`) resolves through the constant it names.
+#[derive(Default)]
+pub(super) struct ClassConsts {
+    /// `NAME = "x"`, `NAME = :x`, `NAME = 3`, `NAME = OTHER`.
+    scalars: std::collections::HashMap<String, Literal>,
+    /// `NAME = %i[…]` / `{ … }`, as the mapping an enum would build.
+    mappings: std::collections::HashMap<String, Vec<(String, EnumStored)>>,
+    /// `NAME = %i[…]` / `%w[…]` — the bare labels, for the idioms that
+    /// derive a mapping from them (`NAME.index_by(&:to_s)`).
+    labels: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl ClassConsts {
+    pub(super) fn collect(stmts: &[Node<'_>], file: &str) -> Self {
+        let mut out = ClassConsts::default();
+        for stmt in stmts {
+            let Some(cw) = stmt.as_constant_write_node() else { continue };
+            let name = constant_id_str(&cw.name()).to_string();
+            let value = cw.value();
+            if let Some(lit) = out.scalar(&value) {
+                out.scalars.insert(name, lit);
+                continue;
+            }
+            if let Some(labels) = label_list(&value) {
+                out.labels.insert(name.clone(), labels);
+            }
+            // A failure to ingest a value is not this pass's to report:
+            // the constant is simply not usable as a mapping, and the
+            // enum that names it says so.
+            if let Ok(Some(mapping)) = enum_label_values(&value, file, &out, &|_| None) {
+                out.mappings.insert(name, mapping);
+            }
+        }
+        out
+    }
+
+    /// A scalar the class body can fold: a string, a symbol (stored as
+    /// its string, which is what a string column holds), an integer,
+    /// or a constant already folded. `.freeze` is transparent.
+    fn scalar(&self, node: &Node<'_>) -> Option<Literal> {
+        if let Some(call) = node.as_call_node() {
+            if constant_id_str(&call.name()) == "freeze" && call.arguments().is_none() {
+                return self.scalar(&call.receiver()?);
+            }
+            return None;
+        }
+        if let Some(s) = string_value(node).or_else(|| symbol_value(node)) {
+            return Some(Literal::Str { value: s });
+        }
+        if let Some(i) = node.as_integer_node() {
+            return Some(Literal::Int { value: super::util::integer_i64(&i.value())? });
+        }
+        if let Some(cr) = node.as_constant_read_node() {
+            return self.scalars.get(constant_id_str(&cr.name())).cloned();
+        }
+        None
+    }
+
+    /// A label spelled as a symbol, a string, a folded constant, or an
+    /// interpolation of folded constants (`"#{UNSET_STATUS}": 0`).
+    fn label(&self, node: &Node<'_>) -> Option<String> {
+        if let Some(Literal::Str { value }) = self.scalar(node) {
+            return Some(value);
+        }
+        let parts: Vec<Node<'_>> = if let Some(d) = node.as_interpolated_symbol_node() {
+            d.parts().iter().collect()
+        } else if let Some(d) = node.as_interpolated_string_node() {
+            d.parts().iter().collect()
+        } else {
+            return None;
+        };
+        let mut out = String::new();
+        for part in parts {
+            if let Some(s) = string_value(&part) {
+                out.push_str(&s);
+            } else if let Some(e) = part.as_embedded_statements_node() {
+                let body: Vec<Node<'_>> = e.statements()?.body().iter().collect();
+                let [only] = body.as_slice() else { return None };
+                match self.scalar(only)? {
+                    Literal::Str { value } => out.push_str(&value),
+                    Literal::Int { value } => out.push_str(&value.to_string()),
+                    _ => return None,
+                }
+            } else {
+                return None;
+            }
+        }
+        Some(out)
+    }
+}
+
+/// The bare labels of a `%i[…]` / `%w[…]` array (optionally `.freeze`d).
+fn label_list(node: &Node<'_>) -> Option<Vec<String>> {
+    if let Some(call) = node.as_call_node() {
+        if constant_id_str(&call.name()) == "freeze" && call.arguments().is_none() {
+            return label_list(&call.receiver()?);
+        }
+    }
+    node.as_array_node()?
+        .elements()
+        .iter()
+        .map(|el| symbol_value(&el).or_else(|| string_value(&el)))
+        .collect()
 }
 
 /// Label → stored value for an `enum` mapping. An array literal maps by
 /// index the way Rails does (`%i[active deactivated]` → 0, 1); a hash
 /// literal carries its own values; `%w[…].index_by(&:itself)` — the
-/// idiom for a string-backed column — maps each label to itself; a bare
-/// `CONST` resolves through `class_consts` (the class body's own
-/// `CONST = %i[…]` assignments, collected before this ever runs); a
-/// qualified constant resolves only a cross-file literal string array; and
-/// `<array-expr>.map { |v| [v, v.to_s] }.to_h` / `.index_by(&:to_s)` /
-/// `.index_with(&:to_s)` recurse into whichever of the above
-/// `<array-expr>` already is — Procore's `bid_package.rb` and
-/// `potential_change_order.rb` compute their (string-backed) mapping
-/// this way from a `CONST` instead of writing the hash out by hand, to
-/// keep the column and the constant's allowed values in one place.
-/// `None` for anything else (a computed hash, an unresolvable
-/// constant), which the caller reports as a gap rather than guessing at
-/// storage.
+/// idiom for a string-backed column — maps each label to itself.
+///
+/// A hash label may be a symbol, a string, or a class-body constant
+/// folded through `consts`; a stored value that is not a foldable scalar
+/// is kept as an expression. `Ok(None)` for anything whose LABELS are not
+/// known at ingest (a computed hash, a constant from another file),
+/// which the caller reports as a gap rather than guessing at names.
 fn enum_label_values(
     node: &Node<'_>,
+    file: &str,
+    consts: &ClassConsts,
     resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
-) -> Option<Vec<(String, Literal)>> {
-    // `CONST` — folded in here (rather than only at the `enum_label_values`
-    // call sites) so a computed mapping's `<array-expr>` can ALSO be a
-    // constant, not just the top-level `enum :x, CONST` spelling.
-    if node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some() {
-        return resolve_constant(node);
+) -> IngestResult<Option<Vec<(String, EnumStored)>>> {
+    if node.as_constant_path_node().is_some() {
+        return Ok(resolve_constant(node).map(|pairs| pairs.into_iter().map(|(label, value)| (label, EnumStored::Lit(value))).collect()));
     }
+
     // `%i[…].freeze` / `{ … }.freeze` — the literal is the receiver.
     if let Some(call) = node.as_call_node() {
         if constant_id_str(&call.name()) == "freeze" && call.arguments().is_none() && call.block().is_none() {
             if let Some(recv) = call.receiver() {
-                return enum_label_values(&recv, resolve_constant);
+                return enum_label_values(&recv, file, consts, resolve_constant);
             }
         }
     }
     if let Some(arr) = node.as_array_node() {
-        return arr
-            .elements()
-            .iter()
-            .enumerate()
-            .map(|(i, el)| {
-                symbol_value(&el)
-                    .or_else(|| string_value(&el))
-                    .map(|label| (label, Literal::Int { value: i as i64 }))
-            })
-            .collect();
+        let Some(labels) = label_list(node) else { return Ok(None) };
+        let _ = arr;
+        return Ok(Some(
+            labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, label)| (label, EnumStored::Lit(Literal::Int { value: i as i64 })))
+                .collect(),
+        ));
     }
     if let Some(hash) = node.as_hash_node() {
-        return enum_label_pairs(hash.elements().iter());
+        return enum_label_pairs(hash.elements().iter(), file, consts);
     }
     // `enum :status, processing: 'processing', ready: 'ready'` — Rails 7's
     // dominant spelling. A trailing bare-hash argument (no braces) parses
     // as a `KeywordHashNode`, not a `HashNode`; its elements are the same
     // `AssocNode`s either way, so the extraction logic is shared.
     if let Some(kwhash) = node.as_keyword_hash_node() {
-        return enum_label_pairs(kwhash.elements().iter());
+        return enum_label_pairs(kwhash.elements().iter(), file, consts);
     }
-    let call = node.as_call_node()?;
-    let call_name = constant_id_str(&call.name());
-
-    // `<array-expr>.index_by(&:itself)` / `.index_by(&:to_s)` /
-    // `.index_with(&:itself)` / `.index_with(&:to_s)` — identity string
-    // mappings over the literal/constant input resolved recursively.
-    if call_name == "index_by" || call_name == "index_with" {
-        // These are identity mappings only for the two explicit symbol
-        // procs. Arbitrary blocks (e.g. &:length) must stay ledgered.
-        let block = call.block()?.as_block_argument_node()?;
-        let proc = symbol_value(&block.expression()?)?;
-        if call.arguments().is_some() || !matches!(proc.as_str(), "itself" | "to_s") {
-            return None;
+    let Some(call) = node.as_call_node() else { return Ok(None) };
+    let Some(recv) = call.receiver() else { return Ok(None) };
+    // The labels a derived mapping starts from: a literal array, or a
+    // class-body constant naming one.
+    let labels = || match recv.as_constant_read_node() {
+        Some(cr) => consts.labels.get(constant_id_str(&cr.name())).cloned(),
+        None => label_list(&recv).or_else(|| resolve_constant(&recv).map(|pairs| pairs.into_iter().map(|(label, _)| label).collect())),
+    };
+    let identity = |labels: Vec<String>| {
+        labels
+            .into_iter()
+            .map(|l| (l.clone(), EnumStored::Lit(Literal::Str { value: l })))
+            .collect::<Vec<_>>()
+    };
+    match constant_id_str(&call.name()) {
+        // `%w[ invisible nothing ].index_by(&:itself)`,
+        // `STATUSES.index_with(&:itself)` — the labels ARE the stored
+        // strings. (`&:to_s`/`&:to_sym` on symbols or strings name the
+        // same label.)
+        "index_by" | "index_with" if is_identity_proc(&call) => {
+            Ok(labels().map(identity))
         }
-        let recv = call.receiver()?;
-        let labels = enum_label_values(&recv, resolve_constant)?;
-        return Some(
-            labels
-                .into_iter()
-                .map(|(label, _)| (label.clone(), Literal::Str { value: label }))
-                .collect(),
-        );
+        // `STATUSES.to_h { |status| [status, status.to_s] }`
+        "to_h" if is_identity_pair_block(&call) => Ok(labels().map(identity)),
+        // The same mapping written as `STATUSES.map { |s| [s, s.to_s] }.to_h`.
+        "to_h" if call.arguments().is_none() && call.block().is_none() => {
+            let Some(map) = recv.as_call_node() else { return Ok(None) };
+            if constant_id_str(&map.name()) != "map" || !is_identity_pair_block(&map) {
+                return Ok(None);
+            }
+            let Some(source) = map.receiver() else { return Ok(None) };
+            let labels = match source.as_constant_read_node() {
+                Some(cr) => consts.labels.get(constant_id_str(&cr.name())).cloned(),
+                None => label_list(&source).or_else(|| resolve_constant(&source).map(|pairs| pairs.into_iter().map(|(label, _)| label).collect())),
+            };
+            Ok(labels.map(identity))
+        }
+        _ => Ok(None),
     }
+}
 
-    // `<array-expr>.map { |v| [v, v.to_s] }.to_h` — the other spelling
-    // of the same identity string mapping. Recognized narrowly: the
-    // `map` block takes exactly one parameter, and its body is a
-    // single statement — a 2-element array literal `[v, v.to_s]` built
-    // from that same parameter. Anything looser (a different second
-    // element, extra elements, multiple statements, a differently
-    // shaped block) falls through to `None` — the caller's refusal —
-    // rather than guessing at storage.
-    if call_name == "to_h" && call.arguments().is_none() {
-        let map_call = call.receiver()?;
-        let map_call = map_call.as_call_node()?;
-        if constant_id_str(&map_call.name()) != "map" {
-            return None;
-        }
-        let recv = map_call.receiver()?;
-        let labels = enum_label_values(&recv, resolve_constant)?;
+/// `&:itself` / `&:to_s` / `&:to_sym` as the only argument: the block maps
+/// a label to itself. (`["draft", "active"].index_by(&:to_sym)` keys by
+/// symbol and stores the string; the label text and the stored value are
+/// the same either way.)
+fn is_identity_proc(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(block) = call.block().and_then(|b| b.as_block_argument_node()) else {
+        return false;
+    };
+    block
+        .expression()
+        .and_then(|e| symbol_value(&e))
+        .is_some_and(|s| s == "itself" || s == "to_s" || s == "to_sym")
+}
 
-        let block = map_call.block()?.as_block_node()?;
-        let block_params = block.parameters()?.as_block_parameters_node()?.parameters()?;
-        let requireds: Vec<_> = block_params.requireds().iter().collect();
-        let [only_param] = &requireds[..] else { return None };
-        let only_param = only_param.as_required_parameter_node()?;
-        let param_name = constant_id_str(&only_param.name());
-
-        let body_stmts = flatten_statements(block.body()?);
-        let [body_stmt] = &body_stmts[..] else { return None };
-        let pair = body_stmt.as_array_node()?;
-        let elements: Vec<_> = pair.elements().iter().collect();
-        let [first, second] = &elements[..] else { return None };
-
-        // First element: a bare read of the block param.
-        let lv = first.as_local_variable_read_node()?;
-        if constant_id_str(&lv.name()) != param_name {
-            return None;
-        }
-        // Second element: `<same param>.to_s`.
-        let to_s_call = second.as_call_node()?;
-        if constant_id_str(&to_s_call.name()) != "to_s" || to_s_call.arguments().is_some() {
-            return None;
-        }
-        let to_s_recv = to_s_call.receiver()?.as_local_variable_read_node()?;
-        if constant_id_str(&to_s_recv.name()) != param_name {
-            return None;
-        }
-
-        return Some(
-            labels
-                .into_iter()
-                .map(|(label, _)| (label.clone(), Literal::Str { value: label }))
-                .collect(),
-        );
-    }
-
-    None
+/// `{ |x| [x, x.to_s] }` / `{ |x| [x, x] }`: a `to_h` block pairing each
+/// label with its own string.
+fn is_identity_pair_block(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return false };
+    let Some(params) = block.parameters().and_then(|p| p.as_block_parameters_node()) else {
+        return false;
+    };
+    let Some(pn) = params.parameters() else { return false };
+    let reqs: Vec<_> = pn.requireds().iter().collect();
+    let [only] = reqs.as_slice() else { return false };
+    let Some(rp) = only.as_required_parameter_node() else { return false };
+    let param = constant_id_str(&rp.name()).to_string();
+    let Some(body) = block.body() else { return false };
+    let stmts: Vec<Node<'_>> = flatten_statements(body);
+    let [stmt] = stmts.as_slice() else { return false };
+    let Some(arr) = stmt.as_array_node() else { return false };
+    let els: Vec<Node<'_>> = arr.elements().iter().collect();
+    let [k, v] = els.as_slice() else { return false };
+    let is_param = |n: &Node<'_>| {
+        n.as_local_variable_read_node().is_some_and(|l| constant_id_str(&l.name()) == param)
+    };
+    is_param(k)
+        && (is_param(v)
+            || v.as_call_node().is_some_and(|c| {
+                constant_id_str(&c.name()) == "to_s"
+                    && c.arguments().is_none()
+                    && c.receiver().is_some_and(|r| is_param(&r))
+            }))
 }
 
 /// The one admitted consumer of enum-valued reads. Shared with the source
@@ -1256,21 +1428,21 @@ fn serialized_enum_receiver<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
 /// `{ … }` or left the braces off.
 fn enum_label_pairs<'a>(
     elements: impl Iterator<Item = Node<'a>>,
-) -> Option<Vec<(String, Literal)>> {
-    elements
-        .map(|el| {
-            let assoc = el.as_assoc_node()?;
-            let label = symbol_value(&assoc.key()).or_else(|| string_value(&assoc.key()))?;
-            let value = assoc.value();
-            let lit = if let Some(s) = string_value(&value) {
-                Literal::Str { value: s }
-            } else {
-                let raw = value.as_integer_node()?;
-                Literal::Int { value: super::util::integer_i64(&raw.value())? }
-            };
-            Some((label, lit))
-        })
-        .collect()
+    file: &str,
+    consts: &ClassConsts,
+) -> IngestResult<Option<Vec<(String, EnumStored)>>> {
+    let mut out = Vec::new();
+    for el in elements {
+        let Some(assoc) = el.as_assoc_node() else { return Ok(None) };
+        let Some(label) = consts.label(&assoc.key()) else { return Ok(None) };
+        let value = assoc.value();
+        let stored = match consts.scalar(&value) {
+            Some(lit) => EnumStored::Lit(lit),
+            None => EnumStored::Expr(ingest_expr(&value, file)?),
+        };
+        out.push((label, stored));
+    }
+    Ok(Some(out))
 }
 
 /// `prefix:`/`suffix:` from an `enum`'s option hash. `true` means "use

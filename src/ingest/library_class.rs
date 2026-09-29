@@ -3151,11 +3151,11 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // User::Role. Expanded here for the same reason the
                 // model walk expands it: one statement, many items.
                 if let Some(call) = inner.as_call_node() {
-                    match super::model::expand_enum_decl(
-                        &call, file, &[], &|_| None,
-                    ) {
+                    match super::model::expand_enum_decl(&call, file, &[], &super::model::ClassConsts::default(), &|_| None) {
                         Ok(Some(expanded)) => {
-                            enums.push((expanded.column, expanded.mapping));
+                            if let Some(mapping) = expanded.mapping {
+                                enums.push((expanded.column, mapping));
+                            }
                             items.extend(expanded.items);
                             continue;
                         }
