@@ -819,6 +819,10 @@ impl Analyzer {
             }
         }
 
+        // Classes a locked gem's RBI declares. After everything the app
+        // and the catalog register, so it only ever adds.
+        registry::gem_boundary::register(&mut classes, app);
+
         // A class named in a signature means the lexically nearest one
         // (`Capabilities::Charge` inside `ShopifyPayments::Capability`),
         // which is only knowable once every class is registered.
