@@ -3331,6 +3331,7 @@ impl Analyzer {
 
         self.harvest_block_value_methods(app);
         self.fold_concern_surfaces(app);
+        self.fold_extended_modules(app);
         self.fold_current_attribute_forwarders(app);
     }
 
@@ -3431,6 +3432,97 @@ impl Analyzer {
     /// (rather than chasing includes at dispatch time) means every
     /// consumer — dispatch, `ide::members_of`, completion — sees the
     /// mixed-in surface identically.
+
+    /// `extend Mod` in a class body: Mod's INSTANCE methods become the
+    /// class's singleton methods (`extend TrackCurrent` gives `User.current`,
+    /// `User.with_current`). Folded the way an `include`d module's surface
+    /// is, onto the class-side table, with the class's own methods winning.
+    /// `extend self` is the module-function idiom, handled at ingest.
+    fn fold_extended_modules(&mut self, app: &App) {
+        let mut wanted: Vec<(ClassId, Vec<ClassId>)> = Vec::new();
+        let extends_of = |exprs: &mut dyn Iterator<Item = &Expr>, owner: &ClassId| {
+            let mut out: Vec<ClassId> = Vec::new();
+            for expr in exprs {
+                let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+                if method.as_str() != "extend" {
+                    continue;
+                }
+                for arg in args {
+                    let ExprNode::Const { path } = &*arg.node else { continue };
+                    let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                    // Lexical resolution: the enclosing scopes outward.
+                    let mut scope: Vec<&str> = owner.0.as_str().split("::").collect();
+                    let mut resolved = None;
+                    loop {
+                        let candidate = if scope.is_empty() {
+                            written.clone()
+                        } else {
+                            format!("{}::{written}", scope.join("::"))
+                        };
+                        if self.classes.contains_key(&ClassId(Symbol::from(candidate.as_str()))) {
+                            resolved = Some(ClassId(Symbol::from(candidate.as_str())));
+                            break;
+                        }
+                        if scope.is_empty() {
+                            break;
+                        }
+                        scope.pop();
+                    }
+                    if let Some(id) = resolved {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        };
+        for model in &app.models {
+            let mut items = model.body.iter().filter_map(|item| match item {
+                ModelBodyItem::Unknown { expr, .. } => Some(expr),
+                _ => None,
+            });
+            let ext = extends_of(&mut items, &model.name);
+            if !ext.is_empty() {
+                wanted.push((model.name.clone(), ext));
+            }
+        }
+        for lc in &app.library_classes {
+            let ext = extends_of(&mut lc.unknown_calls.iter(), &lc.name);
+            if !ext.is_empty() {
+                wanted.push((lc.name.clone(), ext));
+            }
+        }
+        let module_ids: std::collections::HashSet<&ClassId> =
+            app.library_classes.iter().filter(|lc| lc.is_module).map(|lc| &lc.name).collect();
+        for (id, modules) in wanted {
+            let mut queue = modules;
+            let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
+            let mut qi = 0;
+            while qi < queue.len() {
+                let m = queue[qi].clone();
+                qi += 1;
+                if !module_ids.contains(&m) {
+                    continue;
+                }
+                let Some(module) = self.classes.get(&m) else { continue };
+                let inst = module.instance_methods.clone();
+                for n in module.includes.clone() {
+                    if seen.insert(n.clone()) {
+                        queue.push(n);
+                    }
+                }
+                let folded = self.concern_folded.entry(id.clone()).or_default();
+                let cls = self.classes.entry(id.clone()).or_default();
+                for (name, ty) in inst {
+                    if cls.class_methods.contains_key(&name) && !folded.1.contains(&name) {
+                        continue;
+                    }
+                    cls.class_methods.insert(name.clone(), ty);
+                    folded.1.insert(name);
+                }
+            }
+        }
+    }
+
     fn fold_concern_surfaces(&mut self, app: &App) {
         type Surface = (HashMap<Symbol, Ty>, HashMap<Symbol, Ty>, Vec<ClassId>);
         let module_surfaces: HashMap<ClassId, Surface> = app
