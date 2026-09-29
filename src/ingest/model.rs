@@ -67,6 +67,31 @@ pub fn ingest_table_name_prefixes(source: &[u8], file: &str) -> TablePrefixes {
     out
 }
 
+/// `self.table_name = "remote_domains"` in a model body: the class
+/// stores in that table, whatever its name would derive. It is the
+/// entire table declaration for a renamed table, so a model that
+/// says it reads the columns of THAT table -- with the conventional
+/// name looked up instead, a `DomainSubscription` over `remote_domains`
+/// had no `shop_id` at all. Only a literal string or symbol counts; a
+/// computed name would have to run to be known.
+fn explicit_table_name(body: ruby_prism::Node<'_>) -> Option<String> {
+    for stmt in flatten_statements(body) {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if constant_id_str(&call.name()) != "table_name=" {
+            continue;
+        }
+        if call.receiver().and_then(|r| r.as_self_node()).is_none() {
+            continue;
+        }
+        let args = call.arguments()?;
+        let first = args.arguments().iter().next()?;
+        if let Some(name) = string_value(&first).or_else(|| symbol_value(&first)) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Parse a single model file. The first class definition is treated as the
 /// model; any schema-derived attributes are filled in from `schema`.
 pub fn ingest_model(
@@ -101,7 +126,10 @@ pub fn ingest_model(
     // Rails: `full_table_name_prefix + undecorated_table_name`. The
     // prefix comes from the nearest module parent that declares one,
     // searched innermost-out the way `module_parents` walks.
-    let table_name = {
+    let table_name_override = class.body().and_then(explicit_table_name);
+    let table_name = if let Some(t) = table_name_override {
+        t
+    } else {
         let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
         segments.pop();
         let mut prefix = String::new();
