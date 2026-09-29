@@ -53,6 +53,16 @@ impl ConstScope {
     pub fn get(&self, name: &Symbol) -> Option<&Ty> {
         self.own.get(name).or_else(|| self.global.get(name))
     }
+
+    /// Only the constants this scope's class declares itself.
+    pub fn get_own(&self, name: &Symbol) -> Option<&Ty> {
+        self.own.get(name)
+    }
+
+    /// Only the app-wide, by-bare-name registry.
+    pub fn get_global(&self, name: &Symbol) -> Option<&Ty> {
+        self.global.get(name)
+    }
 }
 
 /// Immutable during descent; clone to enter a new scope (Let body,
@@ -504,8 +514,21 @@ impl<'a> BodyTyper<'a> {
                 // capture every qualified read that ends in its name,
                 // including the class of that name.
                 if path.len() == 1 {
-                    if let Some(ty) = ctx.constants.get(&last) {
+                    if let Some(ty) = ctx.constants.get_own(&last) {
                         return ty.clone();
+                    }
+                    // The app-wide map is keyed by bare name and holds
+                    // constants declared inside OTHER classes (a
+                    // `T::Enum` member `ApiClient` in `GiftCard::SourceType`).
+                    // Those are reachable only through their own lexical
+                    // scope, which `lexical_constant` answered above; from
+                    // anywhere else a class of that name at the top level
+                    // is what Ruby finds, so it beats the map.
+                    let top_level_class = self.classes().contains_key(&ClassId(last.clone()));
+                    if !top_level_class {
+                        if let Some(ty) = ctx.constants.get_global(&last) {
+                            return ty.clone();
+                        }
                     }
                 }
                 // A bare class name is read lexically, innermost scope
