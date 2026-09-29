@@ -2214,6 +2214,11 @@ pub(super) fn ingest_library_method(
                 }
             }
         }
+        // `def f(...)`: the forwarded positionals, keywords riding in them
+        // as a trailing Hash (see the `*args, **opts` note below).
+        if super::util::has_forwarding_parameter(&pn) {
+            params.push(Param::rest(Symbol::from(super::util::FORWARDED_REST)));
+        }
         if let Some(krest) = pn.keyword_rest() {
             if let Some(krp) = krest.as_keyword_rest_parameter_node() {
                 if let Some(loc) = krp.name() {
@@ -2261,15 +2266,24 @@ pub(super) fn ingest_library_method(
     // `&block` rides in `MethodDef.block_param`, not the flat list —
     // it occupies the call-site `block:` slot, never `args:`. Mirrors
     // the runtime_src split (see runtime_src::method_params).
-    let block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
-        let name = block
-            .name()
-            .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
-            // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
-            // name so body-side bare-`&` forwarding (`__blk`) binds.
-            .unwrap_or("__blk");
-        Param::positional(Symbol::from(name))
-    });
+    let block_param = def
+        .parameters()
+        .and_then(|pn| pn.block())
+        .map(|block| {
+            let name = block
+                .name()
+                .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
+                // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
+                // name so body-side bare-`&` forwarding (`__blk`) binds.
+                .unwrap_or("__blk");
+            Param::positional(Symbol::from(name))
+        })
+        // `def f(...)` forwards its block under the same binding.
+        .or_else(|| {
+            def.parameters().filter(super::util::has_forwarding_parameter).map(|_| {
+                Param::positional(Symbol::from(super::util::FORWARDED_BLOCK))
+            })
+        });
 
     let body = match def.body() {
         Some(b) => ingest_expr(&b, file)?,

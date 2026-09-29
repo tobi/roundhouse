@@ -1596,6 +1596,7 @@ pub(super) fn ingest_method(
     // library-class path records is recorded here too, in Ruby's
     // declaration order, so the `def` keeps the source arity.
     let mut params: Vec<crate::dialect::Param> = Vec::new();
+    let mut block_param: Option<crate::dialect::Param> = None;
     if let Some(pn) = def.parameters() {
         for req in pn.requireds().iter() {
             if let Some(rp) = req.as_required_parameter_node() {
@@ -1697,6 +1698,15 @@ pub(super) fn ingest_method(
                 }
             }
         }
+        // `def m(...)`: `*rest, **kw, &blk` under names the body's
+        // `foo(...)` forwards. Keywords ride in the rest as a trailing
+        // Hash, as they do for `*args, **opts`.
+        if super::util::has_forwarding_parameter(&pn) {
+            params.push(crate::dialect::Param::rest(Symbol::from(super::util::FORWARDED_REST)));
+            block_param = Some(crate::dialect::Param::positional(Symbol::from(
+                super::util::FORWARDED_BLOCK,
+            )));
+        }
     }
 
     // `&blk` rides in `MethodDef.block_param`, not the flat list, as
@@ -1705,7 +1715,7 @@ pub(super) fn ingest_method(
     // body that passes it on (`each(&blk)`) still binds the name.
     // Ruby 3.4's anonymous `&` gets the same synthesized name the
     // library-class path gives it, so bare-`&` forwarding binds.
-    let block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
+    block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
         let name = block
             .name()
             .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
