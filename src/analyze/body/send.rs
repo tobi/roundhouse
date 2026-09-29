@@ -351,6 +351,7 @@ impl<'a> BodyTyper<'a> {
             Ty::Class { id, .. } if id.0.as_str() == "ActiveModel::Errors" => {
                 match method.as_str() {
                     "each" | "map" | "collect" | "select" | "filter" | "reject"
+                    | "flat_map" | "filter_map" | "find" | "sort_by"
                     | "any?" | "all?" | "none?" => Some(vec![Ty::Class {
                         id: ClassId(Symbol::from("ActiveModel::Error")),
                         args: vec![],
