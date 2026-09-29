@@ -1095,7 +1095,7 @@ impl<'a> BodyTyper<'a> {
                 };
                 // `Parameters` is a Hash-shaped bag: what its own class does
                 // not answer (`fetch`, `each`, `map`, `count`, ...) is the
-                // Hash reading, over the params model's Symbol -> String.
+                // Hash reading, over Symbol -> param value.
                 let recv_ty = match recv_ty {
                     Some(Ty::Class { id, .. })
                         if id.0.as_str() == "ActionController::Parameters"
@@ -1103,7 +1103,7 @@ impl<'a> BodyTyper<'a> {
                             && !self.classes().get(&id).is_some_and(|c|
                                 c.instance_methods.contains_key(method)) =>
                     {
-                        Some(Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) })
+                        Some(send::params_as_hash())
                     }
                     other => other,
                 };

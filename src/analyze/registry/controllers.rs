@@ -475,7 +475,7 @@ pub(in crate::analyze) fn register(
 /// `String | Array[untyped] | ActionController::Parameters`, plus nil
 /// when the key may be absent. Request data is untyped at the element
 /// level (`Array[untyped]`): nothing in the request constrains it.
-fn param_value_ty(nilable: bool) -> Ty {
+pub(crate) fn param_value_ty(nilable: bool) -> Ty {
     let mut variants = vec![
         Ty::Str,
         Ty::Array { elem: Box::new(Ty::Untyped) },
