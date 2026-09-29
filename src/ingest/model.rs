@@ -251,16 +251,27 @@ pub(super) fn ingest_model_with_enum_constants(
             // can't. Library classes get the same treatment one level
             // down, in `walk_decl_body`.
             if let Some(sc) = stmt.as_singleton_class_node() {
-                match ingest_singleton_class_methods(&sc, file) {
-                    Ok(methods) => {
+                match ingest_singleton_class_body(&sc, &owner, file) {
+                    Ok(singleton) => {
                         let mut leading = leading;
                         let mut blank = leading_blank;
-                        for method in methods {
-                            let mut item = ModelBodyItem::Method {
+                        let items = singleton
+                            .methods
+                            .into_iter()
+                            .map(|method| ModelBodyItem::Method {
                                 method,
-                                leading_comments: std::mem::take(&mut leading),
+                                leading_comments: Vec::new(),
                                 leading_blank_line: false,
-                            };
+                            })
+                            .chain(singleton.class_body.into_iter().map(|expr| {
+                                ModelBodyItem::Unknown {
+                                    expr,
+                                    leading_comments: Vec::new(),
+                                    leading_blank_line: false,
+                                }
+                            }));
+                        for mut item in items {
+                            *item.leading_comments_mut() = std::mem::take(&mut leading);
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
@@ -2224,7 +2235,7 @@ mod singleton_visibility_tests {
     fn a_real_statement_in_a_singleton_block_still_refuses() {
         let err = ingest(
             "class Thing < ApplicationRecord\n  \
-             class << self\n    attr_accessor :cache\n  end\nend\n",
+             class << self\n    memoize_everything :cache\n  end\nend\n",
         );
         assert!(err.is_err(), "an unmodeled singleton statement is still an error: {err:?}");
     }

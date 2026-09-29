@@ -1086,7 +1086,7 @@ type DeclBody = (Vec<ClassId>, Vec<MethodDef>, Vec<(Symbol, Expr)>, Vec<Expr>);
 /// `include T::Struct::ActsAsComparable` is deliberately NOT here: it
 /// gives a struct its `==`, which is behavior, and it goes when the
 /// struct itself is lowered.
-fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
+pub(super) fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
     let name = call.name();
     if !matches!(constant_id_str(&name), "extend" | "include") {
         return false;
@@ -1132,7 +1132,7 @@ fn constant_path_written(path: &ruby_prism::ConstantPathNode<'_>) -> String {
 /// constructor and a reader, not an annotation, and deleting it would
 /// leave a class that cannot be built. Those need lowering, not
 /// dropping.
-const SORBET_ANNOTATIONS: &[&str] = &[
+pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "sig",
     "abstract!",
     "interface!",
@@ -1683,7 +1683,7 @@ fn normalize_classvars_to_ivars(e: &mut Expr) {
 /// last `old` already walked on the same side (instance, or class inside
 /// `class << self`). None when either name is not a literal symbol or
 /// the body has not defined `old`.
-fn alias_source(
+pub(super) fn alias_source(
     call: &ruby_prism::CallNode<'_>,
     methods: &[MethodDef],
     class_side: bool,
