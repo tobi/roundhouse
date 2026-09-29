@@ -328,9 +328,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // would hand a strict target a non-null it has to trust.
     let match_data = Ty::Class { id: ClassId(Symbol::from("MatchData")), args: vec![] };
     let str_or_nil_m = Ty::Union { variants: vec![Ty::Str, Ty::Nil] };
-    register_stdlib_class(classes, "Regexp", &[], &[
+    register_stdlib_class(classes, "Regexp", &[
+        // Class side: escaping is a pure String -> String function, `last_match` reads the
+        // `$~` of the previous match, `union` builds a Regexp.
+        ("escape", Ty::Str),
+        ("quote", Ty::Str),
+        ("last_match", Ty::Union { variants: vec![match_data.clone(), Ty::Nil] }),
+        ("union", Ty::Class { id: ClassId(Symbol::from("Regexp")), args: vec![] }),
+    ], &[
         ("match", Ty::Union { variants: vec![match_data.clone(), Ty::Nil] }),
         ("match?", Ty::Bool),
+        ("=~", Ty::Union { variants: vec![Ty::Int, Ty::Nil] }),
+        ("===", Ty::Bool),
         ("source", Ty::Str),
     ]);
     register_stdlib_class(classes, "MatchData", &[], &[
