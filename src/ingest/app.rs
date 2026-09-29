@@ -28,7 +28,7 @@ use super::library_class::{
     ingest_library_classes, ingest_rails_application_singleton_methods,
 };
 use super::model::ingest_model_with_enum_constants;
-use super::routes::ingest_routes_with_draws;
+use super::routes::ingest_routes_with_dsl;
 use super::schema::{ingest_migration, ingest_schema};
 use super::structure_sql::ingest_structure_sql;
 use super::test::ingest_test_files;
@@ -1221,10 +1221,12 @@ end
                     draw_files.insert(key, (split_source, entry.display().to_string()));
                 }
             }
-            if let Some(routes) = unwrap_or_record(ingest_routes_with_draws(
+            let block_wrappers = mapper_extension_block_methods(&app, vfs, dir);
+            if let Some(routes) = unwrap_or_record(ingest_routes_with_dsl(
                 &source,
                 &routes_path.display().to_string(),
                 &draw_files,
+                &block_wrappers,
             ))? {
                 // `to: redirect("/x")` routes point at actions nobody
                 // wrote, so write them: one controller, one action per
@@ -6324,6 +6326,91 @@ fn unqualify_helper_constants(
     }
     e.node
         .for_each_child_mut(&mut |c| unqualify_helper_constants(c, qualified));
+}
+
+/// The block-taking methods an app adds to the routes DSL by prepending
+/// (or including) a module into `ActionDispatch::Routing::Mapper`:
+///
+/// ```ruby
+/// ActionDispatch::Routing::Mapper.prepend(Podding::RoutingAnnotations)
+/// # ... then in routes.rb:
+/// routing_method :main_pod do ... end
+/// ```
+///
+/// Read off the initializers and `lib/` the way Rails loads them: a
+/// top-level `Mapper.prepend(Const)`, with `Const` looked up among the
+/// ingested modules. The methods that take a block are the DSL scopes;
+/// the module's other methods are not.
+fn mapper_extension_block_methods<V: Vfs + ?Sized>(
+    app: &App,
+    vfs: &V,
+    dir: &Path,
+) -> std::collections::HashSet<String> {
+    const TARGET: &str = "Routing::Mapper";
+    let mut modules: Vec<String> = Vec::new();
+    for sub in ["config/initializers", "lib"] {
+        let d = dir.join(sub);
+        if !vfs.is_dir(&d) {
+            continue;
+        }
+        for entry in read_rb_files(vfs, &d).unwrap_or_default() {
+            let Ok(bytes) = vfs.read(&entry) else { continue };
+            // Cheap reject before parsing every initializer and lib file.
+            if !bytes.windows(TARGET.len()).any(|w| w == TARGET.as_bytes()) {
+                continue;
+            }
+            let file = entry.display().to_string();
+            let result = super::prism::parse(&bytes, &file);
+            let src = String::from_utf8_lossy(&bytes).into_owned();
+            let root = result.node();
+            let Some(program) = root.as_program_node() else { continue };
+            for stmt in initializer_statements(&program) {
+                let Some(call) = stmt.as_call_node() else { continue };
+                if !matches!(super::util::constant_id_str(&call.name()), "prepend" | "include") {
+                    continue;
+                }
+                let Some(recv) = call.receiver() else { continue };
+                if constant_text(&recv, &src)
+                    .map(|t| t.trim_start_matches("::") == format!("ActionDispatch::{TARGET}"))
+                    != Some(true)
+                {
+                    continue;
+                }
+                let Some(args) = call.arguments() else { continue };
+                for arg in args.arguments().iter() {
+                    if let Some(name) = constant_text(&arg, &src) {
+                        modules.push(name.trim_start_matches("::").to_string());
+                    }
+                }
+            }
+        }
+    }
+    // The DSL's own scoping macros, which the routes ingest handles
+    // natively; a same-named override in the extension wraps them and
+    // still means the native thing.
+    const NATIVE: [&str; 9] = [
+        "resources", "resource", "collection", "member", "namespace", "scope", "constraints",
+        "concern", "concerns",
+    ];
+    let mut out = std::collections::HashSet::new();
+    for name in modules {
+        let suffix = format!("::{name}");
+        for lc in &app.library_classes {
+            let full = lc.name.0.as_str();
+            if full != name && !full.ends_with(&suffix) {
+                continue;
+            }
+            for m in &lc.methods {
+                if m.receiver == MethodReceiver::Instance
+                    && m.block_param.is_some()
+                    && !NATIVE.contains(&m.name.as_str())
+                {
+                    out.insert(m.name.as_str().to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 // Not left on the declaring base: an abstract base's `enum :state` reads through the subclass's own column reader, which has to know the mapping.
