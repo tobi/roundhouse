@@ -838,6 +838,21 @@ impl Analyzer {
         // and the catalog register, so it only ever adds.
         registry::gem_boundary::register(&mut classes, app);
 
+        // Which registered classes the app itself declares: a bare name
+        // reaches those through Ruby's constant lookup only (see
+        // `ConstIndex`).
+        for id in app
+            .models
+            .iter()
+            .map(|m| &m.name)
+            .chain(app.controllers.iter().map(|c| &c.name))
+            .chain(app.library_classes.iter().map(|lc| &lc.name))
+        {
+            if let Some(info) = classes.get_mut(id) {
+                info.app_declared = true;
+            }
+        }
+
         // A class named in a signature means the lexically nearest one
         // (`Capabilities::Charge` inside `ShopifyPayments::Capability`),
         // which is only knowable once every class is registered.

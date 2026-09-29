@@ -230,6 +230,12 @@ pub struct ClassInfo {
     /// mixin, an ancestor the RBI could not name): a lookup that misses
     /// is unknown, not wrong.
     pub open: bool,
+    /// Declared in the app's own source (a model, controller, or
+    /// library class), as opposed to the framework catalog. An app class
+    /// is reachable from a bare name only through Ruby's constant
+    /// lookup (the lexical scope, then the ancestors), never by its last
+    /// segment alone.
+    pub app_declared: bool,
 }
 
 /// Resolve a single-segment Const ref (like `Const { path:
@@ -310,27 +316,48 @@ fn resolve_owner_path(
 #[derive(Default)]
 pub struct ConstIndex {
     by_last: HashMap<String, Vec<Symbol>>,
+    /// The same, less the classes a bare name cannot reach by its last
+    /// segment: the app's own (Ruby resolves those lexically) and a
+    /// gem's (a gem's nested class is reached by its full name).
+    ambient_by_last: HashMap<String, Vec<Symbol>>,
 }
 
 impl ConstIndex {
     pub fn build(classes: &HashMap<ClassId, ClassInfo>) -> Self {
         let mut by_last: HashMap<String, Vec<Symbol>> = HashMap::new();
-        for key in classes.keys() {
+        let mut ambient_by_last: HashMap<String, Vec<Symbol>> = HashMap::new();
+        for (key, info) in classes.iter() {
             if let Some((_, last)) = key.0.as_str().rsplit_once("::") {
+                if info.gem_boundary {
+                    continue;
+                }
                 by_last.entry(last.to_string()).or_default().push(key.0.clone());
+                if !info.app_declared {
+                    ambient_by_last.entry(last.to_string()).or_default().push(key.0.clone());
+                }
             }
         }
-        Self { by_last }
+        Self { by_last, ambient_by_last }
     }
 
     /// The one qualified class whose name ends in `::written`, when
     /// exactly one does. More than one match is not a guess worth
     /// making.
     fn unique_suffix(&self, written: &str) -> Option<Symbol> {
+        Self::unique_in(&self.by_last, written)
+    }
+
+    /// [`Self::unique_suffix`] over the classes a bare name can reach by
+    /// its last segment alone (see `ambient_by_last`).
+    fn unique_ambient_suffix(&self, written: &str) -> Option<Symbol> {
+        Self::unique_in(&self.ambient_by_last, written)
+    }
+
+    fn unique_in(map: &HashMap<String, Vec<Symbol>>, written: &str) -> Option<Symbol> {
         let last = written.rsplit("::").next()?;
         let suffix = format!("::{written}");
         let mut found: Option<&Symbol> = None;
-        for full in self.by_last.get(last)? {
+        for full in map.get(last)? {
             if full.as_str().ends_with(&suffix) {
                 if found.is_some() {
                     return None; // ambiguous
@@ -364,7 +391,7 @@ fn expand_bare_const(
     if RUBY_TOP_LEVEL.contains(&target) {
         return None;
     }
-    index.unique_suffix(target)
+    index.unique_ambient_suffix(target)
 }
 
 /// Reusable body-type walker. Holds a borrow of the dispatch table so
