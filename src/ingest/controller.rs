@@ -101,6 +101,17 @@ pub(super) fn ingest_controller_with_nesting(
     let Some(class) = class else {
         return Ok(None);
     };
+    // No `*Controller` class in the file: the first class is only a
+    // controller when it descends from one. `app/controllers/` also
+    // holds plain objects (a redirection strategy, a request-options
+    // struct nested in a concern, a `FormBuilder` subclass), and
+    // ingesting those as controllers types their `initialize` as an
+    // action: no default-value typing, no ivar environment, so every
+    // ivar they assign reads `has no known type`. `Ok(None)` hands the
+    // file to the library-class path, where a class is a class.
+    if chosen_idx.is_none() && !descends_from_controller(&class) {
+        return Ok(None);
+    }
 
     let mut name_path = scope;
     name_path.extend(class_name_path(&class).ok_or_else(|| IngestError::Unsupported {
@@ -908,4 +919,16 @@ pub fn render_template_name(args: &[Expr]) -> Option<Symbol> {
         }),
         _ => None,
     }
+}
+
+/// Whether `class`'s superclass names a controller: anything under
+/// `ActionController::` (`Base`, `API`, `Metal`), or a constant whose
+/// last segment ends in `Controller` (`ApplicationController`,
+/// `Admin::SectionController`).
+fn descends_from_controller(class: &ruby_prism::ClassNode<'_>) -> bool {
+    let Some(parent) = class.superclass().and_then(|n| constant_path_of(&n)) else {
+        return false;
+    };
+    parent.first().is_some_and(|s| s == "ActionController")
+        || parent.last().is_some_and(|s| s.ends_with("Controller"))
 }
