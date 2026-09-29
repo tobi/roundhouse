@@ -1167,6 +1167,19 @@ impl<'a> BodyTyper<'a> {
                 if id.0.as_str() == "Process" && method.as_str() == "pid" {
                     return Ty::Int;
                 }
+                // `Process.clock_gettime(clock, unit = :float_second)`:
+                // the `:float_*` units answer Float; every other unit
+                // (`:millisecond`, `:microsecond`, `:nanosecond`, …)
+                // answers Integer. No unit means Float.
+                if id.0.as_str() == "Process" && method.as_str() == "clock_gettime" {
+                    return match call_args.get(1).map(|a| &*a.node) {
+                        None => Ty::Float,
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) => {
+                            if value.as_str().starts_with("float_") { Ty::Float } else { Ty::Int }
+                        }
+                        Some(_) => Ty::Untyped,
+                    };
+                }
                 // JSON stdlib — `JSON.generate` and `JSON.dump` return
                 // String; `JSON.parse` / `JSON.load` return parsed
                 // structure (untyped — the body is genuinely
