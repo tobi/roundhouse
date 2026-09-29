@@ -597,6 +597,11 @@ fn sorbet_ty(
                     key: Box::new(key.clone()),
                     value: Box::new(value.clone()),
                 }),
+                // A generic class applied to arguments (`Shopify::Adt::Result[A, B]`).
+                (name, _) if !name.starts_with("T::") && !name.is_empty() => Some(Ty::Class {
+                    id: ClassId(Symbol::new(name)),
+                    args,
+                }),
                 _ => None,
             };
         }
