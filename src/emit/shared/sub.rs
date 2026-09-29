@@ -66,6 +66,9 @@ pub fn classify_sub<'a>(lhs: &'a Expr, rhs: &'a Expr) -> SubCase<'a> {
     match (lhs_ty, rhs_ty) {
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => SubCase::Numeric,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => SubCase::NumericPromote,
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => {
+            SubCase::NumericPromote
+        }
         (Ty::Array { elem: l }, Ty::Array { .. }) => {
             SubCase::ArrayDifference { elem: l.as_ref() }
         }
