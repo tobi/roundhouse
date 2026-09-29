@@ -1678,7 +1678,7 @@ end
 
     // Before the splice: it (and every later consumer) looks concerns up
     // by ClassId, so the lexical-scope resolution has to have happened.
-    qualify_relative_model_includes(&mut app);
+    qualify_relative_includes(&mut app);
     // Before the concern splices: they read `library_classes`, and this
     // turns `Current`'s metaprogrammed surface into real methods first.
     super::current_attributes::lower_current_attributes(&mut app);
@@ -3576,25 +3576,36 @@ fn qualify_relative_controller_superclasses(
     }
 }
 
-/// Resolve a model's `include <Const>` against Ruby's lexical scope:
-/// inside `class User`, `include Avatar` names `User::Avatar` when such
-/// a module exists, and only falls back to a top-level `Avatar`.
+/// Resolve an `include <Const>` against Ruby's lexical scope.
+///
+/// Inside `class User`, `include Avatar` names `User::Avatar` when such
+/// a module exists, and only falls back to a top-level `Avatar`. The
+/// same walk covers a namespaced owner: in `module Auth; class
+/// SessionsController`, `include Concerns::RequireClient` names
+/// `Auth::SessionsController::Concerns::RequireClient`, then
+/// `Auth::Concerns::RequireClient`, then `Concerns::RequireClient`,
+/// innermost first, the way `Module.nesting` is consulted.
 ///
 /// Campfire keeps every model concern that way —
 /// `app/models/user/{avatar,bannable,bot,mentionable,role,transferable}.rb`
 /// each declare `module User::Avatar` and friends — so the unqualified
 /// ClassId matched no ingested module and the whole mixed-in surface
 /// (`ban`, `create_bot!`, `active_bots`, `from_avatar_token`) dispatched
-/// into nothing.
+/// into nothing. Shopify's customer-authentication controllers keep
+/// theirs one namespace up (`Auth::Concerns::RequireClient`, included
+/// as `Concerns::RequireClient`), so every ivar those concerns write
+/// (`@client_id`, `@redirect_uri`) read as `has no known type` in the
+/// includer.
 ///
 /// Rewrites the IR node rather than resolving at each consumer:
-/// `model_includes` (analyze), `splice_concerns_into_models` above, and
-/// every emitter that re-emits the line then read one qualified path.
-/// Narrow trigger — only when `<Model>::<Const>` actually names an
-/// ingested module, so apps whose concerns live at the top level
+/// `model_includes` / `controller_includes` (analyze),
+/// `splice_concerns_into_models` above, and every emitter that
+/// re-emits the line then read one qualified path. Narrow trigger —
+/// only when some `<scope>::<Const>` actually names an ingested module,
+/// so apps whose concerns live at the top level
 /// (`app/models/concerns/…`) are untouched.
-fn qualify_relative_model_includes(app: &mut App) {
-    use crate::dialect::ModelBodyItem;
+fn qualify_relative_includes(app: &mut App) {
+    use crate::dialect::{ControllerBodyItem, ModelBodyItem};
     use crate::expr::ExprNode;
 
     let known: std::collections::HashSet<crate::ident::ClassId> = app
@@ -3604,27 +3615,58 @@ fn qualify_relative_model_includes(app: &mut App) {
         .chain(app.concern_model_items.keys().cloned())
         .collect();
 
+    /// `path` as written inside `owner`, when a nesting scope above it
+    /// (innermost first) defines it. `None` leaves the node alone.
+    fn resolve(
+        owner: &str,
+        path: &[crate::ident::Symbol],
+        known: &std::collections::HashSet<crate::ident::ClassId>,
+    ) -> Option<Vec<crate::ident::Symbol>> {
+        let scope: Vec<&str> = owner.split("::").collect();
+        let tail = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        for depth in (1..=scope.len()).rev() {
+            let candidate = format!("{}::{tail}", scope[..depth].join("::"));
+            if known.contains(&crate::ident::ClassId(crate::ident::Symbol::from(
+                candidate.as_str(),
+            ))) {
+                return Some(candidate.split("::").map(crate::ident::Symbol::from).collect());
+            }
+        }
+        None
+    }
+
+    fn rewrite_include(
+        expr: &mut crate::expr::Expr,
+        owner: &str,
+        known: &std::collections::HashSet<crate::ident::ClassId>,
+    ) {
+        let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else {
+            return;
+        };
+        if method.as_str() != "include" {
+            return;
+        }
+        for arg in args.iter_mut() {
+            let ExprNode::Const { path } = &mut *arg.node else { continue };
+            if let Some(qualified) = resolve(owner, path, known) {
+                *path = qualified;
+            }
+        }
+    }
+
     for model in &mut app.models {
         let model_name = model.name.0.as_str().to_string();
         for item in &mut model.body {
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
-            let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else {
-                continue;
-            };
-            if method.as_str() != "include" {
-                continue;
-            }
-            for arg in args.iter_mut() {
-                let ExprNode::Const { path } = &mut *arg.node else { continue };
-                let [segment] = &path[..] else { continue };
-                let qualified = crate::ident::ClassId(crate::ident::Symbol::from(format!(
-                    "{model_name}::{}",
-                    segment.as_str()
-                )));
-                if known.contains(&qualified) {
-                    *path = vec![crate::ident::Symbol::from(model_name.as_str()), segment.clone()];
-                }
-            }
+            rewrite_include(expr, &model_name, &known);
+        }
+    }
+
+    for controller in &mut app.controllers {
+        let name = controller.name.0.as_str().to_string();
+        for item in &mut controller.body {
+            let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
+            rewrite_include(expr, &name, &known);
         }
     }
 
@@ -3638,15 +3680,11 @@ fn qualify_relative_model_includes(app: &mut App) {
     for lc in &mut app.library_classes {
         let owner = lc.name.0.as_str().to_string();
         for inc in &mut lc.includes {
-            if inc.0.as_str().contains("::") {
-                continue;
-            }
-            let qualified = crate::ident::ClassId(crate::ident::Symbol::from(format!(
-                "{owner}::{}",
-                inc.0.as_str()
-            )));
-            if known.contains(&qualified) {
-                *inc = qualified;
+            let path: Vec<crate::ident::Symbol> =
+                inc.0.as_str().split("::").map(crate::ident::Symbol::from).collect();
+            if let Some(qualified) = resolve(&owner, &path, &known) {
+                let joined = qualified.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                *inc = crate::ident::ClassId(crate::ident::Symbol::from(joined));
             }
         }
     }
