@@ -366,7 +366,7 @@ pub fn compile_erb_mapped(source: &str) -> (String, Vec<ErbSegment>) {
                     record_code(&mut map, out.len(), ruby, body_start, body);
                     out.push_str(ruby);
                     out.push('\n');
-                    if opens_passthrough_block(ruby) {
+                    for _ in 0..passthrough_blocks_opened(ruby) {
                         stack.push(BlockKind::Pass);
                     }
                 }
@@ -414,6 +414,40 @@ pub(crate) fn is_block_expr(code: &str) -> bool {
         return matches!(last, Some(c) if c.is_whitespace() || c == ')');
     }
     false
+}
+
+/// How many blocks a `<% code %>` tag leaves open, i.e. how many `<% end %>`
+/// tags it will take to close them.
+///
+/// A one-line tag opens at most the block its head names, which
+/// [`opens_passthrough_block`] reads off the text. A multi-statement tag
+/// can open several:
+///
+/// ```erb
+/// <% items.each do |item|
+///      unless item.nil? %>
+///   …
+///   <% end %>
+/// <% end %>
+/// ```
+///
+/// The head test sees `unless item.nil?`, not an opener, so the first
+/// `<% end %>` popped whichever output block enclosed the tag and closed
+/// it with `end).to_s` — the compiled Ruby no longer parsed. The exact
+/// count is the number of `end`s that make the tag parse on its own.
+/// `None`-fallback keeps the head test for tags that never parse alone
+/// (`else`, `elsif`, `when`, `rescue` continuations).
+fn passthrough_blocks_opened(code: &str) -> usize {
+    if code.contains('\n') || code.contains(';') {
+        let mut src = code.to_string();
+        for opened in 0..=8 {
+            if ruby_prism::parse(src.as_bytes()).errors().next().is_none() {
+                return opened;
+            }
+            src.push_str("\nend");
+        }
+    }
+    usize::from(opens_passthrough_block(code))
 }
 
 /// Does `code` (inside a `<% code %>` tag) open a block whose `end` we
