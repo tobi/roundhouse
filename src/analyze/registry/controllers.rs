@@ -111,8 +111,41 @@ pub(in crate::analyze) fn register(
         classes.insert(params_id, p);
         app_ctrl.class_methods.insert(Symbol::from("params"), params_ty);
     }
-    app_ctrl.class_methods.insert(Symbol::from("session"),
-        Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) });
+    // `session` is an `ActionDispatch::Request::Session`, hash-like but not a
+    // Hash: it answers `id`, `options`, `loaded?`, `destroy`, and whatever an app
+    // mixes onto it (core adds `essential`). Typing it `Hash[String, String]`
+    // made every one of those a send_dispatch_failed.
+    {
+        let session_id = ClassId(Symbol::from("ActionDispatch::Request::Session"));
+        let mut session = ClassInfo::default();
+        // An unregistered parent: the rack session hash underneath is not
+        // modeled, so a method this table does not list stays gradual instead
+        // of failing dispatch.
+        session.parent = Some(ClassId(Symbol::from("Rack::Session::Abstract::SessionHash")));
+        for m in ["[]", "fetch", "dig", "delete"] {
+            session.instance_methods.insert(Symbol::from(m), Ty::Untyped);
+        }
+        for m in ["[]=", "store", "clear", "destroy", "update", "merge!", "each", "reload!"] {
+            session.instance_methods.insert(Symbol::from(m), Ty::Untyped);
+        }
+        for m in ["key?", "has_key?", "include?", "empty?", "loaded?", "exists?"] {
+            session.instance_methods.insert(Symbol::from(m), Ty::Bool);
+        }
+        session.instance_methods.insert(Symbol::from("id"), Ty::Union { variants: vec![Ty::Str, Ty::Nil] });
+        session.instance_methods.insert(Symbol::from("keys"), Ty::Array { elem: Box::new(Ty::Str) });
+        session.instance_methods.insert(
+            Symbol::from("options"),
+            Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) },
+        );
+        for m in ["to_hash", "to_h"] {
+            session.instance_methods.insert(
+                Symbol::from(m),
+                Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
+            );
+        }
+        classes.insert(session_id.clone(), session);
+        app_ctrl.class_methods.insert(Symbol::from("session"), Ty::Class { id: session_id, args: vec![] });
+    }
     app_ctrl.class_methods.insert(Symbol::from("render"), Ty::Nil);
     app_ctrl.class_methods.insert(Symbol::from("redirect_to"), Ty::Nil);
     app_ctrl.class_methods.insert(Symbol::from("redirect_back_or_to"), Ty::Nil);
