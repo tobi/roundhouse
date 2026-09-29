@@ -46,3 +46,30 @@ fn without_the_declaration_the_conventional_table_is_used() {
     let f = failures("");
     assert_eq!(f.len(), 1, "no domain_subscriptions table, so no shop_id: {f:?}");
 }
+
+/// `self.table_name_prefix = "three_d_secure_"` in the class body (32
+/// core models, e.g. `ThreeDSecure::Authentication`) prefixes the
+/// derived name the way a namespace module's `table_name_prefix` does.
+#[test]
+fn a_class_level_table_name_prefix_is_applied() {
+    let files: Vec<(&str, String)> = vec![
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema.define do\n  create_table \"three_d_secure_authentications\", force: :cascade do |t|\n    t.string \"status\"\n  end\nend\n".into(),
+        ),
+        (
+            "app/models/three_d_secure/authentication.rb",
+            "module ThreeDSecure\n  class Authentication < ApplicationRecord\n    self.table_name_prefix = \"three_d_secure_\"\n\n    def self.st\n      find_by(id: 1).status\n    end\n  end\nend\n".into(),
+        ),
+    ];
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        files.into_iter().map(|(p, c)| (PathBuf::from(p), c.into_bytes())).collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    let f: Vec<_> = diagnose(&app)
+        .iter()
+        .filter(|d| d.code() == "send_dispatch_failed")
+        .map(|d| format!("{d:?}"))
+        .collect();
+    assert!(f.is_empty(), "unexpected dispatch failures: {f:?}");
+}
