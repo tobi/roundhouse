@@ -615,7 +615,7 @@ impl<'a> BodyTyper<'a> {
     ) -> Ty {
         // `Parameters` is a Hash-shaped bag: what its own class does not
         // answer (`fetch`, `each`, `map`, `count`, ...) is the Hash
-        // reading over the params model's Symbol -> String. Done here,
+        // reading over Symbol -> param value. Done here,
         // not only where a `params` receiver is typed, so the Parameters
         // arm of an element read's union answers the same surface.
         if let Some(Ty::Class { id, .. }) = recv_ty {
@@ -623,7 +623,7 @@ impl<'a> BodyTyper<'a> {
                 && method.as_str() != "new"
                 && !self.classes().get(id).is_some_and(|c| c.instance_methods.contains_key(method))
             {
-                let as_hash = Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) };
+                let as_hash = params_as_hash();
                 return self.dispatch(Some(&as_hash), method, block_ret, args);
             }
         }
@@ -2924,4 +2924,15 @@ fn is_known_module(id: &ClassId) -> bool {
     let root = root.split("::").next().unwrap_or(root);
     super::RUBY_TOP_LEVEL.contains(&root)
         || matches!(root, "ActiveSupport" | "ActiveModel" | "ActiveRecord" | "ActiveJob" | "ActionView" | "ActionController" | "ActionDispatch" | "ActionMailer" | "Rails" | "T" | "Sorbet")
+}
+
+/// `ActionController::Parameters` read as the Hash it stands in for:
+/// Symbol keys over param values (`String | Array | Parameters`), so
+/// `params.fetch(:ids, [])`, `params.each { |k, v| }` and
+/// `params.values` hand out the same element union `params[:k]` does.
+pub(super) fn params_as_hash() -> Ty {
+    Ty::Hash {
+        key: Box::new(Ty::Sym),
+        value: Box::new(crate::analyze::registry::controllers::param_value_ty(false)),
+    }
 }

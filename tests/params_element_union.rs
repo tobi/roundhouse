@@ -94,3 +94,11 @@ fn an_element_handed_to_a_helper_keeps_the_union_in_the_helper() {
     );
     assert!(f.is_empty(), "helper dispatch failures: {f:?}");
 }
+
+#[test]
+fn parameters_read_as_a_hash_of_param_values() {
+    let f = failures(
+        "  def index\n    a = params.fetch(:queues, []).map(&:to_s)\n    b = params[:obj].values.map(&:to_s)\n    params[:obj].each { |k, v| v.to_s }\n    render plain: \"x\"\n  end",
+    );
+    assert!(f.is_empty(), "hash reading dispatch failures: {f:?}");
+}
