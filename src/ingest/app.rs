@@ -1612,7 +1612,9 @@ end
         let Ok(entries) = read_rb_files(vfs, &tree) else { continue };
         for entry in entries {
             let Ok(source) = vfs.read(&entry) else { continue };
-            for (class_id, methods) in super::sorbet_sig::ingest_sorbet_signatures(&source) {
+            let (signatures, abstracts) = super::sorbet_sig::ingest_sorbet_declarations(&source);
+            drop_abstract_stubs(&mut app, &abstracts);
+            for (class_id, methods) in signatures {
                 let declared = app.rbs_signatures.entry(class_id).or_default();
                 for (name, ty) in methods {
                     declared.entry(name).or_insert(ty);
@@ -2237,6 +2239,34 @@ fn synthesize_template_only_actions(app: &mut App) {
 /// emits) and the reference becomes `IntervalHelper::TIME_INTERVALS`,
 /// which is what Ruby's lexical lookup means and what every strict
 /// target can resolve.
+/// A `sig { abstract… }` method is a declaration: its `def` is an empty stub
+/// and the includer supplies the real one. Spliced into the includer, the
+/// stub answered `nil` ahead of the implementation the includer inherits
+/// (a concern declaring `abstract.returns(ActionController::Parameters)
+/// def params; end` made every includer's `params` nil). The sig stays in
+/// `rbs_signatures` as the module's declaration; only the empty body goes.
+fn drop_abstract_stubs(
+    app: &mut App,
+    abstracts: &HashMap<crate::ident::ClassId, std::collections::HashSet<crate::ident::Symbol>>,
+) {
+    for lc in &mut app.library_classes {
+        let Some(names) = abstracts.get(&lc.name) else { continue };
+        lc.methods.retain(|m| {
+            !(matches!(m.receiver, crate::dialect::MethodReceiver::Instance)
+                && names.contains(&m.name)
+                && is_empty_body(&m.body))
+        });
+    }
+}
+
+fn is_empty_body(body: &crate::expr::Expr) -> bool {
+    match &*body.node {
+        crate::expr::ExprNode::Seq { exprs } => exprs.is_empty(),
+        crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil } => true,
+        _ => false,
+    }
+}
+
 fn splice_concerns_into_controllers(app: &mut App) {
     use crate::dialect::{Action, ControllerBodyItem, MethodReceiver, RenderTarget};
     use crate::ty::{Row, Ty};

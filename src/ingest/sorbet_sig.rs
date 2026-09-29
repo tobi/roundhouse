@@ -31,12 +31,25 @@ use super::util::constant_id_str;
 /// Method signatures declared with `sig` in one Ruby file, keyed by the
 /// enclosing class's qualified name.
 pub fn ingest_sorbet_signatures(source: &[u8]) -> HashMap<ClassId, HashMap<Symbol, Ty>> {
+    ingest_sorbet_declarations(source).0
+}
+
+/// Signatures plus the names declared `sig { abstract… }` per class or
+/// module. An abstract method is a declaration with no implementation to
+/// carry: the includer supplies it.
+pub fn ingest_sorbet_declarations(
+    source: &[u8],
+) -> (
+    HashMap<ClassId, HashMap<Symbol, Ty>>,
+    HashMap<ClassId, std::collections::HashSet<Symbol>>,
+) {
     let result = ruby_prism::parse(source);
     let node = result.node();
     let Some(program) = node.as_program_node() else {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     };
     let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
+    let mut abstracts = HashMap::new();
     walk(
         &program.statements().body().iter().collect::<Vec<_>>(),
         None,
@@ -44,9 +57,10 @@ pub fn ingest_sorbet_signatures(source: &[u8]) -> HashMap<ClassId, HashMap<Symbo
         &HashMap::new(),
         &HashMap::new(),
         &mut out,
+        &mut abstracts,
         source,
     );
-    out
+    (out, abstracts)
 }
 
 /// `in_singleton_class` is true while walking a `class << self` body.
@@ -61,6 +75,7 @@ fn walk(
     aliases: &HashMap<String, Ty>,
     rbs_aliases: &crate::rbs::AliasTable,
     out: &mut HashMap<ClassId, HashMap<Symbol, Ty>>,
+    abstracts: &mut HashMap<ClassId, std::collections::HashSet<Symbol>>,
     source: &[u8],
 ) {
     // The `sig` immediately above a `def` is the one that applies to
@@ -92,7 +107,7 @@ fn walk(
                     // matter; an enclosing scope's aliases stay visible.
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, class.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, source);
+                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, source);
                 }
             }
             pending = None;
@@ -105,7 +120,7 @@ fn walk(
                     let statements = body.body().iter().collect::<Vec<_>>();
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, module.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, source);
+                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, source);
                 }
             }
             pending = None;
@@ -120,7 +135,7 @@ fn walk(
         if let Some(singleton) = statement.as_singleton_class_node() {
             if let Some(body) = singleton.body() {
                 if let Some(body) = body.as_statements_node() {
-                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, rbs_aliases, out, source);
+                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, rbs_aliases, out, abstracts, source);
                 }
             }
             pending = None;
@@ -128,6 +143,12 @@ fn walk(
         }
         if let Some(def) = statement.as_def_node() {
             if let (Some(sig), Some(scope)) = (pending.take(), scope) {
+                if !in_singleton_class && def.receiver().is_none() && sig_is_abstract(&statements[sig]) {
+                    abstracts
+                        .entry(ClassId(Symbol::new(scope)))
+                        .or_default()
+                        .insert(Symbol::new(constant_id_str(&def.name())));
+                }
                 if let Some(ty) = signature_ty(&statements[sig], &def, in_singleton_class, aliases) {
                     out.entry(ClassId(Symbol::new(scope)))
                         .or_default()
@@ -295,6 +316,24 @@ fn literal_ty(node: &Node<'_>) -> Option<Ty> {
 fn symbol_name(node: &Node<'_>) -> Option<String> {
     let symbol = node.as_symbol_node()?;
     Some(String::from_utf8_lossy(symbol.value_loc()?.as_slice()).into_owned())
+}
+
+/// Does the `sig` chain carry the `abstract` modifier?
+fn sig_is_abstract(sig: &Node<'_>) -> bool {
+    let Some(call) = sig.as_call_node() else { return false };
+    let Some(block) = call.block() else { return false };
+    let Some(block) = block.as_block_node() else { return false };
+    let Some(body) = block.body() else { return false };
+    let Some(body) = body.as_statements_node() else { return false };
+    let mut link = body.body().iter().next();
+    while let Some(node) = link {
+        let Some(call) = node.as_call_node() else { return false };
+        if constant_id_str(&call.name()) == "abstract" {
+            return true;
+        }
+        link = call.receiver();
+    }
+    false
 }
 
 fn is_sig_call(call: &ruby_prism::CallNode<'_>) -> bool {
