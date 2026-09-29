@@ -92,8 +92,25 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) 
     for (gem, path) in files {
         if let Ok(source) = vfs.read(&path) {
             read_rbi(&source, &gem, &mut boundary);
+            boundary.namespaces.entry(gem).or_default();
         }
     }
+    let mut namespaces = std::mem::take(&mut boundary.namespaces);
+    for (id, class) in &boundary.classes {
+        let content = !class.instance_methods.is_empty()
+            || !class.class_methods.is_empty()
+            || !class.constants.is_empty()
+            || class.parent.is_some()
+            || !class.includes.is_empty()
+            || !class.extends.is_empty()
+            || class.dynamic;
+        if content {
+            if let Some(names) = namespaces.get_mut(&class.gem) {
+                names.insert(id.0.as_str().to_string());
+            }
+        }
+    }
+    boundary.namespaces = namespaces;
     boundary
 }
 

@@ -347,7 +347,7 @@ pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
                         return Some((gem, Some(format!("matches the declared `{dsl}` surface in {}; runtime method availability is unverified", owner.0))));
                     }
                 }
-                match ancestry.as_ref()?.receiver_gem(recv_ty, &census) {
+                match ancestry.as_ref()?.receiver_gem(recv_ty, &census, &|gem, path| app.gem_boundary.declares_path(gem, path)) {
                     GemClaim::Known { gem, constant } => Some((gem, Some(format!(
                         "receiver ancestry reaches `{constant}`; method ownership is unverified"
                     )))),
