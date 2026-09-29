@@ -34,20 +34,22 @@ pub struct Signatures {
 pub fn parse_signatures(source: &str) -> Result<Signatures, String> {
     let signature = parse(source)?;
     let mut out = Signatures::default();
+    let decls: Vec<Node<'_>> = signature.declarations().iter().collect();
+    let top_aliases = resolve_aliases(&decls, None, &AliasTable::new());
 
-    for decl in signature.declarations().iter() {
+    for decl in decls {
         match decl {
             Node::Class(class) => {
                 let scope = declared_name(&class.name());
-                collect_members(class.members().iter(), &mut out, Some(&scope))?;
+                collect_members(class.members().iter(), &mut out, Some(&scope), &top_aliases)?;
             }
             Node::Module(module) => {
                 let scope = declared_name(&module.name());
-                collect_members(module.members().iter(), &mut out, Some(&scope))?;
+                collect_members(module.members().iter(), &mut out, Some(&scope), &top_aliases)?;
             }
             Node::Interface(iface) => {
                 let scope = declared_name(&iface.name());
-                collect_members(iface.members().iter(), &mut out, Some(&scope))?;
+                collect_members(iface.members().iter(), &mut out, Some(&scope), &top_aliases)?;
             }
             _ => {}
         }
@@ -74,9 +76,11 @@ pub fn parse_app_signatures(
     let signature = parse(source)?;
     let mut out: std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>> =
         std::collections::HashMap::new();
+    let decls: Vec<Node<'_>> = signature.declarations().iter().collect();
+    let top_aliases = resolve_aliases(&decls, None, &AliasTable::new());
 
-    for decl in signature.declarations().iter() {
-        walk_decl(&decl, None, &mut out)?;
+    for decl in decls {
+        walk_decl(&decl, None, &top_aliases, &mut out)?;
     }
 
     Ok(out)
@@ -187,20 +191,21 @@ fn declared_name(type_name: &ruby_rbs::node::TypeNameNode<'_>) -> String {
 fn walk_decl(
     decl: &Node<'_>,
     parent: Option<&str>,
+    aliases: &AliasTable,
     out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
     match decl {
         Node::Class(class) => {
             let name = namespace_join(parent, &declared_name(&class.name()));
-            collect_class_methods(class.members().iter(), &name, out)?;
+            collect_class_methods(class.members().iter(), &name, aliases, out)?;
         }
         Node::Module(module) => {
             let name = namespace_join(parent, &declared_name(&module.name()));
-            collect_class_methods(module.members().iter(), &name, out)?;
+            collect_class_methods(module.members().iter(), &name, aliases, out)?;
         }
         Node::Interface(iface) => {
             let name = namespace_join(parent, &declared_name(&iface.name()));
-            collect_class_methods(iface.members().iter(), &name, out)?;
+            collect_class_methods(iface.members().iter(), &name, aliases, out)?;
         }
         _ => {}
     }
@@ -210,20 +215,24 @@ fn walk_decl(
 fn collect_class_methods<'a, I: Iterator<Item = Node<'a>>>(
     members: I,
     class_name: &str,
+    outer: &AliasTable,
     out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
     let class_id = ClassId(Symbol::new(class_name));
+    let members: Vec<Node<'a>> = members.collect();
+    let aliases = resolve_aliases(&members, Some(class_name), outer);
+    let aliases = &aliases;
     for member in members {
         match member {
             Node::MethodDefinition(method) => {
                 let name = Symbol::new(method.name().as_str());
-                let ty = method_signature_ty(&method, Some(class_name))?;
+                let ty = method_signature_ty(&method, Some(class_name), aliases)?;
                 out.entry(class_id.clone()).or_default().insert(name, ty);
             }
             // Nested class/module inside this one — recurse with the
             // combined namespace.
             Node::Class(_) | Node::Module(_) | Node::Interface(_) => {
-                walk_decl(&member, Some(class_name), out)?;
+                walk_decl(&member, Some(class_name), aliases, out)?;
             }
             _ => {}
         }
@@ -242,7 +251,11 @@ fn collect_members<'a, I: Iterator<Item = Node<'a>>>(
     members: I,
     out: &mut Signatures,
     scope: Option<&str>,
+    outer: &AliasTable,
 ) -> Result<(), String> {
+    let members: Vec<Node<'a>> = members.collect();
+    let aliases = resolve_aliases(&members, scope, outer);
+    let aliases = &aliases;
     for member in members {
         match member {
             Node::MethodDefinition(method) => {
@@ -250,7 +263,7 @@ fn collect_members<'a, I: Iterator<Item = Node<'a>>>(
                 if method_is_abstract(&method) {
                     out.abstract_methods.insert(name.clone());
                 }
-                let ty = method_signature_ty(&method, scope)?;
+                let ty = method_signature_ty(&method, scope, aliases)?;
                 out.methods.push((name, ty));
             }
             // Nested class / module / interface — recurse so methods
@@ -261,15 +274,15 @@ fn collect_members<'a, I: Iterator<Item = Node<'a>>>(
             // class refs inside qualify correctly.
             Node::Class(class) => {
                 let nested_scope = namespace_join(scope, &declared_name(&class.name()));
-                collect_members(class.members().iter(), out, Some(&nested_scope))?;
+                collect_members(class.members().iter(), out, Some(&nested_scope), aliases)?;
             }
             Node::Module(module) => {
                 let nested_scope = namespace_join(scope, &declared_name(&module.name()));
-                collect_members(module.members().iter(), out, Some(&nested_scope))?;
+                collect_members(module.members().iter(), out, Some(&nested_scope), aliases)?;
             }
             Node::Interface(iface) => {
                 let nested_scope = namespace_join(scope, &declared_name(&iface.name()));
-                collect_members(iface.members().iter(), out, Some(&nested_scope))?;
+                collect_members(iface.members().iter(), out, Some(&nested_scope), aliases)?;
             }
             _ => {}
         }
@@ -296,11 +309,13 @@ fn method_is_abstract(method: &ruby_rbs::node::MethodDefinitionNode<'_>) -> bool
 fn method_signature_ty(
     method: &ruby_rbs::node::MethodDefinitionNode<'_>,
     scope: Option<&str>,
+    aliases: &AliasTable,
 ) -> Result<Ty, String> {
     // RBS `self` on an instance member is the receiving class; on a
     // singleton member it is the class object. See `TyCtx`.
     let ctx = TyCtx {
         scope,
+        aliases,
         self_is_instance: matches!(
             method.kind(),
             ruby_rbs::node::MethodDefinitionKind::Instance
@@ -650,7 +665,12 @@ fn is_builtin_class_name(name: &str) -> bool {
 struct TyCtx<'a> {
     scope: Option<&'a str>,
     self_is_instance: bool,
+    /// The `type name = ...` aliases visible here, already read to `Ty`.
+    aliases: &'a AliasTable,
 }
+
+/// `type name = ...` declarations in scope, keyed by the name as written.
+pub(crate) type AliasTable = std::collections::HashMap<String, Ty>;
 
 fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
     match node {
@@ -750,11 +770,62 @@ fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
         // spell — that falls through to the error below and stays an
         // honestly unread signature rather than a wrong one.
         Node::SelfType(_) if ctx.self_is_instance => Ok(Ty::SelfInstance),
+        // `type path = Array[String | Integer]` names a type, and a
+        // signature below it says `(path)`. Sorbet's RBS comments
+        // declare them in a class body (`#: type object_type = ::User`),
+        // sidecar `.rbs` files at top level or in a class. Read to a
+        // `Ty` when the declaration is collected; a name nobody in scope
+        // declared stays an unread signature, as it always was.
+        Node::AliasType(alias) => {
+            let written = declared_name(&alias.name());
+            let bare = alias.name().name().as_str().to_string();
+            ctx.aliases
+                .get(&written)
+                .or_else(|| ctx.aliases.get(&bare))
+                .cloned()
+                .ok_or_else(|| format!("unresolved RBS type alias: {written}"))
+        }
         other => Err(format!(
             "unsupported RBS type node: {}",
             type_node_kind(other)
         )),
     }
+}
+
+/// Read the `type name = ...` declarations among `members` to `Ty`,
+/// layered over the enclosing scope's (`outer`), so a nested class sees
+/// the aliases of the classes around it and can shadow them.
+///
+/// An alias may name another declared later, so declarations are read
+/// in passes until one makes no progress; what is still unread then
+/// (a cycle, an unsupported type) is left out, and a signature that
+/// uses it stays unread exactly as before.
+fn resolve_aliases(members: &[Node<'_>], scope: Option<&str>, outer: &AliasTable) -> AliasTable {
+    let mut table = outer.clone();
+    let mut pending: Vec<(String, Node<'_>)> = members
+        .iter()
+        .filter_map(|m| match m {
+            Node::TypeAlias(alias) => Some((declared_name(&alias.name()), alias.type_())),
+            _ => None,
+        })
+        .collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|(name, node)| {
+            let ctx = TyCtx { scope, self_is_instance: true, aliases: &table };
+            match ty_from_node(node, ctx) {
+                Ok(ty) => {
+                    table.insert(name.clone(), ty);
+                    false
+                }
+                Err(_) => true,
+            }
+        });
+        if pending.len() == before {
+            break;
+        }
+    }
+    table
 }
 
 /// Sorbet's `T::` generics and `T::Boolean`, read as the types they

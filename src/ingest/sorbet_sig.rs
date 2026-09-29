@@ -55,6 +55,7 @@ pub fn ingest_sorbet_declarations(
         None,
         false,
         &HashMap::new(),
+        &[],
         &mut out,
         &mut abstracts,
         source,
@@ -72,6 +73,7 @@ fn walk(
     scope: Option<&str>,
     in_singleton_class: bool,
     aliases: &HashMap<String, Ty>,
+    rbs_aliases: &[(String, String)],
     out: &mut HashMap<ClassId, HashMap<Symbol, Ty>>,
     abstracts: &mut HashMap<ClassId, std::collections::HashSet<Symbol>>,
     source: &[u8],
@@ -104,7 +106,8 @@ fn walk(
                     // order of alias and `sig` in the file does not
                     // matter; an enclosing scope's aliases stay visible.
                     let inner = collect_type_aliases(&statements, aliases);
-                    walk(&statements, Some(&name), false, &inner, out, abstracts, source);
+                    let inner_rbs = scoped_rbs_aliases(source, class.location(), &statements, rbs_aliases);
+                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, source);
                 }
             }
             pending = None;
@@ -116,7 +119,8 @@ fn walk(
                 if let Some(body) = body.as_statements_node() {
                     let statements = body.body().iter().collect::<Vec<_>>();
                     let inner = collect_type_aliases(&statements, aliases);
-                    walk(&statements, Some(&name), false, &inner, out, abstracts, source);
+                    let inner_rbs = scoped_rbs_aliases(source, module.location(), &statements, rbs_aliases);
+                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, source);
                 }
             }
             pending = None;
@@ -131,7 +135,7 @@ fn walk(
         if let Some(singleton) = statement.as_singleton_class_node() {
             if let Some(body) = singleton.body() {
                 if let Some(body) = body.as_statements_node() {
-                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, out, abstracts, source);
+                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, rbs_aliases, out, abstracts, source);
                 }
             }
             pending = None;
@@ -152,7 +156,7 @@ fn walk(
                 }
             }
             else if let Some(scope) = scope {
-                if let Some(ty) = rbs_comment_signature(source, &def, in_singleton_class) {
+                if let Some(ty) = rbs_comment_signature(source, &def, in_singleton_class, rbs_aliases) {
                     out.entry(ClassId(Symbol::new(scope)))
                         .or_default()
                         .insert(Symbol::new(constant_id_str(&def.name())), ty);
@@ -680,9 +684,15 @@ fn rbs_comment_signature(
     source: &[u8],
     def: &ruby_prism::DefNode<'_>,
     in_singleton_class: bool,
+    rbs_aliases: &[(String, String)],
 ) -> Option<Ty> {
     let text = rbs_comment_text(source, def.location().start_offset())?;
-    let wrapped = format!("class X\n  def m: {text}\nend\n");
+    // A `#: type name = ...` comment is a declaration, not a signature.
+    if text.starts_with("type ") {
+        return None;
+    }
+    let declarations = referenced_alias_declarations(&text, rbs_aliases);
+    let wrapped = format!("class X\n{declarations}  def m: {text}\nend\n");
     let sigs = crate::rbs::parse_signatures(&wrapped).ok()?;
     let Ty::Fn { params: declared, block, ret, effects } = sigs.methods.into_iter().next()?.1 else {
         return None;
@@ -721,6 +731,97 @@ fn rbs_comment_signature(
         params.push(Param { name: Symbol::new(name), ty, kind: ParamKind::Block });
     }
     Some(Ty::Fn { params, block, ret, effects })
+}
+
+/// The `#: type name = ...` aliases a class or module body declares,
+/// layered over the enclosing scope's (`outer`); a name declared again
+/// shadows the outer one.
+///
+/// Sorbet's RBS comments spell a type alias as a comment in the body
+/// (`#: type object_type = ::User`, continued with `#|`) and refer to
+/// it by name from any signature below. The text is kept as written and
+/// handed to the RBS reader with the signature, which is what knows
+/// how to read it. Nested class and module bodies are skipped: an alias
+/// declared there is not visible here.
+fn scoped_rbs_aliases(
+    source: &[u8],
+    body: ruby_prism::Location<'_>,
+    statements: &[Node<'_>],
+    outer: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = outer.to_vec();
+    let Ok(text) = std::str::from_utf8(source) else { return out };
+    let nested: Vec<(usize, usize)> = statements
+        .iter()
+        .filter_map(|s| {
+            let location = s.as_class_node().map(|c| c.location()).or_else(|| s.as_module_node().map(|m| m.location()))?;
+            Some((location.start_offset(), location.end_offset()))
+        })
+        .collect();
+    let mut offset = body.start_offset();
+    let Some(region) = text.get(body.start_offset()..body.end_offset()) else { return out };
+    let mut current: Option<String> = None;
+    let mut declarations: Vec<String> = Vec::new();
+    for line in region.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        if nested.iter().any(|(s, e)| start >= *s && start < *e) {
+            declarations.extend(current.take());
+            continue;
+        }
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("#:").map(str::trim).filter(|r| r.starts_with("type ")) {
+            declarations.extend(current.take());
+            current = Some(rest.to_string());
+        } else if let (Some(rest), Some(open)) = (trimmed.strip_prefix("#|"), current.as_mut()) {
+            open.push(' ');
+            open.push_str(rest.trim());
+        } else {
+            declarations.extend(current.take());
+        }
+    }
+    declarations.extend(current);
+    for declaration in declarations {
+        let name: String = declaration["type ".len()..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        out.retain(|(existing, _)| *existing != name);
+        out.push((name, declaration));
+    }
+    out
+}
+
+/// The alias declarations `text` needs, as RBS lines for the wrapper
+/// class: the ones it names, and the ones those name in turn. Only
+/// those, so an alias this reader cannot parse cannot take down a
+/// signature that never mentions it.
+fn referenced_alias_declarations(text: &str, aliases: &[(String, String)]) -> String {
+    let mut needed: Vec<usize> = Vec::new();
+    let mut frontier: Vec<&str> = vec![text];
+    while let Some(haystack) = frontier.pop() {
+        for (index, (name, declaration)) in aliases.iter().enumerate() {
+            if !needed.contains(&index) && mentions_word(haystack, name) {
+                needed.push(index);
+                frontier.push(declaration);
+            }
+        }
+    }
+    needed.sort_unstable();
+    needed.iter().map(|i| format!("  {}\n", aliases[*i].1)).collect()
+}
+
+fn mentions_word(haystack: &str, word: &str) -> bool {
+    haystack.match_indices(word).any(|(at, _)| {
+        let before = haystack[..at].chars().next_back();
+        let after = haystack[at + word.len()..].chars().next();
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
 }
 
 /// The signature text of the `#:` / `#|` comment lines directly above
