@@ -1076,6 +1076,19 @@ impl<'a> BodyTyper<'a> {
                     Some(r) => Some(self.analyze_expr(r, ctx)),
                     None => ctx.self_ty.clone(),
                 };
+                // Inside the class-side method, the instance a class-side
+                // `new` built (`Ty::SelfInstance`, see below) answers the
+                // methods of the class the `def` sits in: the receiving
+                // subclass is only known at the call site, and what the
+                // body can call on it is the base's surface. The value
+                // itself stays `SelfInstance`, so the method still answers
+                // the receiving class.
+                let recv_ty = match (recv_ty, &ctx.self_ty) {
+                    (Some(t), Some(self_ty @ Ty::Class { .. })) if ctx.class_side => {
+                        Some(t.subst_self(self_ty))
+                    }
+                    (other, _) => other,
+                };
                 // `Parameters` is a Hash-shaped bag: what its own class does
                 // not answer (`fetch`, `each`, `map`, `count`, ...) is the
                 // Hash reading, over the params model's Symbol -> String.
