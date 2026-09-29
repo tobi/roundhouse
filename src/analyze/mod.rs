@@ -774,6 +774,17 @@ impl Analyzer {
         // see `registry::library`.
         registry::library::register(&mut classes, app, &route_helper_names);
 
+        // A helper object built from a YAML table
+        // (`WebUrlHelpers = Factory.create(YAML.load_file(…)["paths"])`):
+        // one path/URL String per generated name. See
+        // `ingest::generated_helpers`.
+        for (constant, names) in &app.generated_helper_methods {
+            let cls = classes.entry(constant.clone()).or_default();
+            for name in names {
+                cls.class_methods.entry(name.clone()).or_insert(Ty::Str);
+            }
+        }
+
         // Controllers: register each as a known class so self-method
         // dispatch (a bare `find_story` inside an action) resolves against
         // the controller's own methods and walks the parent chain to the
