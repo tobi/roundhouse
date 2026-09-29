@@ -56,3 +56,12 @@ fn not_nil_still_checks_the_stripped_type() {
     let f = failures("  def show\n    User.find_by(name: \"a\").not_nil!.frobnicate\n  end");
     assert_eq!(f.len(), 1, "frobnicate must still be reported once: {f:?}");
 }
+
+/// A receiver whose non-nil arm is itself un-inferred (`Var`) stays
+/// gradual, the way union dispatch treats a `Var` arm, rather than
+/// reporting `not_nil!` on `untyped?` (9 such on core).
+#[test]
+fn not_nil_on_an_uninferred_arm_is_not_an_error() {
+    let f = failures("  def show\n    x = UnknownThing.lookup(1) || nil\n    x.not_nil!.anything\n  end");
+    assert!(f.iter().all(|m| !m.contains("not_nil")), "not_nil! must not fail: {f:?}");
+}

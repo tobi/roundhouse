@@ -761,7 +761,12 @@ impl<'a> BodyTyper<'a> {
         // arm by arm reported "no known method `not_nil!` on String".
         if method.as_str() == "not_nil!" && args.is_empty() {
             if let Some(ty) = recv_ty {
-                return ty.clone().strip_nil();
+                // An un-inferred arm stays gradual, as union dispatch
+                // treats it, rather than becoming a second error.
+                return match ty.clone().strip_nil() {
+                    Ty::Var { .. } => Ty::Untyped,
+                    other => other,
+                };
             }
         }
         // `tap` is receiver-identity too — the block's value is
