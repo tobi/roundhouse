@@ -417,9 +417,16 @@ impl<'a> BodyTyper<'a> {
                                 // username and a password. Spread them,
                                 // or the second parameter binds nothing
                                 // and everything read from it is
-                                // untyped.
+                                // untyped. A block of ONE parameter
+                                // yields that parameter's type and a
+                                // block of none yields nothing: the
+                                // block's `Ty::Fn` is its signature,
+                                // not the value it yields. (A stub
+                                // that registers the yielded type
+                                // itself has a non-`Fn` block and
+                                // takes the last arm.)
                                 Ty::Fn { block: Some(block_ty), .. } => match &**block_ty {
-                                    Ty::Fn { params, .. } if params.len() > 1 => Some(
+                                    Ty::Fn { params, .. } => Some(
                                         params
                                             .iter()
                                             .map(|p| p.ty.subst_self(&self_ty))
