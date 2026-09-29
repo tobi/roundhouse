@@ -1568,4 +1568,7 @@ pub struct Fixture {
     pub path: Symbol,
     pub records: IndexMap<Symbol, IndexMap<Symbol, FixtureValue>>,
     pub preamble: Vec<Expr>,
+    /// `_fixture: model_class:` — the class the rows load, for a set
+    /// whose path doesn't name it. `None` derives it from `path`.
+    pub model_class: Option<Symbol>,
 }

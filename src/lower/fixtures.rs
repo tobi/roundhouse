@@ -94,7 +94,10 @@ fn lower_fixture(fixture: &Fixture, app: &App) -> LoweredFixture {
     // flattened `push_subscriptions` names `PushSubscription` — a class
     // no model registers, so `model` below comes back `None` and every
     // field is dropped as "not a known column".
-    let class_name = crate::naming::classify_path(fixture.path.as_str());
+    let class_name = match &fixture.model_class {
+        Some(class) => class.as_str().trim_start_matches("::").to_string(),
+        None => crate::naming::classify_path(fixture.path.as_str()),
+    };
     let class = ClassId(Symbol::from(class_name.as_str()));
     let model = app
         .models

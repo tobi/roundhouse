@@ -143,20 +143,59 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
         values.push(super::expr::ingest_ruby_program(src, &tag_file)?);
     }
 
-    // Parse as a nested mapping of String → String → YAML scalar. We
-    // stringify scalars at load time so the IR representation stays
-    // format-simple; round-trip tests catch any precision loss by
-    // comparing re-ingested YAML.
-    let raw: IndexMap<String, IndexMap<String, serde_yaml_ng::Value>> =
+    // Parse as YAML values, then resolve merge keys (`<<: *defaults`)
+    // the way Psych does before Rails sees the rows. The top level is
+    // label → field map; scalars are stringified at load time so the IR
+    // stays format-simple, and round-trip tests catch precision loss.
+    let mut doc: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&split.yaml).map_err(|e| IngestError::Parse {
             file: file.clone(),
             message: format!("yaml: {e}"),
         })?;
+    resolve_merge_keys(&mut doc);
+    let not_a_set = |what: String| IngestError::Unsupported {
+        file: file.clone(),
+        message: format!("not a fixture set: {what}, where Rails expects label → fields"),
+    };
+    let top = match doc {
+        serde_yaml_ng::Value::Mapping(m) => m,
+        // An empty file (or one that is all comments) is an empty set.
+        serde_yaml_ng::Value::Null => serde_yaml_ng::Mapping::new(),
+        other => return Err(not_a_set(format!("the top level is {}", yaml_kind(&other)))),
+    };
 
+    let mut model_class: Option<Symbol> = None;
+    let mut ignored: Vec<String> = Vec::new();
     let mut records: IndexMap<Symbol, IndexMap<Symbol, FixtureValue>> = IndexMap::new();
-    for (label, fields) in raw {
+    for (label, fields) in top {
+        let label = yaml_scalar_as_string(&label).unwrap_or_default();
+        // `_fixture:` is the file's configuration, not a row: the model
+        // class when the path doesn't name it, and the labels that exist
+        // only to be anchored and merged into others (Rails'
+        // `ActiveRecord::FixtureSet::File#config_row`).
+        if label == "_fixture" {
+            if let Some(class) = fields.get("model_class").and_then(yaml_scalar_as_string) {
+                model_class = Some(Symbol::from(class.as_str()));
+            }
+            match fields.get("ignore") {
+                Some(serde_yaml_ng::Value::Sequence(seq)) => {
+                    ignored.extend(seq.iter().filter_map(yaml_scalar_as_string))
+                }
+                Some(v) => ignored.extend(yaml_scalar_as_string(v)),
+                None => {}
+            }
+            continue;
+        }
+        let fields = match fields {
+            serde_yaml_ng::Value::Mapping(m) => m,
+            serde_yaml_ng::Value::Null => serde_yaml_ng::Mapping::new(),
+            other => {
+                return Err(not_a_set(format!("`{label}` is {}", yaml_kind(&other))));
+            }
+        };
         let mut field_map: IndexMap<Symbol, FixtureValue> = IndexMap::new();
         for (k, v) in fields {
+            let k = yaml_scalar_as_string(&k).unwrap_or_default();
             let s = yaml_scalar_as_string(&v).ok_or_else(|| IngestError::Unsupported {
                 file: file.clone(),
                 message: format!("fixture field {label}.{k} is not a scalar"),
@@ -178,9 +217,13 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
                     });
                 }
             };
-            field_map.insert(Symbol::from(k), value);
+            field_map.insert(Symbol::from(k.as_str()), value);
         }
-        records.insert(Symbol::from(label), field_map);
+        records.insert(Symbol::from(label.as_str()), field_map);
+    }
+    // After merging, so a row that merges an ignored one still has its fields.
+    for label in &ignored {
+        records.shift_remove(&Symbol::from(label.as_str()));
     }
 
     Ok(Fixture {
@@ -188,6 +231,7 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
         path: Symbol::from(rel.as_str()),
         records,
         preamble,
+        model_class,
     })
 }
 
@@ -211,6 +255,46 @@ fn resolve_slot(s: &str, values: &[Expr]) -> SlotMatch {
         }
     }
     SlotMatch::None
+}
+
+/// Resolve YAML merge keys, innermost first: an anchor is copied where
+/// it is aliased, so in a chain (`c` merges `b`, which merges `a`) the
+/// copy of `b` under `c`'s `<<` still carries its own `<<`, and has to
+/// be resolved before `c` takes its fields. A key the mapping sets
+/// itself wins over a merged one, and within `<<: [*a, *b]` the earlier
+/// mapping wins, as in Psych.
+fn resolve_merge_keys(v: &mut serde_yaml_ng::Value) {
+    match v {
+        serde_yaml_ng::Value::Mapping(m) => {
+            for (_, child) in m.iter_mut() {
+                resolve_merge_keys(child);
+            }
+            let Some(merge) = m.remove("<<") else { return };
+            let sources = match merge {
+                serde_yaml_ng::Value::Sequence(seq) => seq,
+                other => vec![other],
+            };
+            for source in sources {
+                if let serde_yaml_ng::Value::Mapping(src) = source {
+                    for (k, val) in src {
+                        m.entry(k).or_insert(val);
+                    }
+                }
+            }
+        }
+        serde_yaml_ng::Value::Sequence(seq) => seq.iter_mut().for_each(resolve_merge_keys),
+        serde_yaml_ng::Value::Tagged(t) => resolve_merge_keys(&mut t.value),
+        _ => {}
+    }
+}
+
+fn yaml_kind(v: &serde_yaml_ng::Value) -> &'static str {
+    match v {
+        serde_yaml_ng::Value::Sequence(_) => "a sequence",
+        serde_yaml_ng::Value::Mapping(_) => "a mapping",
+        serde_yaml_ng::Value::Tagged(_) => "a tagged value",
+        _ => "a scalar",
+    }
 }
 
 fn yaml_scalar_as_string(v: &serde_yaml_ng::Value) -> Option<String> {

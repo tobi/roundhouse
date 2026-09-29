@@ -3083,10 +3083,15 @@ fn extract_kwarg_str(arg: &Node<'_>, key: &str) -> Option<String> {
 /// `read_dir` silently skipped them: the file was never ingested, so
 /// `push_subscriptions(:david_chrome)` reached no method at all.
 /// Non-YAML files in the tree (campfire's `test/fixtures/files/*.png`,
-/// which `file_fixture` reads) are filtered out here as before.
+/// which `file_fixture` reads) are filtered out here as before, and so
+/// is all of `test/fixtures/files/`: it is `file_fixture_path`, data a
+/// test reads, and Rails leaves it out of `fixtures :all` even when the
+/// files there are YAML.
 fn read_yml_files<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
     walk_yml(vfs, dir, &mut out)?;
+    let file_fixtures = dir.join("files");
+    out.retain(|p| !p.starts_with(&file_fixtures));
     out.sort();
     Ok(out)
 }
