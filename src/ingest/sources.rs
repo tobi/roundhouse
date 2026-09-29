@@ -189,6 +189,16 @@ pub(super) fn generated_local_is_reserved(location: &ruby_prism::Location<'_>, n
             .any(|word| word == name.as_bytes())
 }
 
+/// The text registered for `path` during this ingest, if any.
+pub fn text_of(path: &str) -> Option<String> {
+    SOURCES.with(|s| {
+        let reg = s.borrow();
+        let id = reg.by_path.get(path)?;
+        let i = (id.0 as usize).checked_sub(1)?;
+        reg.files.get(i).map(|f| f.text.clone())
+    })
+}
+
 /// The registered path for a `FileId`; `None` for the synthetic
 /// sentinel or an id from another ingest.
 pub fn path_of(id: FileId) -> Option<String> {
