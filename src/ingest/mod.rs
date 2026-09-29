@@ -40,6 +40,7 @@ pub mod rbi;
 pub mod rate_limit;
 pub mod roda_app;
 pub mod routes;
+pub mod singleton_class;
 pub mod schema;
 pub mod sequel_migration;
 pub mod sequel_model;
