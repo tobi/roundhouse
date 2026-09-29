@@ -60,6 +60,22 @@ fn multi_write_target(node: &Node<'_>, file: &str) -> IngestResult<crate::expr::
         let recv = ingest_expr(&it.receiver(), file)?;
         let index = ingest_index_argument(it.arguments(), file)?;
         Ok(crate::expr::LValue::Index { recv, index })
+    } else if let Some(ct) = node.as_constant_target_node() {
+        // `A, B = pair` — class-scoped constants, as `A = …` writes.
+        Ok(crate::expr::LValue::Const { path: vec![Symbol::from(constant_id_str(&ct.name()))] })
+    } else if let Some(cp) = node.as_constant_path_target_node() {
+        // `Foo::A, Foo::B = pair` — qualified constants.
+        let mut path: Vec<Symbol> = cp
+            .parent()
+            .and_then(|p| crate::ingest::util::constant_path_segments_strs(&p))
+            .unwrap_or_default()
+            .into_iter()
+            .map(Symbol::from)
+            .collect();
+        if let Some(id) = cp.name() {
+            path.push(Symbol::from(constant_id_str(&id)));
+        }
+        Ok(crate::expr::LValue::Const { path })
     } else {
         Err(IngestError::Unsupported {
             file: file.into(),
