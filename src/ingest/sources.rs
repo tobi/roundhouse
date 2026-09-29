@@ -199,6 +199,18 @@ pub fn text_of(path: &str) -> Option<String> {
     })
 }
 
+/// Run `f` on the text registered for `path`, without copying it.
+/// For lookups made per expression, where `text_of`'s clone of the
+/// whole file would make ingest quadratic in file size.
+pub fn with_text<R>(path: &str, f: impl FnOnce(&str) -> R) -> Option<R> {
+    SOURCES.with(|s| {
+        let reg = s.borrow();
+        let id = reg.by_path.get(path)?;
+        let i = (id.0 as usize).checked_sub(1)?;
+        reg.files.get(i).map(|file| f(&file.text))
+    })
+}
+
 /// The registered path for a `FileId`; `None` for the synthetic
 /// sentinel or an id from another ingest.
 pub fn path_of(id: FileId) -> Option<String> {

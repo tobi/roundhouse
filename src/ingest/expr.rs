@@ -327,7 +327,45 @@ fn ingest_defined_operand(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     })
 }
 
+/// Whether a trailing `#:` comment after `node` can be a type
+/// ascription of the value it evaluates to.
+///
+/// Writes carry theirs on the assigned value (see the write arms), and
+/// definitions have no value to ascribe. A call whose name ends in `=`
+/// is an attribute or index write, and `attr_reader :x #: Integer`
+/// documents the attribute rather than the call's result.
+fn takes_trailing_ascription(node: &Node<'_>) -> bool {
+    if let Some(call) = node.as_call_node() {
+        let name = call.name();
+        let name = constant_id_str(&name);
+        let is_write = name.ends_with('=')
+            && !matches!(name, "==" | "!=" | "<=" | ">=" | "===");
+        let is_attr = call.receiver().is_none()
+            && matches!(name, "attr_reader" | "attr_writer" | "attr_accessor");
+        return !is_write && !is_attr;
+    }
+    node.as_parentheses_node().is_some()
+        || node.as_local_variable_read_node().is_some()
+        || node.as_instance_variable_read_node().is_some()
+        || node.as_and_node().is_some()
+        || node.as_or_node().is_some()
+        || node.as_super_node().is_some()
+        || node.as_forwarding_super_node().is_some()
+        || node.as_yield_node().is_some()
+}
+
 fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
+    let expr = ingest_expr_node(node, file)?;
+    if !takes_trailing_ascription(node) {
+        return Ok(expr);
+    }
+    Ok(super::type_ascription::ascribe_trailing(
+        expr,
+        super::type_ascription::trailing_ascription(file, node.location().end_offset()),
+    ))
+}
+
+fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     // Byte offsets into the text registered for `file` (the exact text
     // prism is parsing). FileId(0) when the entry point didn't
     // register — spans then render message-only downstream.
@@ -396,10 +434,16 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     // `self #: as untyped` above a leading-dot line:
                     // the assertion sits after the receiver and before
                     // the `.method` it is the receiver of.
-                    Some(super::type_ascription::ascribe(
-                        value,
-                        super::type_ascription::receiver_rbs_assertion(file, r.location().end_offset()),
-                    ))
+                    // Receivers that read their own trailing comment
+                    // (see `takes_trailing_ascription`) already did.
+                    if takes_trailing_ascription(&r) {
+                        Some(value)
+                    } else {
+                        Some(super::type_ascription::ascribe_trailing(
+                            value,
+                            super::type_ascription::receiver_rbs_assertion(file, r.location().end_offset()),
+                        ))
+                    }
                 }
                 None => None,
             };
@@ -990,7 +1034,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let raw = constant_id_str(&w.name());
             let name = raw.strip_prefix('@').unwrap_or(raw);
             let value = ingest_expr(&w.value(), file)?;
-            let value = super::type_ascription::ascribe(value, super::type_ascription::trailing_rbs_type(file, loc.end_offset()));
+            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()));
             ExprNode::Assign {
                 target: crate::expr::LValue::Ivar { name: Symbol::from(name) },
                 value,
@@ -1000,7 +1044,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let w = n.as_local_variable_write_node().unwrap();
             let name = Symbol::from(constant_id_str(&w.name()));
             let value = ingest_expr(&w.value(), file)?;
-            let value = super::type_ascription::ascribe(value, super::type_ascription::trailing_rbs_type(file, loc.end_offset()));
+            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()));
             ExprNode::Assign {
                 target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
                 value,
@@ -1141,7 +1185,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let raw = constant_id_str(&w.name());
             let name = Symbol::from(raw.strip_prefix('@').unwrap_or(raw));
             let value = ingest_expr(&w.value(), file)?;
-            let value = super::type_ascription::ascribe(value, super::type_ascription::trailing_rbs_type(file, loc.end_offset()));
+            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()));
             ExprNode::OpAssign {
                 target: crate::expr::LValue::Ivar { name },
                 op: crate::expr::OpAssignOp::OrOr,

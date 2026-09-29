@@ -53,47 +53,95 @@ pub(super) fn sorbet_declared_type(node: &Node<'_>) -> Option<Ty> {
     sorbet_type_node(&ty)
 }
 
-/// The RBS type in a `#: Type` (or `#: as Type`) comment that follows
-/// the statement ending at byte `end` on the same line.
-pub(super) fn trailing_rbs_type(file: &str, end: usize) -> Option<Ty> {
-    let text = sources::text_of(file)?;
-    let rest = text.get(end..)?;
-    let line = rest.split('\n').next()?;
-    let comment = line.trim_start().strip_prefix("#:")?.trim();
-    let comment = comment.strip_prefix("as ").unwrap_or(comment).trim();
-    rbs_type(comment)
+/// What a trailing `#:` comment on a line says about the expression it
+/// follows.
+pub(super) enum Trailing {
+    /// `#: as Type` / `#: Type` — the value has this type.
+    Type(Ty),
+    /// `#: as !nil` — RBS inline's `T.must`: the value, with nil ruled out.
+    NotNil,
 }
 
-/// The type of a `#: as Type` assertion written between a call's
-/// receiver and the leading-dot line that continues the call:
+/// The `#:` comment that follows the expression ending at byte `end`
+/// on the same line, read as [`Trailing`]. A comma may sit between them:
+/// the comment on an argument written one per line
+/// (`delivery.lines.first, #: as !nil`) belongs to that argument.
+pub(super) fn trailing_ascription(file: &str, end: usize) -> Option<Trailing> {
+    // Only the comment text is copied out, and only when there is one.
+    let comment = sources::with_text(file, |text| {
+        let line = text.get(end..)?.split('\n').next()?.trim_start();
+        let line = line.strip_prefix(',').map_or(line, str::trim_start);
+        Some(line.strip_prefix("#:")?.trim().to_string())
+    })??;
+    let comment = comment.strip_prefix("as ").unwrap_or(&comment).trim();
+    if comment == "!nil" {
+        return Some(Trailing::NotNil);
+    }
+    rbs_type(comment).map(Trailing::Type)
+}
+
+/// Apply a trailing ascription to `value`: a `Cast` to the declared
+/// type, or `value.not_nil!` for `#: as !nil` — the method core writes
+/// instead of `T.must`, which the analyzer already reads as "the
+/// receiver, nil removed".
+pub(super) fn ascribe_trailing(value: Expr, trailing: Option<Trailing>) -> Expr {
+    match trailing {
+        Some(Trailing::Type(ty)) => ascribe(value, Some(ty)),
+        Some(Trailing::NotNil) => not_nil(value),
+        None => value,
+    }
+}
+
+/// `value.not_nil!`.
+pub(super) fn not_nil(value: Expr) -> Expr {
+    let span = value.span;
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(value),
+            method: crate::ident::Symbol::from("not_nil!"),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        },
+    )
+}
+
+/// The `#:` assertion written between a call's receiver and the
+/// leading-dot line that continues the call:
 ///
 /// ```text
 /// self #: as untyped
 ///   .before_update(prepend: true) { ... }
 /// ```
 ///
-/// The comment ends the receiver's own line, so `trailing_rbs_type`
-/// reads it as the receiver's declared type. Only the `as` form counts
-/// here, and only when the next non-blank line continues with `.` or
-/// `&.`; a comment after a receiver on the same line as its method
-/// (`x.foo #: as T`) never gets this far, because the text after the
-/// receiver is then the method, not the comment.
-pub(super) fn receiver_rbs_assertion(file: &str, end: usize) -> Option<Ty> {
-    let text = sources::text_of(file)?;
-    let rest = text.get(end..)?;
-    let mut lines = rest.split('\n');
-    let comment = lines.next()?.trim_start().strip_prefix("#:")?.trim();
-    comment.strip_prefix("as ")?;
-    let continues = lines
-        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-        .is_some_and(|l| {
-            let l = l.trim_start();
-            l.starts_with('.') || l.starts_with("&.")
-        });
+/// The comment ends the receiver's own line, so it is read exactly as
+/// [`trailing_ascription`] reads one after any expression (`as T`,
+/// `T`, `!nil`) -- but only when the next non-blank line continues with
+/// `.` or `&.`; a comment after a receiver on the same line as its
+/// method (`x.foo #: as T`) never gets this far, because the text after
+/// the receiver is then the method, not the comment. Receivers that
+/// read their own trailing comment in `ingest_expr_strict` (calls,
+/// variable reads, parentheses) do not come here, so no assertion is
+/// applied twice; this covers the rest (`self`, constants, literals).
+pub(super) fn receiver_rbs_assertion(file: &str, end: usize) -> Option<Trailing> {
+    let continues = sources::with_text(file, |text| {
+        let rest = text.get(end..)?;
+        let mut lines = rest.split('\n');
+        lines.next()?.trim_start().strip_prefix("#:")?;
+        Some(
+            lines
+                .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                .is_some_and(|l| {
+                    let l = l.trim_start();
+                    l.starts_with('.') || l.starts_with("&.")
+                }),
+        )
+    })??;
     if !continues {
         return None;
     }
-    trailing_rbs_type(file, end)
+    trailing_ascription(file, end)
 }
 
 /// Parse one RBS type expression by wrapping it in a method signature
