@@ -64,7 +64,7 @@ pub(in crate::analyze) fn register(
             "transform_values", "transform_keys", "deep_transform_keys", "extract!", "update",
             "slice!", "except!",
             // typed_parameters: answers the Parameters restricted to the schema
-            "permit_types", "require_hash", "require",
+            "permit_types", "require_hash",
         ] {
             p.instance_methods.insert(Symbol::from(m), params_ty.clone());
         }
@@ -84,7 +84,7 @@ pub(in crate::analyze) fn register(
         ] {
             p.instance_methods.insert(Symbol::from(m), Ty::Bool);
         }
-        for m in ["to_h", "to_unsafe_h", "to_hash", "to_unsafe_hash", "to_hwia"] {
+        for m in ["to_h", "to_unsafe_h", "to_hash", "to_unsafe_hash", "to_hwia", "as_json"] {
             p.instance_methods.insert(Symbol::from(m), hash_str_untyped.clone());
         }
         p.instance_methods.insert(
@@ -97,13 +97,19 @@ pub(in crate::analyze) fn register(
         for m in ["hash", "object_id"] {
             p.instance_methods.insert(Symbol::from(m), Ty::Int);
         }
-        // An element read is `String | Array | Parameters | nil`; it types
-        // as the String reading every scalar read wants, and a
-        // Parameters-only method sent to it selects the Parameters arm
-        // (`BodyTyper::parameters_arm_ty`). `expect(:id)` is the scalar form.
-        let str_or_nil = Ty::Union { variants: vec![Ty::Str, Ty::Nil] };
-        p.instance_methods.insert(Symbol::from("[]"), str_or_nil.clone());
-        p.instance_methods.insert(Symbol::from("dig"), str_or_nil);
+        // What a key holds is whatever the request carried: a scalar
+        // String, an Array (`ids[]=1&ids[]=2`, a JSON array), a nested
+        // Parameters (`order[a]=1`), or nothing. The element reads answer
+        // that whole union (`param_value_ty`); union dispatch resolves a
+        // send on whichever arms answer it, so `params[:id].to_i` still
+        // reads as the String arm's Integer while `params[:ids].map` and
+        // `params[:order].permit(...)` read as the Array and Parameters
+        // arms. `expect(:id)` is the scalar form.
+        p.instance_methods.insert(Symbol::from("[]"), param_value_ty(true));
+        p.instance_methods.insert(Symbol::from("dig"), param_value_ty(true));
+        // `require(:key)` answers the value under the key (raising when it
+        // is blank), so it is the same union minus nil.
+        p.instance_methods.insert(Symbol::from("require"), param_value_ty(false));
         for m in ["[]=", "expect"] {
             p.instance_methods.insert(Symbol::from(m), Ty::Str);
         }
@@ -463,4 +469,20 @@ pub(in crate::analyze) fn register(
     let mut app_ctrl_entry = app_ctrl;
     app_ctrl_entry.parent = Some(acb_id);
     classes.insert(ClassId(Symbol::from("ApplicationController")), app_ctrl_entry);
+}
+
+/// The type of a value read out of an `ActionController::Parameters`:
+/// `String | Array[untyped] | ActionController::Parameters`, plus nil
+/// when the key may be absent. Request data is untyped at the element
+/// level (`Array[untyped]`): nothing in the request constrains it.
+fn param_value_ty(nilable: bool) -> Ty {
+    let mut variants = vec![
+        Ty::Str,
+        Ty::Array { elem: Box::new(Ty::Untyped) },
+        Ty::Class { id: ClassId(Symbol::from("ActionController::Parameters")), args: vec![] },
+    ];
+    if nilable {
+        variants.push(Ty::Nil);
+    }
+    Ty::Union { variants }
 }
