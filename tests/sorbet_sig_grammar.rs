@@ -84,3 +84,39 @@ fn bind_on_a_sig_is_not_a_type() {
     let Ty::Fn { params, .. } = &ty else { panic!() };
     assert_eq!(params[0].kind, ParamKind::Required);
 }
+
+/// `T.proc` is the type of a block (790 signatures in core). The block
+/// parameter is recorded as the method's block too, the way an RBS
+/// `{ (A) -> R }` is, and a `T.nilable(T.proc…)` block is still the
+/// callable.
+#[test]
+fn a_proc_type_is_a_callable_and_a_block_parameter_is_the_methods_block() {
+    let ty = read(
+        "sig { params(shop_id: Integer, blk: T.proc.params(shop: Cart, n: Integer).bind(Cart).returns(String)).returns(String) }",
+        "def m(shop_id, &blk); end",
+    );
+    let Ty::Fn { params, block, ret, .. } = &ty else { panic!() };
+    assert_eq!(**ret, Ty::Str);
+    assert_eq!(params[0].ty, Ty::Int);
+    assert_eq!(params[1].kind, ParamKind::Block);
+    let Ty::Fn { params: block_params, ret: block_ret, .. } = &params[1].ty else {
+        panic!("{:?}", params[1].ty)
+    };
+    assert_eq!(block_params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>(), vec![class("Cart"), Ty::Int]);
+    assert_eq!(**block_ret, Ty::Str);
+    assert_eq!(block.as_deref(), Some(&params[1].ty));
+
+    let ty = read("sig { params(blk: T.nilable(T.proc.void)).void }", "def m(&blk); end");
+    let Ty::Fn { params, block, .. } = &ty else { panic!() };
+    let Ty::Fn { ret, .. } = &params[0].ty else { panic!("{:?}", params[0].ty) };
+    assert_eq!(**ret, Ty::Nil);
+    assert!(block.is_some());
+}
+
+#[test]
+fn a_proc_type_as_an_ordinary_parameter() {
+    let ty = read("sig { params(callback: T.proc.returns(Integer)).void }", "def m(callback); end");
+    let (params, _) = signature(&ty);
+    let Ty::Fn { ret, .. } = &params[0] else { panic!("{:?}", params[0]) };
+    assert_eq!(**ret, Ty::Int);
+}
