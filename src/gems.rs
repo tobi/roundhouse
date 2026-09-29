@@ -594,7 +594,16 @@ pub fn gem_owning_constant<'a>(census: &'a GemCensus, constant_path: &str) -> Op
 /// All candidates in the best namespace-matching tier. Full/irregular
 /// names beat dashed-prefix guesses (`Alba`: alba, not alba-inertia).
 pub fn gems_owning_constant<'a>(census: &'a GemCensus, constant_path: &str) -> Vec<&'a str> {
-    let head = constant_path.split("::").next().unwrap_or(constant_path);
+    gems_owning_constant_with(census, constant_path, &|_, _| None)
+}
+
+pub fn gem_owning_constant_with<'a>(census: &'a GemCensus, constant_path: &str, declares: &dyn Fn(&str, &str) -> Option<bool>) -> Option<&'a str> {
+    let owners = gems_owning_constant_with(census, constant_path, declares);
+    (owners.len() == 1).then(|| owners[0])
+}
+
+pub(crate) fn gems_owning_constant_with<'a>(census: &'a GemCensus, constant_path: &str, declares: &dyn Fn(&str, &str) -> Option<bool>) -> Vec<&'a str> {
+    let head = constant_path.trim_start_matches("::").split("::").next().unwrap_or(constant_path);
     let exact: Vec<_> = census
         .unknown()
         .filter(|g| g.version.is_some() && namespace_of(&g.name) == head)
@@ -603,10 +612,11 @@ pub fn gems_owning_constant<'a>(census: &'a GemCensus, constant_path: &str) -> V
     if !exact.is_empty() {
         return exact;
     }
-    if census.resolved.iter().any(|name| namespace_of(name) == head) {
+    if census.resolved.iter().any(|s| namespace_of(s) == head) {
         return Vec::new();
     }
     census.unknown()
+        .filter(|g| declares(&g.name, constant_path) != Some(false))
         .filter(|g| g.version.is_some() && namespace_candidates(&g.name).iter().any(|c| c == head))
         .map(|g| g.name.as_str())
         .collect()
