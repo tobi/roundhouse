@@ -457,6 +457,29 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // loop below repeats itself. The list is Ruby's own hierarchy under
     // `StandardError` plus `Exception` itself, which `rescue Exception`
     // names and campfire's `MessagesHelper` actually writes.
+    // `cause` is the exception being handled when this one was raised, or
+    // nil; `exception` answers the exception itself (`raise e` and
+    // `e.exception("msg")` both go through it).
+    let exception_surface = [
+        ("message", Ty::Str),
+        ("to_s", Ty::Str),
+        ("full_message", Ty::Str),
+        ("detailed_message", Ty::Str),
+        ("inspect", Ty::Str),
+        ("backtrace", Ty::Array { elem: Box::new(Ty::Str) }),
+        ("backtrace_locations", Ty::Array { elem: Box::new(Ty::Untyped) }),
+        ("set_backtrace", Ty::Untyped),
+        ("exception", Ty::Untyped),
+        (
+            "cause",
+            Ty::Union {
+                variants: vec![
+                    Ty::Class { id: ClassId(Symbol::from("Exception")), args: vec![] },
+                    Ty::Nil,
+                ],
+            },
+        ),
+    ];
     for exc in [
         "Exception", "StandardError", "RuntimeError", "ArgumentError",
         "TypeError", "NameError", "NoMethodError", "IndexError",
@@ -467,21 +490,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "URI::InvalidURIError", "Net::OpenTimeout", "Net::ReadTimeout",
         "OpenSSL::OpenSSLError", "JSON::ParserError",
     ] {
-        register_stdlib_class(classes, exc, &[], &[
-            ("message", Ty::Str),
-            ("to_s", Ty::Str),
-            ("full_message", Ty::Str),
-            ("inspect", Ty::Str),
-            ("backtrace", Ty::Array { elem: Box::new(Ty::Str) }),
-        ]);
+        register_stdlib_class(classes, exc, &[], &exception_surface);
     }
-    let exception_surface = [
-        ("message", Ty::Str),
-        ("to_s", Ty::Str),
-        ("full_message", Ty::Str),
-        ("inspect", Ty::Str),
-        ("backtrace", Ty::Array { elem: Box::new(Ty::Str) }),
-    ];
     for (exc, extra) in [
         ("ActiveRecord::RecordNotFound", None),
         ("ActiveRecord::RecordNotUnique", None),
