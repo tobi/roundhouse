@@ -143,11 +143,15 @@ pub(in crate::analyze) fn register(
         // Reads keep the String-or-nil answer the Hash typing gave: the
         // blank-predicate grounding of `(rd = session[:k]).present?` needs a
         // nilable String receiver to lower.
-        session.instance_methods.insert(
-            Symbol::from("[]"),
-            Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
-        );
-        for m in ["fetch", "dig", "delete"] {
+        // Deleting a key returns the same value as reading it, or nil
+        // when absent (e.g. `session.delete(:return_to) || root_url`).
+        for m in ["[]", "delete"] {
+            session.instance_methods.insert(
+                Symbol::from(m),
+                Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
+            );
+        }
+        for m in ["fetch", "dig"] {
             session.instance_methods.insert(Symbol::from(m), Ty::Untyped);
         }
         for m in ["[]=", "store", "clear", "destroy", "update", "merge!", "each", "reload!"] {
