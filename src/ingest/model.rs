@@ -1127,6 +1127,7 @@ pub(super) fn ingest_method(
     // at every call site that passes one. Keyword/rest/block params are
     // rarer on model methods and still fall through unrecorded.
     let mut params: Vec<crate::dialect::Param> = Vec::new();
+    let mut block_param: Option<crate::dialect::Param> = None;
     if let Some(pn) = def.parameters() {
         for req in pn.requireds().iter() {
             if let Some(rp) = req.as_required_parameter_node() {
@@ -1185,6 +1186,15 @@ pub(super) fn ingest_method(
                 }
             }
         }
+        // `def m(...)`: `*rest, **kw, &blk` under names the body's
+        // `foo(...)` forwards. Keywords ride in the rest as a trailing
+        // Hash, as they do for `*args, **opts`.
+        if super::util::has_forwarding_parameter(&pn) {
+            params.push(crate::dialect::Param::rest(Symbol::from(super::util::FORWARDED_REST)));
+            block_param = Some(crate::dialect::Param::positional(Symbol::from(
+                super::util::FORWARDED_BLOCK,
+            )));
+        }
     }
 
     let body = match def.body() {
@@ -1207,7 +1217,7 @@ pub(super) fn ingest_method(
         kind: crate::dialect::AccessorKind::Method,
         is_async: false,
             mutates_self: false,
-            block_param: None,
+            block_param,
     })
 }
 
