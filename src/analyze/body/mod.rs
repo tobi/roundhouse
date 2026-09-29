@@ -802,8 +802,8 @@ impl<'a> BodyTyper<'a> {
 
             ExprNode::Apply { fun, args, block } => {
                 self.analyze_expr(fun, ctx);
-                for a in args.iter_mut() { self.analyze_expr(a, ctx); }
-                if let Some(b) = block { self.analyze_expr(b, ctx); }
+                // `Parameters` is a Hash-shaped bag: what its own class does
+                // not answer (`fetch`, `each`, `map`, `count`, ...) is the
                 unknown()
             }
 
@@ -885,6 +885,20 @@ impl<'a> BodyTyper<'a> {
                 let recv_ty = match recv.as_mut() {
                     Some(r) => Some(self.analyze_expr(r, ctx)),
                     None => ctx.self_ty.clone(),
+                };
+                // `Parameters` is a Hash-shaped bag: what its own class does
+                // not answer (`fetch`, `each`, `map`, `count`, ...) is the
+                // Hash reading, over the params model's Symbol -> String.
+                let recv_ty = match recv_ty {
+                    Some(Ty::Class { id, .. })
+                        if id.0.as_str() == "ActionController::Parameters"
+                            && method.as_str() != "new"
+                            && !self.classes().get(&id).is_some_and(|c|
+                                c.instance_methods.contains_key(method)) =>
+                    {
+                        Some(Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) })
+                    }
+                    other => other,
                 };
                 for a in args.iter_mut() { self.analyze_expr(a, ctx); }
                 let block_ret = if let Some(b) = block {
@@ -1013,6 +1027,16 @@ impl<'a> BodyTyper<'a> {
                     return t;
                 }
                 if let Some(t) = recv.as_ref().and_then(|r| time_parse_ty(r, method, args)) {
+                    return t;
+                }
+                // An element read of a `Parameters` (`params[:order]`,
+                // `params.dig(:a, :b)`) holds `String | Array | Parameters |
+                // nil`, and is typed by its String reading because that is
+                // what nearly every read wants. A method only Parameters
+                // answers (`params[:order].permit_types(...)`,
+                // `.to_unsafe_h`) selects the Parameters arm of that
+                // union instead of failing on the String one.
+                if let Some(t) = self.parameters_arm_ty(recv.as_ref(), method, block_ret.as_ref(), args) {
                     return t;
                 }
                 self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args)
