@@ -1024,7 +1024,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// `is_module: true` and `parent: None`. The `is_module` flag is
 /// load-bearing: callers using `include` on the result need it to be
 /// emitted as `module`, not `class`, or Ruby will raise TypeError.
-fn library_class_from_module_node_with_scope(
+pub(super) fn library_class_from_module_node_with_scope(
     module: &ruby_prism::ModuleNode<'_>,
     scope: &[String],
     file: &str,
@@ -1403,7 +1403,12 @@ fn walk_decl_body<'pr>(
             }
         }
         if let Some(call) = stmt.as_call_node() {
-            if call.receiver().is_none() {
+            // `include X` and `self.include(X)` are the same call: the
+            // explicit-self spelling is how a file that must satisfy a
+            // type checker writes it (`self #: as untyped` on the line
+            // before `.include(Rails.application.routes.url_helpers)`),
+            // and it means the body's own self, exactly as the bare form.
+            if call.receiver().is_none_or(|r| r.as_self_node().is_some()) {
                 let kw = constant_id_str(&call.name());
                 // `class_methods do … end` — ActiveSupport::Concern's
                 // class-side block: its defs become class methods of
@@ -1440,7 +1445,7 @@ fn walk_decl_body<'pr>(
                                         continue;
                                     }
                                     includes.push(ClassId(Symbol::from(path.join("::"))));
-                                } else if is_rails_url_helpers_chain(&arg) {
+                                } else if crate::ingest::util::is_rails_url_helpers_chain(&arg) {
                                     // `include Rails.application.routes.
                                     // url_helpers` (lobsters' Routes class,
                                     // inside `class << self`) — the whole
@@ -1654,35 +1659,6 @@ fn walk_decl_body<'pr>(
 
 /// Rewrite `@@X` (ingested as a sigil-verbatim `Var`) to `Ivar { X }`,
 /// both in read position and as an `Assign` target.
-/// Match the `Rails.application.routes.url_helpers` receiver chain (a
-/// nested CallNode ladder rooted at the `Rails` constant).
-fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
-    let mut expected = ["url_helpers", "routes", "application"].iter();
-    let mut cur = match node.as_call_node() {
-        Some(c) => c,
-        None => return false,
-    };
-    loop {
-        let Some(want) = expected.next() else { return false };
-        if cur.name().as_slice() != want.as_bytes() {
-            return false;
-        }
-        match cur.receiver() {
-            Some(r) => {
-                if let Some(cr) = r.as_constant_read_node() {
-                    return expected.next().is_none()
-                        && cr.name().as_slice() == b"Rails";
-                }
-                match r.as_call_node() {
-                    Some(next) => cur = next,
-                    None => return false,
-                }
-            }
-            None => return false,
-        }
-    }
-}
-
 fn normalize_classvars_to_ivars(e: &mut Expr) {
     match &mut *e.node {
         ExprNode::Var { name, .. } if name.as_str().starts_with("@@") => {
