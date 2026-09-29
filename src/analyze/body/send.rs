@@ -2442,6 +2442,29 @@ pub(super) fn hash_method(
             key: Box::new(key.clone()),
             value: Box::new(value.clone()),
         },
+        // ActiveSupport's Hash core_ext. The key-normalizing copies
+        // (`symbolize_keys`, `with_indifferent_access`, ...) and
+        // `to_query`/`to_param` are typed above; `to_xml` renders a
+        // document.
+        "to_xml" | "to_sentence" => Ty::Str,
+        // `first` without a count is the first `[key, value]` pair (nil
+        // when empty); with a count, an Array of pairs.
+        "first" => {
+            let pair = Ty::Tuple { elems: vec![key.clone(), value.clone()] };
+            if args.is_empty() {
+                Ty::Union { variants: vec![pair, Ty::Nil] }
+            } else {
+                Ty::Array { elem: Box::new(pair) }
+            }
+        }
+        // The first key that maps to a value, or nil.
+        "key" => Ty::Union { variants: vec![key.clone(), Ty::Nil] },
+        "filter_map" => Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or_else(unknown)) },
+        // Strong-parameters `permit!` marks everything permitted.
+        "permit!" | "to_hash" => Ty::Hash {
+            key: Box::new(key.clone()),
+            value: Box::new(value.clone()),
+        },
         // JSON/string renderings of a Hash are Strings whatever the
         // value type — campfire's `Webhook#payload(message).to_json`
         // nests hashes three deep.
