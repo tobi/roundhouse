@@ -225,6 +225,13 @@ pub(super) fn sorbet_assertion_argument<'pr>(node: &Node<'pr>) -> Option<Node<'p
     call.arguments()?.arguments().iter().next()
 }
 
+/// Whether the sorbet assertion `node` (see [`sorbet_assertion_argument`])
+/// raises on nil, and so answers its argument with nil ruled out.
+fn sorbet_assertion_rules_out_nil(node: &Node<'_>) -> bool {
+    node.as_call_node()
+        .is_some_and(|c| matches!(constant_id_str(&c.name()), "must" | "must_because"))
+}
+
 /// The argument of a `T.absurd(x)`, which raises rather than
 /// evaluating to it. See the call site in `ingest_expr_strict`.
 fn sorbet_absurd_argument<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
@@ -385,9 +392,20 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     //
     // The declared type of `T.let` / `T.cast` rides along as a `Cast`
     // (see `type_ascription`); the other assertions keep just the value.
+    //
+    // `T.must(x)` / `T.must_because(x) { }` are the exception to "just
+    // the value": they raise on nil, so what they answer is `x` with nil
+    // ruled out. That is `x.not_nil!` (core's spelling of the same
+    // thing), which the analyzer reads that way.
     if let Some(inner) = sorbet_assertion_argument(node) {
         let declared = super::type_ascription::sorbet_declared_type(node);
-        return Ok(super::type_ascription::ascribe(ingest_expr_strict(&inner, file)?, declared));
+        let value = ingest_expr_strict(&inner, file)?;
+        let value = if sorbet_assertion_rules_out_nil(node) {
+            super::type_ascription::not_nil(value)
+        } else {
+            value
+        };
+        return Ok(super::type_ascription::ascribe(value, declared));
     }
 
     // `T.absurd(x)` is NOT an assertion that evaluates to its argument:

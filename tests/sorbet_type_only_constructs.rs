@@ -167,7 +167,8 @@ end
 #[test]
 fn an_assertion_still_unwraps_rather_than_raising() {
     // `T.absurd` is the exception among the `T.` calls, not the rule:
-    // the assertions still evaluate to their argument.
+    // the assertions still evaluate to their argument. `T.must` is that
+    // argument with nil ruled out, which is what `not_nil!` says.
     let emitted = emitted(
         r#"class Gauge
   def label(kind)
@@ -178,5 +179,6 @@ end
         "gauge.rb",
     );
     assert!(!emitted.contains("raise"), "got:\n{emitted}");
-    assert!(emitted.contains("kind.to_s"), "got:\n{emitted}");
+    assert!(!emitted.contains("T.must"), "got:\n{emitted}");
+    assert!(emitted.contains("kind.not_nil!.to_s"), "got:\n{emitted}");
 }
