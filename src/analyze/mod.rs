@@ -1631,6 +1631,20 @@ impl Analyzer {
                 action.effects = self.collect_effects(&mut action.body, &mctx);
             }
 
+            // The class-side methods (`def self.x`, `class << self`),
+            // typed with `self` the class itself. Nothing reads their
+            // ivars into a view; typing them is what resolves their own
+            // bodies and their harvested return types.
+            for method in controller.class_methods_mut() {
+                for p in &mut method.params {
+                    if let Some(default) = &mut p.default {
+                        self.body_typer().analyze_expr(default, &ctx);
+                    }
+                }
+                let mctx = self.seed_method_params(&ctx, &ctrl_id, method);
+                self.body_typer().analyze_expr(&mut method.body, &mctx);
+            }
+
             // Snapshot each action's ivar bindings (this controller's
             // own actions only — parent's actions get layered in by
             // Phase B's `chained_bindings` builder).
@@ -3575,6 +3589,15 @@ impl Analyzer {
         // no class-receiver variant).
         for controller in &app.controllers {
             let class_id = &controller.name;
+            // Class-side methods register like a library class's: the
+            // method exists whether or not its body can be typed, so a
+            // call to it resolves to the inferred return or to Untyped
+            // rather than "no known method".
+            for method in controller.class_methods() {
+                let ret = self.method_return_ty(class_id, method);
+                let target = &mut self.classes.entry(class_id.clone()).or_default().class_methods;
+                Self::register_method_return(target, &method.name, ret.as_ref());
+            }
             for action in controller.actions() {
                 let Some(body_ty) =
                     tuple_return_ty(&action.body).or_else(|| effective_return_ty(&action.body))
