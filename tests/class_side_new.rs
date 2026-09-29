@@ -42,3 +42,23 @@ fn a_subclass_factory_answers_the_subclass() {
     ]);
     assert!(err.contains("0 error(s)"), "{err}");
 }
+
+/// The instance a class-side `new` builds is still an instance of the
+/// class the `def` sits in, for the body that builds it: core's
+/// `ClientDetails.from_checkout_client_details` assigns attributes onto
+/// `details = new`, and `UriValidator.verify` runs `new(...).tap(&:valid?)`.
+/// Each of those sends was reported as "no known method on instance".
+#[test]
+fn the_built_instance_answers_the_defining_class_inside_the_factory() {
+    let schema = "ActiveRecord::Schema.define do\n  create_table \"client_details\" do |t|\n    t.string \"user_agent\"\n  end\nend\n";
+    let record = "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n";
+    let model = "class ClientDetails < ApplicationRecord\n  def self.from_other(agent)\n    details = new\n    details.user_agent = agent\n    details\n  end\nend\n";
+    let validator = "class UriValidator\n  include ActiveModel::Validations\n  def initialize(uri_string:)\n    @uri_string = uri_string\n  end\n  class << self\n    #: (uri_string: String) -> UriValidator\n    def verify(uri_string:)\n      new(uri_string:).tap(&:valid?)\n    end\n  end\nend\n";
+    let err = check(&[
+        ("db/schema.rb", schema),
+        ("app/models/application_record.rb", record),
+        ("app/models/client_details.rb", model),
+        ("app/models/uri_validator.rb", validator),
+    ]);
+    assert!(err.contains(" 0 error(s)"), "{err}");
+}
