@@ -7,6 +7,7 @@
 pub(super) mod activemodel;
 pub(super) mod ar;
 pub(super) mod controllers;
+pub(super) mod gem_boundary;
 pub(super) mod library;
 pub(super) mod routes;
 pub(super) mod stdlib;
