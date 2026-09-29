@@ -2635,9 +2635,16 @@ impl Analyzer {
                 // Re-seed ctx with discovered ivars alongside @attributes.
                 // Memoizing ivars become `Union<T, Nil>` to reflect that
                 // the read can be nil before the first assignment.
+                let initialized = ivars_initialized_by(model.methods());
                 let mut reseeded = class_ivars;
                 for (name, ty) in flow_ivars {
-                    let union_ty = crate::analyze::body::union_of(ty, Ty::Nil);
+                    // `initialize` sets its own ivars before any other method
+                    // runs (see the library-class pass).
+                    let union_ty = if initialized.contains(&name) && !ty.is_open() {
+                        ty
+                    } else {
+                        crate::analyze::body::union_of(ty, Ty::Nil)
+                    };
                     reseeded.insert(name, union_ty);
                 }
                 let reseeded_ctx = Ctx {
@@ -2884,6 +2891,7 @@ impl Analyzer {
                 }
             }
 
+            let initialized = ivars_initialized_by(lc.methods.iter());
             if !flow_ivars.is_empty() {
                 let mut reseeded: HashMap<Symbol, Ty> = HashMap::new();
                 for (name, ty) in flow_ivars {
@@ -2896,7 +2904,12 @@ impl Analyzer {
                     // Union { User, Nil }` on the very next hop — the
                     // same reasoning the controller-wide seed's
                     // `strip_nil` already carries.
-                    let seeded = if is_current_attributes {
+                    // Nor for an ivar `initialize` assigns as one of its own
+                    // statements: it is set before any other method can run,
+                    // so `@total = T.let(attrs[:total], Money)` reads as a
+                    // `Money` everywhere, not `Money?`. The union with the
+                    // other writes already keeps a `nil` some method writes.
+                    let seeded = if is_current_attributes || (initialized.contains(&name) && !ty.is_open()) {
                         ty
                     } else {
                         crate::analyze::body::union_of(ty, Ty::Nil)
@@ -5909,6 +5922,44 @@ fn is_clean_binding(ty: &Ty) -> bool {
         Ty::Union { variants } => variants.iter().all(|v| !v.is_unknown()),
         t => !t.is_unknown(),
     }
+}
+
+/// The ivars `initialize` assigns as statements of its own, across `methods`.
+fn ivars_initialized_by<'a>(
+    methods: impl Iterator<Item = &'a crate::dialect::MethodDef>,
+) -> std::collections::HashSet<Symbol> {
+    methods
+        .filter(|m| {
+            m.name.as_str() == "initialize"
+                && m.receiver == crate::dialect::MethodReceiver::Instance
+        })
+        .flat_map(|m| ivars_assigned_by_statement(&m.body))
+        .collect()
+}
+
+/// The ivars a method body assigns as statements of its own -- not inside
+/// a branch, loop or block, where the write may never run. After the method
+/// returns, each of these is set.
+fn ivars_assigned_by_statement(body: &Expr) -> Vec<Symbol> {
+    let statements: Vec<&Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+    let mut out = Vec::new();
+    for stmt in statements {
+        match &*stmt.node {
+            ExprNode::Assign { target: LValue::Ivar { name }, .. } => out.push(name.clone()),
+            ExprNode::MultiAssign { targets, .. } => {
+                for t in targets {
+                    if let LValue::Ivar { name } = t {
+                        out.push(name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 pub(crate) fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
