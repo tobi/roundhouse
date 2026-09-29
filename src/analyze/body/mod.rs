@@ -508,6 +508,25 @@ impl<'a> BodyTyper<'a> {
                         return ty.clone();
                     }
                 }
+                // A bare class name is read lexically, innermost scope
+                // first: inside `Dash::KeysController`, `Current` is
+                // `Dash::Current` when that exists — however many other
+                // namespaces also declare a `Current`, which is exactly
+                // where the by-suffix expansion below gives up.
+                if path.len() == 1 {
+                    if let Some(Ty::Class { id: self_id, .. }) = &ctx.self_ty {
+                        let mut scope: Vec<&str> = self_id.0.as_str().split("::").collect();
+                        while !scope.is_empty() {
+                            let candidate =
+                                ClassId(Symbol::from(format!("{}::{}", scope.join("::"), last.as_str())));
+                            if self.classes().contains_key(&candidate) {
+                                *path = candidate.0.as_str().split("::").map(Symbol::from).collect();
+                                return Ty::Class { id: candidate, args: vec![] };
+                            }
+                            scope.pop();
+                        }
+                    }
+                }
                 // Build a Ty::Class ClassId from the path. For multi-
                 // segment writes (`ActiveSupport::HashWithIndifferentAccess`)
                 // use the joined path verbatim. For single-segment app-
