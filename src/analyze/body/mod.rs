@@ -844,8 +844,8 @@ impl<'a> BodyTyper<'a> {
 
             ExprNode::Apply { fun, args, block } => {
                 self.analyze_expr(fun, ctx);
-                // `Parameters` is a Hash-shaped bag: what its own class does
-                // not answer (`fetch`, `each`, `map`, `count`, ...) is the
+                for a in args.iter_mut() { self.analyze_expr(a, ctx); }
+                if let Some(b) = block { self.analyze_expr(b, ctx); }
                 unknown()
             }
 
