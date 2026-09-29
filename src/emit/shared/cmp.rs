@@ -67,7 +67,25 @@ pub fn classify_cmp(lhs: &Expr, rhs: &Expr) -> CmpCase {
         (Ty::Str, Ty::Str) | (Ty::Sym, Ty::Sym) => CmpCase::SameType,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => CmpCase::NumericPromote,
         (Ty::Class { .. }, Ty::Class { .. }) => CmpCase::ClassSubclass,
+        // `Gem::Version < Integer?`, `Money <= Money?`: `<` is `Comparable`
+        // on the lhs class; whether it accepts the rhs is that class's
+        // business, not decidable here.
+        _ if super::operand::is_user_operator_receiver(Some(lhs_ty)) => CmpCase::Unknown,
+        // `(score || BEST) <= LIMIT` where the arms are Integer and
+        // `Numeric`: every arm is an ordered number.
+        (l, r) if is_number(l) && is_number(r) => CmpCase::NumericPromote,
         _ => CmpCase::Incompatible,
+    }
+}
+
+/// An ordered number: `Int`, `Float`, `Numeric`/`BigDecimal`/`Rational`, or
+/// a union whose every arm is one (`Numeric | Integer`).
+fn is_number(ty: &Ty) -> bool {
+    match ty {
+        Ty::Int | Ty::Float => true,
+        Ty::Class { id, .. } => matches!(id.0.as_str(), "Numeric" | "BigDecimal" | "Rational"),
+        Ty::Union { variants } => !variants.is_empty() && variants.iter().all(is_number),
+        _ => false,
     }
 }
 
