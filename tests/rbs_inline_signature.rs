@@ -11,10 +11,19 @@ use std::path::PathBuf;
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};
 use roundhouse::ingest::ingest_app_from_tree;
 
+/// The provider is written as a controller subclass: `diagnose` walks
+/// controllers, models and views, so it is the shape whose ivar reads are
+/// observable here. (A plain class under `app/controllers/` is a library
+/// class, which is typed but not walked for diagnostics.)
 fn unresolved_ivars(provider: &str) -> Vec<String> {
+    let provider = provider.replace("class Prov\n", "class Prov < ApplicationController\n");
     let files = [
         ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
-        ("app/controllers/cust/prov.rb", provider),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        ("app/controllers/cust/prov.rb", provider.as_str()),
     ];
     let tree: HashMap<PathBuf, Vec<u8>> = files
         .iter()
