@@ -1085,7 +1085,12 @@ impl<'a> BodyTyper<'a> {
                     // `belongs_to :order` gives an instance the reader `order`. A relation
                     // builder called with no arguments is not a query (`Refund.order` is an
                     // error), so the zero-argument call is the instance reader.
-                    if call_args.is_empty() {
+                    if call_args.is_empty()
+                        && matches!(
+                            method.as_str(),
+                            "order" | "group" | "limit" | "offset" | "having" | "joins" | "includes" | "select" | "distinct"
+                        )
+                    {
                         if let (Some(cm), Some(im)) =
                             (cls.class_methods.get(method), cls.instance_methods.get(method))
                         {
