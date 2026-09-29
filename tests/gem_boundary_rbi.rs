@@ -176,3 +176,25 @@ fn rails_component_rbis_are_not_read() {
     assert!(has("Zork::Widget"));
     assert!(!has("Shadow::Only"));
 }
+
+const REOPENS_CATALOG: &str = r#"# typed: true
+class SecureRandom
+  sig { returns(::String) }
+  def self.zork_token; end
+end
+"#;
+
+#[test]
+fn an_rbi_adds_methods_to_a_class_the_stdlib_already_registers() {
+    // `Rack::Utils`-style: the registry knows the class, the gem adds
+    // to it. The added method is typed by the RBI and the registered
+    // ones keep working.
+    let ok = diagnostics(
+        REOPENS_CATALOG,
+        &[],
+        "    @a = SecureRandom.zork_token.upcase\n    @b = SecureRandom.hex(4)",
+    );
+    assert!(ok.is_empty(), "{ok:?}");
+    let bad = diagnostics(REOPENS_CATALOG, &[], "    @a = SecureRandom.zork_token.no_such_string_method");
+    assert_eq!(bad.len(), 1, "{bad:?}");
+}
