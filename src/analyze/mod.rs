@@ -85,6 +85,11 @@ pub struct Analyzer {
     /// The Symbol key is the method name; the Vec aligns positionally
     /// with `MethodDef.params`.
     inferred_params: HashMap<(ClassId, Symbol), Vec<Ty>>,
+    /// (class, method) pairs an author wrote a signature for, as opposed
+    /// to a `Fn` the registry stamped from the def itself. Only in the
+    /// first is an `untyped` slot a statement rather than an inference
+    /// gap.
+    declared_signatures: std::collections::HashSet<(ClassId, Symbol)>,
     /// Backend-specific effect classification. The analyzer consults
     /// this when deciding whether a Send on an AR model carries
     /// `DbRead` or `DbWrite`. Defaults to `SqliteAdapter` via
@@ -868,6 +873,11 @@ impl Analyzer {
         Self {
             classes,
             inferred_params: HashMap::new(),
+            declared_signatures: app
+                .rbs_signatures
+                .iter()
+                .flat_map(|(c, ms)| ms.keys().map(move |m| (c.clone(), m.clone())))
+                .collect(),
             adapter,
             concern_folded: HashMap::new(),
             host_folded: HashMap::new(),
@@ -3260,6 +3270,35 @@ impl Analyzer {
         (!matches!(found.ty, Ty::Var { .. } | Ty::Untyped)).then(|| found.ty.clone())
     }
 
+    /// Whether a signature says this parameter is `untyped`, in as many
+    /// words. That is a statement, unlike an unannotated parameter (whose
+    /// slot is an inference gap): the author opted the parameter out of
+    /// typing, and what the call sites happen to pass says nothing about
+    /// what the body must accept. `#: (untyped, untyped) -> bool` on a
+    /// comparator that is handed Money, Integers and Strings is the shape.
+    fn declared_untyped_param(
+        &self,
+        class_id: &ClassId,
+        method: &Symbol,
+        index: usize,
+        name: &Symbol,
+    ) -> bool {
+        if !self.declared_signatures.contains(&(class_id.clone(), method.clone())) {
+            return false;
+        }
+        let Some(cls) = self.classes.get(class_id) else { return false };
+        let Some(Ty::Fn { params, .. }) =
+            cls.instance_methods.get(method).or_else(|| cls.class_methods.get(method))
+        else {
+            return false;
+        };
+        params
+            .iter()
+            .find(|p| p.name == *name)
+            .or_else(|| params.get(index))
+            .is_some_and(|p| matches!(p.ty, Ty::Untyped))
+    }
+
     fn seed_method_params(
         &self,
         base: &Ctx,
@@ -3271,6 +3310,10 @@ impl Analyzer {
         let mut ctx = base.clone();
         ctx.class_side = matches!(method.receiver, crate::dialect::MethodReceiver::Class);
         for (i, param) in method.params.iter().enumerate() {
+            if self.declared_untyped_param(class_id, &method.name, i, &param.name) {
+                ctx.local_bindings.insert(param.name.clone(), Ty::Untyped);
+                continue;
+            }
             let from_sites = observed.and_then(|v| v.get(i)).cloned();
             let seeded = param_ty_with_default(from_sites, param);
             // A declared type fills in where the call sites said
@@ -3316,6 +3359,10 @@ impl Analyzer {
             origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone())));
         let mut ctx = base.clone();
         for (i, name) in params.fields.keys().enumerate() {
+            if self.declared_untyped_param(class_id, action_name, i, name) {
+                ctx.local_bindings.insert(name.clone(), Ty::Untyped);
+                continue;
+            }
             let observed = [own, from_origin]
                 .into_iter()
                 .flatten()
