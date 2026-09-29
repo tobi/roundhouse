@@ -130,13 +130,14 @@ fn params_resolves_via_implicit_self_in_action_body() {
         other => panic!("expected ActionController::Parameters, got {other:?}"),
     }
 
-    // `params[:id]` resolves to Union<Str, Nil>.
+    // `params[:id]` resolves to the element union: a String among
+    // Array / Parameters arms, or nil.
     match bracket_send.ty.as_ref().expect("bracket ty populated") {
         Ty::Union { variants } => {
             assert!(variants.iter().any(|v| matches!(v, Ty::Str)));
             assert!(variants.iter().any(|v| matches!(v, Ty::Nil)));
         }
-        other => panic!("expected Union<Str, Nil>, got {other:?}"),
+        other => panic!("expected the params element union, got {other:?}"),
     }
 }
 
