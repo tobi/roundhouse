@@ -190,6 +190,26 @@ fn receiver(target: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The forwarder for an operator method (`delegate :[], :<<, :==, to:
+/// :@hash` — a collection wrapper's usual shape), or `None` for an
+/// ordinary name. Unary operators (`!`, `-@`) forward as zero-arg sends
+/// like any reader and are not listed.
+fn operator_forwarder(name: &str, t: &str, m: &str) -> Option<String> {
+    const BINARY: &[&str] = &[
+        "==", "!=", "<", ">", "<=", ">=", "<=>", "===", "=~", "+", "-", "*", "/", "%", "**",
+        "<<", ">>", "&", "|", "^",
+    ];
+    let body = match m {
+        "[]" => return Some(format!("  def {name}(key)\n    {t}[key]\n  end\n\n")),
+        "[]=" => {
+            return Some(format!("  def {name}(key, value)\n    {t}[key] = value\n  end\n\n"));
+        }
+        op if BINARY.contains(&op) => format!("{t} {op} other"),
+        _ => return None,
+    };
+    Some(format!("  def {name}(other)\n    {body}\n  end\n\n"))
+}
+
 fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
     let defines = |name: &str| {
         lc.methods
@@ -202,7 +222,12 @@ fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
             continue;
         }
         let (t, m) = (receiver(d.target.as_str()), d.method.as_str());
-        if let Some(attr) = m.strip_suffix('=') {
+        // Operators have a fixed arity, so they forward exactly — no
+        // `*args` needed. Checked first: `==`, `<=` and `[]=` end in
+        // `=` without being writers.
+        if let Some(def) = operator_forwarder(&d.name, &t, m) {
+            body.push_str(&def);
+        } else if let Some(attr) = m.strip_suffix('=') {
             // A writer (`delegate :id, :id=, to: :class`) takes the value
             // it forwards; Rails' `allow_nil` guards it the same way.
             let guard = if d.allow_nil { format!("return if {t}.nil?\n    ") } else { String::new() };

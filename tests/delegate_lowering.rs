@@ -185,3 +185,25 @@ end
     assert!(out.contains("self.class.request_id"), "got:\n{out}");
     assert!(out.contains("self.class.request_id = value"), "got:\n{out}");
 }
+
+#[test]
+fn delegated_operators_forward_their_operands() {
+    // core's collection wrappers: `delegate :each, :[], :[]=, :<<, :==,
+    // to: :@set`. An operator is not a reader — `[]=` and `==` end in
+    // `=` without being writers — and each has a fixed arity, so it
+    // forwards exactly.
+    let out = emit(
+        r#"class Filter
+  delegate :[], :[]=, :<<, :==, to: :@set
+
+  def initialize
+    @set = {}
+  end
+end
+"#,
+    );
+    assert!(out.contains("@set[key] = value"), "got:\n{out}");
+    assert!(out.contains("@set[key]"), "got:\n{out}");
+    assert!(out.contains("@set << other"), "got:\n{out}");
+    assert!(out.contains("@set == other"), "got:\n{out}");
+}
