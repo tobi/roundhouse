@@ -2059,6 +2059,20 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_def_node().is_some() => {
             ExprNode::Lit { value: Literal::Nil }
         }
+        // `class << self … end` at expression position (inside an
+        // `included do` / `Class.new do` block, where no class-body walk
+        // classifies it). Ruby evaluates the body with `self` the
+        // singleton class and the block's value is its last statement
+        // (nil when empty). The `def`s in it lift to nil exactly as a
+        // bare `def` does above; the statements around them keep their
+        // own expressions, so a constant or call in the block is not lost.
+        n if n.as_singleton_class_node().is_some() => {
+            let sc = n.as_singleton_class_node().unwrap();
+            match sc.body() {
+                Some(body) => return ingest_expr(&body, file),
+                None => ExprNode::Lit { value: Literal::Nil },
+            }
+        }
         other => {
             return Err(IngestError::Unsupported {
                 file: file.into(),
