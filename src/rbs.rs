@@ -984,6 +984,10 @@ fn map_class_instance(name: &str, args: Vec<Ty>) -> Ty {
             key: Box::new(key.clone()),
             value: Box::new(value.clone()),
         },
+        // A bare `Hash` / `Array` is the unparameterized container, not a
+        // class named Hash with nothing to call on it.
+        ("Hash", []) => Ty::Hash { key: Box::new(Ty::Untyped), value: Box::new(Ty::Untyped) },
+        ("Array", []) => Ty::Array { elem: Box::new(Ty::Untyped) },
         _ => Ty::Class {
             id: ClassId(Symbol::new(name)),
             args,

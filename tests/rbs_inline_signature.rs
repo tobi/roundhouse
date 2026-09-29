@@ -141,3 +141,47 @@ fn inline_self_is_an_instance_only_on_instance_methods() {
         assert_eq!(ret, expected, "{source}");
     }
 }
+
+/// `Capabilities::Charge` written inside `ShopifyPayments::Capability`
+/// names `ShopifyPayments::Capabilities::Charge`, and a bare `Hash` is a
+/// hash you can index. Both were read as classes with nothing to call.
+fn dispatch_failures(files: &[(&str, &str)]) -> Vec<String> {
+    let tree: HashMap<PathBuf, Vec<u8>> = files
+        .iter()
+        .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    diagnose(&app)
+        .into_iter()
+        .filter_map(|d| match d.kind {
+            DiagnosticKind::SendDispatchFailed { method, .. } => Some(method.as_str().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_signature_class_resolves_lexically_and_a_bare_hash_is_indexable() {
+    let failures = dispatch_failures(&[
+        ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+        (
+            "app/models/shopify_payments/capabilities/charge.rb",
+            "module ShopifyPayments\n  module Capabilities\n    class Charge\n      def shop_id\n        1\n      end\n    end\n  end\nend\n",
+        ),
+        (
+            "app/models/shopify_payments/capability.rb",
+            r#"module ShopifyPayments
+  class Capability
+    #: (Array[Capabilities::Charge], Hash params) -> void
+    def preload(charges, params)
+      charges.each { |c| c.shop_id }
+      params[:x]
+    end
+  end
+end
+"#,
+        ),
+    ]);
+    assert!(failures.is_empty(), "{failures:?}");
+}
