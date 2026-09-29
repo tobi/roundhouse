@@ -239,7 +239,10 @@ pub fn compile_erb_mapped(source: &str) -> (String, Vec<ErbSegment>) {
                 // alone, so `<% x -%>` mid-line keeps its newline.
                 let had_tail_dash = body.ends_with('-');
                 let body = body.strip_suffix('-').unwrap_or(body);
-                let ruby = body.trim();
+                // A trailing Ruby comment (`<% end # card.section %>`) is
+                // not part of the code: it would swallow the `).to_s` an
+                // output tag closes with, and stop `end` being read as one.
+                let ruby = strip_trailing_comment(body.trim());
 
                 // Erubi's `rspace`: the optional `[ \t]*\r?\n` right
                 // after `%>`. Absent (None) when the tag has trailing
@@ -414,6 +417,32 @@ pub(crate) fn is_block_expr(code: &str) -> bool {
         return matches!(last, Some(c) if c.is_whitespace() || c == ')');
     }
     false
+}
+
+/// `code` without a trailing `# comment`. Asked of Prism rather than
+/// scanned for, because a `#` opens a comment only outside a string,
+/// regexp or interpolation (`"#{x}"`, `?#`).
+fn strip_trailing_comment(code: &str) -> &str {
+    // Only a `#` that is not `#{` / `#@` / `#$` can start a comment.
+    let bytes = code.as_bytes();
+    let may_comment = bytes
+        .iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'#' && !matches!(bytes.get(i + 1), Some(b'{' | b'@' | b'$')));
+    if !may_comment {
+        return code;
+    }
+    let result = ruby_prism::parse(bytes);
+    let start = result
+        .comments()
+        .map(|c| c.location())
+        .filter(|l| code[l.end_offset()..].trim().is_empty())
+        .map(|l| l.start_offset())
+        .min();
+    match start {
+        Some(start) => code[..start].trim_end(),
+        None => code,
+    }
 }
 
 /// How many blocks a `<% code %>` tag leaves open, i.e. how many `<% end %>`

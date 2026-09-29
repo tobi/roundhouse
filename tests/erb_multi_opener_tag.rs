@@ -60,3 +60,17 @@ fn a_multi_line_tag_that_opens_nothing_pushes_nothing() {
     let errors = parse_errors(&compiled);
     assert!(errors.is_empty(), "{errors:?}\n{compiled}");
 }
+
+/// `<% end # card.section %>`: a trailing Ruby comment on a tag. It must
+/// neither hide the `end` from the block stack (leaving the enclosing
+/// output block unclosed) nor swallow the `).to_s` an output tag closes
+/// with. `"#{…}"` is interpolation, not a comment.
+#[test]
+fn a_trailing_comment_on_a_tag_is_not_code() {
+    let compiled = compile_erb(
+        "<%= ui_card do |card| %>\n  <%= card.section do %>\n    <%= \"n: #{1}\" # shown %>\n  <% end # card.section %>\n<% end # ui_card %>\n",
+    );
+    let errors = parse_errors(&compiled);
+    assert!(errors.is_empty(), "{errors:?}\n{compiled}");
+    assert!(compiled.contains("\"n: #{1}\""), "{compiled}");
+}
