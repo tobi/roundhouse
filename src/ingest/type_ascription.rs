@@ -20,11 +20,14 @@ use crate::ty::Ty;
 use super::sorbet_sig::sorbet_type_node;
 use super::sources;
 
-/// Wrap `value` in a `Cast` to `ty`, unless the type says nothing
-/// (`untyped` / unreadable), in which case `value` is returned as is.
+/// Wrap `value` in a `Cast` to `ty`, unless the type is unreadable
+/// (`None` or an open inference variable), in which case `value` is
+/// returned as is. `untyped` IS a reading: `T.unsafe(x)` and
+/// `x #: as untyped` are the author's signed escape hatch, so the value
+/// leaves the type system rather than keeping the type inferred for it.
 pub(super) fn ascribe(value: Expr, ty: Option<Ty>) -> Expr {
     match ty {
-        Some(ty) if !ty.is_open() && !matches!(ty, Ty::Untyped) => {
+        Some(ty) if !ty.is_open() => {
             let span = value.span;
             Expr::new(span, ExprNode::Cast { value, target_ty: ty })
         }
@@ -37,6 +40,11 @@ pub(super) fn sorbet_declared_type(node: &Node<'_>) -> Option<Ty> {
     let call = node.as_call_node()?;
     let method = call.name();
     let method = std::str::from_utf8(method.as_slice()).ok()?;
+    // `T.unsafe(x)` is the escape hatch: no second argument, the value
+    // is untyped from there on.
+    if method == "unsafe" {
+        return Some(Ty::Untyped);
+    }
     if !matches!(method, "let" | "cast") {
         return None;
     }
@@ -54,6 +62,38 @@ pub(super) fn trailing_rbs_type(file: &str, end: usize) -> Option<Ty> {
     let comment = line.trim_start().strip_prefix("#:")?.trim();
     let comment = comment.strip_prefix("as ").unwrap_or(comment).trim();
     rbs_type(comment)
+}
+
+/// The type of a `#: as Type` assertion written between a call's
+/// receiver and the leading-dot line that continues the call:
+///
+/// ```text
+/// self #: as untyped
+///   .before_update(prepend: true) { ... }
+/// ```
+///
+/// The comment ends the receiver's own line, so `trailing_rbs_type`
+/// reads it as the receiver's declared type. Only the `as` form counts
+/// here, and only when the next non-blank line continues with `.` or
+/// `&.`; a comment after a receiver on the same line as its method
+/// (`x.foo #: as T`) never gets this far, because the text after the
+/// receiver is then the method, not the comment.
+pub(super) fn receiver_rbs_assertion(file: &str, end: usize) -> Option<Ty> {
+    let text = sources::text_of(file)?;
+    let rest = text.get(end..)?;
+    let mut lines = rest.split('\n');
+    let comment = lines.next()?.trim_start().strip_prefix("#:")?.trim();
+    comment.strip_prefix("as ")?;
+    let continues = lines
+        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .is_some_and(|l| {
+            let l = l.trim_start();
+            l.starts_with('.') || l.starts_with("&.")
+        });
+    if !continues {
+        return None;
+    }
+    trailing_rbs_type(file, end)
 }
 
 /// Parse one RBS type expression by wrapping it in a method signature

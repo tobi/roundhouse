@@ -391,7 +391,16 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 vec![]
             };
             let recv = match c.receiver() {
-                Some(r) => Some(ingest_expr(&r, file)?),
+                Some(r) => {
+                    let value = ingest_expr(&r, file)?;
+                    // `self #: as untyped` above a leading-dot line:
+                    // the assertion sits after the receiver and before
+                    // the `.method` it is the receiver of.
+                    Some(super::type_ascription::ascribe(
+                        value,
+                        super::type_ascription::receiver_rbs_assertion(file, r.location().end_offset()),
+                    ))
+                }
                 None => None,
             };
             let block = match c.block() {
