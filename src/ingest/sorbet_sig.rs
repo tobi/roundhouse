@@ -57,6 +57,7 @@ pub fn ingest_sorbet_declarations(
         &HashMap::new(),
         &mut out,
         &mut abstracts,
+        source,
     );
     (out, abstracts)
 }
@@ -73,6 +74,7 @@ fn walk(
     aliases: &HashMap<String, Ty>,
     out: &mut HashMap<ClassId, HashMap<Symbol, Ty>>,
     abstracts: &mut HashMap<ClassId, std::collections::HashSet<Symbol>>,
+    source: &[u8],
 ) {
     // The `sig` immediately above a `def` is the one that applies to
     // it; anything else between them (a comment is not a statement,
@@ -102,7 +104,7 @@ fn walk(
                     // order of alias and `sig` in the file does not
                     // matter; an enclosing scope's aliases stay visible.
                     let inner = collect_type_aliases(&statements, aliases);
-                    walk(&statements, Some(&name), false, &inner, out, abstracts);
+                    walk(&statements, Some(&name), false, &inner, out, abstracts, source);
                 }
             }
             pending = None;
@@ -114,7 +116,7 @@ fn walk(
                 if let Some(body) = body.as_statements_node() {
                     let statements = body.body().iter().collect::<Vec<_>>();
                     let inner = collect_type_aliases(&statements, aliases);
-                    walk(&statements, Some(&name), false, &inner, out, abstracts);
+                    walk(&statements, Some(&name), false, &inner, out, abstracts, source);
                 }
             }
             pending = None;
@@ -129,7 +131,7 @@ fn walk(
         if let Some(singleton) = statement.as_singleton_class_node() {
             if let Some(body) = singleton.body() {
                 if let Some(body) = body.as_statements_node() {
-                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, out, abstracts);
+                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, out, abstracts, source);
                 }
             }
             pending = None;
@@ -144,6 +146,13 @@ fn walk(
                         .insert(Symbol::new(constant_id_str(&def.name())));
                 }
                 if let Some(ty) = signature_ty(&statements[sig], &def, in_singleton_class, aliases) {
+                    out.entry(ClassId(Symbol::new(scope)))
+                        .or_default()
+                        .insert(Symbol::new(constant_id_str(&def.name())), ty);
+                }
+            }
+            else if let Some(scope) = scope {
+                if let Some(ty) = rbs_comment_signature(source, &def, in_singleton_class) {
                     out.entry(ClassId(Symbol::new(scope)))
                         .or_default()
                         .insert(Symbol::new(constant_id_str(&def.name())), ty);
@@ -643,4 +652,101 @@ fn named_ty(name: &str) -> Ty {
 /// read as a `Ty`, for `T.let(x, Type)`.
 pub(super) fn sorbet_type_node(node: &Node<'_>) -> Option<Ty> {
     sorbet_ty(node, true, &HashMap::new())
+}
+
+/// The `Ty::Fn` an RBS inline comment declares for a `def`:
+///
+/// ```ruby
+/// #: (::Shop, ActionDispatch::Request) -> void
+/// def initialize(shop, request)
+/// ```
+///
+/// The comment lines are the contiguous run directly above the `def`
+/// (other `#` comments may sit among them: `# @override`). `#:` starts
+/// the signature and `#|` continues it. RBS leaves positional
+/// parameters unnamed; the def names them, so the two are paired in
+/// order and anything that does not pair up (a different count or
+/// kind, a keyword the def does not have) drops the signature rather
+/// than mistyping a parameter.
+fn rbs_comment_signature(
+    source: &[u8],
+    def: &ruby_prism::DefNode<'_>,
+    in_singleton_class: bool,
+) -> Option<Ty> {
+    let text = rbs_comment_text(source, def.location().start_offset())?;
+    let wrapped = format!("class X\n  def m: {text}\nend\n");
+    let sigs = crate::rbs::parse_signatures(&wrapped).ok()?;
+    let Ty::Fn { params: declared, block, ret, effects } = sigs.methods.into_iter().next()?.1 else {
+        return None;
+    };
+    let _ = in_singleton_class;
+    let (declared_block, declared): (Vec<Param>, Vec<Param>) =
+        declared.into_iter().partition(|p| matches!(p.kind, ParamKind::Block));
+    let def_params = match def.parameters() {
+        Some(parameters) => {
+            if parameters.posts().iter().next().is_some() {
+                return None;
+            }
+            def_parameters(&parameters)?
+        }
+        None => Vec::new(),
+    };
+    let def_block = def_params.iter().find(|(_, k)| matches!(k, ParamKind::Block));
+    let def_params: Vec<&(String, ParamKind)> =
+        def_params.iter().filter(|(_, k)| !matches!(k, ParamKind::Block)).collect();
+    if def_params.len() != declared.len() {
+        return None;
+    }
+    let mut params = Vec::new();
+    for ((name, kind), decl) in def_params.into_iter().zip(declared) {
+        if *kind != decl.kind {
+            return None;
+        }
+        // Keywords are named by the RBS itself; they must agree.
+        if matches!(kind, ParamKind::Keyword { .. }) && decl.name.as_str() != name {
+            return None;
+        }
+        params.push(Param { name: Symbol::new(name), ty: decl.ty, kind: kind.clone() });
+    }
+    if let Some((name, _)) = def_block {
+        let ty = declared_block.into_iter().next().map(|p| p.ty).unwrap_or(Ty::Untyped);
+        params.push(Param { name: Symbol::new(name), ty, kind: ParamKind::Block });
+    }
+    Some(Ty::Fn { params, block, ret, effects })
+}
+
+/// The signature text of the `#:` / `#|` comment lines directly above
+/// the line holding byte `def_start`.
+fn rbs_comment_text(source: &[u8], def_start: usize) -> Option<String> {
+    let text = std::str::from_utf8(source).ok()?;
+    let before = text.get(..def_start)?;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text[..line_start].lines().rev() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            break;
+        }
+        lines.push(trimmed);
+    }
+    lines.reverse();
+    let mut sig = String::new();
+    let mut open = false;
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("#:") {
+            // A second `#:` opens another declaration; only the last
+            // block counts, matching what sits nearest the def.
+            sig.clear();
+            sig.push_str(rest.trim());
+            open = true;
+        } else if let Some(rest) = line.strip_prefix("#|") {
+            if open {
+                sig.push(' ');
+                sig.push_str(rest.trim());
+            }
+        } else {
+            open = false;
+        }
+    }
+    (!sig.is_empty()).then_some(sig)
 }
