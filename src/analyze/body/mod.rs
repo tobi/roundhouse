@@ -1198,6 +1198,12 @@ impl<'a> BodyTyper<'a> {
                 {
                     return Ty::Str;
                 }
+                if let Some(t) = recv_ty
+                    .as_ref()
+                    .and_then(|t| literal_extremum_ty(recv.as_ref(), t, method, args))
+                {
+                    return t;
+                }
                 // An element read of a `Parameters` (`params[:order]`,
                 // `params.dig(:a, :b)`) holds `String | Array | Parameters |
                 // nil`, and is typed by its String reading because that is
@@ -3523,3 +3529,33 @@ const RUBY_TOP_LEVEL: &[&str] = &[
     "Socket", "StringIO", "Struct", "Tempfile", "Thread", "Time", "Timeout", "URI", "YAML",
     "Zlib",
 ];
+
+/// `[a, b].min` / `.max` (no count, no block) on an array LITERAL: the
+/// literal has at least one element, so the extremum is an element, never
+/// the `nil` an empty collection would give. `[x, LIMIT].min` is the
+/// clamp idiom; typing it `T?` (as `Enumerable#min` does for an arbitrary
+/// array) makes every `MAX - [x, LIMIT].min` look like arithmetic on nil.
+/// A nil element cannot survive either: comparing it raises in Ruby, so
+/// the nil arm is dropped from the element type too.
+fn literal_extremum_ty(recv: Option<&Expr>, recv_ty: &Ty, method: &Symbol, args: &[Expr]) -> Option<Ty> {
+    if !matches!(method.as_str(), "min" | "max") || !args.is_empty() {
+        return None;
+    }
+    let recv = recv?;
+    let ExprNode::Array { elements, .. } = &*recv.node else { return None };
+    if elements.is_empty() {
+        return None;
+    }
+    let Ty::Array { elem } = recv_ty else { return None };
+    Some(match &**elem {
+        Ty::Union { variants } => {
+            let kept: Vec<Ty> = variants.iter().filter(|v| !matches!(v, Ty::Nil)).cloned().collect();
+            match kept.len() {
+                0 => return None,
+                1 => kept.into_iter().next().unwrap(),
+                _ => Ty::Union { variants: kept },
+            }
+        }
+        other => other.clone(),
+    })
+}
