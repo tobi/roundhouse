@@ -439,9 +439,24 @@ fn signature_ty(
     }
 
     let mut params = Vec::new();
+    let mut block = None;
     if let Some(parameters) = def.parameters() {
         for (name, kind) in def_parameters(&parameters)? {
-            let ty = declared.remove(&name)?;
+            let mut ty = declared.remove(&name)?;
+            // The block parameter is the method's block: `T.proc…`, or
+            // `T.nilable(T.proc…)` when a caller may omit it. Recorded
+            // both as the block and as the parameter, the way the RBS
+            // reader does, holding the callable itself.
+            if kind == ParamKind::Block {
+                if let Ty::Union { variants } = &ty {
+                    if let [only @ Ty::Fn { .. }, Ty::Nil] = variants.as_slice() {
+                        ty = only.clone();
+                    }
+                }
+                if matches!(ty, Ty::Fn { .. }) {
+                    block = Some(Box::new(ty.clone()));
+                }
+            }
             params.push(Param { name: Symbol::new(&name), ty, kind });
         }
     }
@@ -453,7 +468,7 @@ fn signature_ty(
 
     Some(Ty::Fn {
         params,
-        block: None,
+        block,
         ret: Box::new(returns?),
         effects: EffectSet::pure(),
     })
@@ -626,6 +641,13 @@ fn sorbet_ty(
     if let Some(index) = node.as_call_node() {
         let name = index.name();
         let method = constant_id_str(&name).to_string();
+        // `T.proc.params(a: A).returns(R)` / `.void` — a block or
+        // callable, the type RBS spells `^(A) -> R`. `bind(Foo)` says
+        // what `self` is inside it and `checked` how hard runtime
+        // checks it; neither is a type.
+        if let Some(fn_ty) = sorbet_proc_ty(&index, self_is_instance, aliases) {
+            return fn_ty;
+        }
         if method == "[]" {
             let receiver = index.receiver()?;
             let container = constant_path_name(&receiver);
@@ -708,6 +730,75 @@ fn sorbet_ty(
         };
     }
     None
+}
+
+/// A `T.proc` chain read as `Ty::Fn`. `Some(None)` when the chain is a
+/// `T.proc` this grammar cannot read (the caller drops the signature),
+/// `None` when the call is not a `T.proc` chain at all.
+fn sorbet_proc_ty(
+    call: &ruby_prism::CallNode<'_>,
+    self_is_instance: bool,
+    aliases: &HashMap<String, Ty>,
+) -> Option<Option<Ty>> {
+    // Walk to the root first: only `T.proc` heads such a chain.
+    let mut chain = vec![call.as_node().as_call_node()?];
+    loop {
+        let receiver = chain.last()?.receiver()?;
+        match receiver.as_call_node() {
+            Some(next) => chain.push(next),
+            None => {
+                let root = chain.pop()?;
+                let names_t = receiver
+                    .as_constant_read_node()
+                    .is_some_and(|c| constant_id_str(&c.name()) == "T");
+                if !names_t || constant_id_str(&root.name()) != "proc" {
+                    return None;
+                }
+                break;
+            }
+        }
+    }
+    let read = || -> Option<Ty> {
+        let mut params = Vec::new();
+        let mut ret: Option<Ty> = None;
+        // Outermost link first; the inner `params` is written first, so
+        // walk from the root outward.
+        for link in chain.iter().rev() {
+            match constant_id_str(&link.name()) {
+                "params" => {
+                    for argument in link.arguments()?.arguments().iter() {
+                        let hash = argument.as_keyword_hash_node()?;
+                        for element in hash.elements().iter() {
+                            let assoc = element.as_assoc_node()?;
+                            let key = assoc.key();
+                            let key = key.as_symbol_node()?;
+                            let name =
+                                String::from_utf8_lossy(key.value_loc()?.as_slice()).into_owned();
+                            params.push(Param {
+                                name: Symbol::new(&name),
+                                ty: sorbet_ty(&assoc.value(), self_is_instance, aliases)?,
+                                kind: ParamKind::Required,
+                            });
+                        }
+                    }
+                }
+                "returns" => {
+                    let argument = link.arguments()?.arguments().iter().next()?;
+                    ret = Some(sorbet_ty(&argument, self_is_instance, aliases)?);
+                }
+                "void" => ret = Some(Ty::Nil),
+                "bind" | "checked" => {}
+                _ => return None,
+            }
+        }
+        Some(Ty::Fn {
+            params,
+            block: None,
+            ret: Box::new(ret.unwrap_or(Ty::Untyped)),
+            effects: EffectSet::default(),
+        })
+    };
+    Some(read())
 }
 
 /// A constant in type position, mapped the way the RBS reader maps the
