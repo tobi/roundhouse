@@ -1221,16 +1221,6 @@ impl<'a> BodyTyper<'a> {
                 {
                     return t;
                 }
-                // An element read of a `Parameters` (`params[:order]`,
-                // `params.dig(:a, :b)`) holds `String | Array | Parameters |
-                // nil`, and is typed by its String reading because that is
-                // what nearly every read wants. A method only Parameters
-                // answers (`params[:order].permit_types(...)`,
-                // `.to_unsafe_h`) selects the Parameters arm of that
-                // union instead of failing on the String one.
-                if let Some(t) = self.parameters_arm_ty(recv.as_ref(), method, block_ret.as_ref(), args) {
-                    return t;
-                }
                 let answered = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only, like
