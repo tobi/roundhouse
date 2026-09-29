@@ -415,6 +415,9 @@ impl Analyzer {
             // `has_json` schema keys — same situation, JSON instead of
             // YAML, plus the one type the declaration erases.
             register_has_json(&model.body, &mut cls.instance_methods);
+            // `serialize :col, coder: …` — the column reads back as the
+            // coder's object, not the storage text.
+            register_serialized_columns(&model.body, &mut cls.instance_methods);
             // `attribute :name, :type` virtual attributes (ActiveModel) —
             // backed by something other than a schema column, so absent
             // from `model.attributes` above.
@@ -6385,6 +6388,29 @@ fn register_has_json(body: &[ModelBodyItem], methods: &mut HashMap<Symbol, Ty>) 
             methods
                 .entry(Symbol::from(format!("{}=", flat.as_str())))
                 .or_insert(ty);
+        }
+    }
+}
+
+/// `serialize :settings, coder: JSON` (Rails' attribute serialization)
+/// keeps the column's storage type in the schema (`text`/`string`) but
+/// the attribute reads back as whatever the coder loads: a Hash, an
+/// Array, a value object. Typing the reader and writer as the storage
+/// `String` makes every use of the deserialized value (`line_items.map`,
+/// `settings.fetch`) a dispatch failure on `String?`. The coder is an
+/// arbitrary object (`JSON`, `VersionedSerializer.column(…)`, a custom
+/// class), so the honest type is the gradual one. `insert`, not
+/// `or_insert`: this deliberately overrides the schema-derived type.
+fn register_serialized_columns(body: &[ModelBodyItem], methods: &mut HashMap<Symbol, Ty>) {
+    for item in body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+        if method.as_str() != "serialize" {
+            continue;
+        }
+        for name in args.iter().map_while(symbol_arg) {
+            methods.insert(name.clone(), Ty::Untyped);
+            methods.insert(Symbol::from(format!("{}=", name.as_str())), Ty::Untyped);
         }
     }
 }
