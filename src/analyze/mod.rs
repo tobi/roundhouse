@@ -681,6 +681,17 @@ impl Analyzer {
                 cls.includes = includes;
             }
 
+            // Link to the parent when it is itself an app model
+            // (`User < ApplicationRecord`), so class-side and instance
+            // methods the base defines or folds in from its concerns
+            // reach the subclass. Gem parents stay unlinked: the catalog
+            // seeding above already covers the AR::Base surface.
+            if let Some(Some(p)) = model_parents.get(&model.name) {
+                if model_parents.contains_key(*p) {
+                    cls.parent = Some((*p).clone());
+                }
+            }
+
             classes.insert(model.name.clone(), cls);
         }
 
