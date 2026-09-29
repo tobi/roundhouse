@@ -138,12 +138,14 @@ fn including_types_the_to_a_it_synthesizes() {
 /// clean ledger entry.
 ///
 /// The fixture used to be campfire's
-/// `params.fetch(:user_ids, []).including(…)`. That shape is no longer
-/// an example of the rule: `fetch` now reads the `[]` default, so the
-/// receiver is `Array[…] | Str` and the Array arm answers — see
-/// `tests/params_fetch_array_default.rs`. A bare `params[:user_ids]`
-/// still types `Str | Nil`, which is what "no arm can answer" looks
-/// like, so the invariant keeps a fixture that actually exercises it.
+/// `params.fetch(:user_ids, []).including(…)`, then a bare
+/// `params[:user_ids].including(1)`. Neither is an example of the rule
+/// now: `fetch` reads the `[]` default (see
+/// `tests/params_fetch_array_default.rs`) and an element read is
+/// `String | Array | Parameters | nil`, whose Array arm answers. A
+/// `params[:user_ids].to_i` is an Integer, which is what "no arm can
+/// answer" looks like, so the invariant keeps a fixture that actually
+/// exercises it.
 #[test]
 fn including_leaves_an_unknown_receiver_on_the_ledger() {
     let found = errors(vec![
@@ -153,7 +155,7 @@ fn including_leaves_an_unknown_receiver_on_the_ledger() {
             "app/controllers/users_controller.rb",
             "class UsersController < ApplicationController\n  \
                def index\n    \
-                 @ids = params[:user_ids].including(1)\n  \
+                 @ids = params[:user_ids].to_i.including(1)\n  \
                end\nend\n",
         ),
     ]);
