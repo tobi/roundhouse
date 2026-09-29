@@ -27,6 +27,8 @@ fn failed_sends(files: &[(&str, &str)]) -> Vec<String> {
     @s = request.buyer_session!
     @u = request.http_basic_user
     @ok = request.authorized?
+    @k = request.key_generator
+    @c = request.controller_class
     @n = request.nothing_defined
     render plain: ""
   end
