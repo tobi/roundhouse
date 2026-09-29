@@ -460,6 +460,7 @@ impl Server {
             crate::gems::GemFate::Framework,
             crate::gems::GemFate::Stdlib,
             crate::gems::GemFate::Infrastructure,
+            crate::gems::GemFate::InRepo,
         ] {
             for g in census.gems.iter().filter(|g| g.fate == fate) {
                 let version = g.version.as_deref().map(|v| format!(" {v}")).unwrap_or_default();
