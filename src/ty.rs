@@ -231,6 +231,31 @@ impl Ty {
         }
     }
 
+    /// True when an unknown ([`Ty::is_unknown`]) sits anywhere inside
+    /// this type: `untyped`, `Array[untyped]`, `Hash[Symbol, untyped]`,
+    /// `String | untyped`, a signature with an untyped parameter. A
+    /// type that does NOT is fully spelled out, which is what makes a
+    /// declaration the last word rather than a hint.
+    pub fn mentions_unknown(&self) -> bool {
+        match self {
+            Ty::Var { .. } | Ty::Untyped => true,
+            Ty::Class { args, .. } => args.iter().any(Ty::mentions_unknown),
+            Ty::Array { elem } => elem.mentions_unknown(),
+            Ty::Hash { key, value } => key.mentions_unknown() || value.mentions_unknown(),
+            Ty::Tuple { elems } => elems.iter().any(Ty::mentions_unknown),
+            Ty::Union { variants } => variants.iter().any(Ty::mentions_unknown),
+            Ty::Record { row } => {
+                row.fields.values().any(Ty::mentions_unknown) || row.rest.is_some()
+            }
+            Ty::Fn { params, block, ret, .. } => {
+                params.iter().any(|p| p.ty.mentions_unknown())
+                    || block.as_ref().is_some_and(|b| b.mentions_unknown())
+                    || ret.mentions_unknown()
+            }
+            _ => false,
+        }
+    }
+
     /// True for the two "no known type" variants: [`Ty::Var`] (the
     /// analyzer couldn't infer a type) and [`Ty::Untyped`] (an
     /// author-signed gradual-typing opt-out). Both mean "don't reason
