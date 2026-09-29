@@ -1083,6 +1083,21 @@ impl<'a> BodyTyper<'a> {
                         let receiver_is_model = self.classes().get(id).is_some_and(|c| c.table.is_some());
                         if cid != id && cls.table.is_some() && receiver_is_model { ty.rebind_class(cid, id) } else { ty }
                     };
+                    // The class object and its instances share this one type, so a
+                    // name both sides define is ambiguous. The catalog gives every model
+                    // the relation builders (`order`, `group`, `limit`, ...) class-side;
+                    // `belongs_to :order` gives an instance the reader `order`. A relation
+                    // builder called with no arguments is not a query (`Refund.order` is an
+                    // error), so the zero-argument call is the instance reader.
+                    if call_args.is_empty() {
+                        if let (Some(cm), Some(im)) =
+                            (cls.class_methods.get(method), cls.instance_methods.get(method))
+                        {
+                            if matches!(unwrap_fn_ret(cm), Ty::Relation { .. }) {
+                                return unwrap_fn_ret(&subst(im));
+                            }
+                        }
+                    }
                     if let Some(ty) = cls.class_methods.get(method) {
                         return unwrap_fn_ret(&subst(ty));
                     }
