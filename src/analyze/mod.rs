@@ -251,6 +251,12 @@ impl Analyzer {
             // return whatever the block returned, which we don't
             // statically track — Untyped is the gradual escape.
             cls.class_methods.insert(Symbol::from("transaction"), Ty::Untyped);
+            // Multi-database routing (`connects_to` sets it up): the
+            // block runs on the named role/shard and the call answers
+            // the block's value, like `transaction`.
+            for m in registry::ar::CONNECTION_SCOPING_METHODS {
+                cls.class_methods.insert(Symbol::from(*m), Ty::Untyped);
+            }
             cls.class_methods.insert(Symbol::from("connection"), registry::ar::connection_ty());
             cls.class_methods.insert(Symbol::from("connection_pool"), Ty::Untyped);
             cls.class_methods.insert(Symbol::from("establish_connection"), Ty::Untyped);

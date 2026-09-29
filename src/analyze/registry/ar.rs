@@ -35,6 +35,13 @@ fn register_connection_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
     }
 }
 
+/// The class-side calls that run a block against a chosen database
+/// role or shard (`connected_to(role: :reading) { … }`). They answer
+/// the block's value, so dispatch adopts the block's type for them the
+/// way it does for `transaction`.
+pub(in crate::analyze) const CONNECTION_SCOPING_METHODS: &[&str] =
+    &["connected_to", "connected_to_many", "connecting_to", "while_preventing_writes"];
+
 pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_connection_surface(classes);
     // `ActiveRecord::Base` itself — the literal base class, called
@@ -63,8 +70,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             "transaction",
             "connection_pool",
             "establish_connection",
-        ] {
-            base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Untyped);
+        ].iter().chain(CONNECTION_SCOPING_METHODS) {
+            base.class_methods.entry(Symbol::from(*m)).or_insert(Ty::Untyped);
         }
         base.class_methods
             .entry(Symbol::from("connection"))
