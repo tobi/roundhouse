@@ -1123,8 +1123,16 @@ impl Controller {
         })
     }
 
+    /// The class-side methods (`def self.x`, `class << self` defs).
     pub fn class_methods(&self) -> impl Iterator<Item = &MethodDef> {
         self.body.iter().filter_map(|item| match item {
+            ControllerBodyItem::ClassMethod { method, .. } => Some(method),
+            _ => None,
+        })
+    }
+
+    pub fn class_methods_mut(&mut self) -> impl Iterator<Item = &mut MethodDef> {
+        self.body.iter_mut().filter_map(|item| match item {
             ControllerBodyItem::ClassMethod { method, .. } => Some(method),
             _ => None,
         })
@@ -1186,6 +1194,18 @@ pub enum ControllerBodyItem {
         leading_blank_line: bool,
     },
     PrivateMarker {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        leading_comments: Vec<Comment>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        leading_blank_line: bool,
+    },
+    /// A CLASS-side method: `def self.x`, or a `def` inside `class << self`.
+    /// Not an action — nothing routes to it and it takes no part in the
+    /// filter chain — but it is a method of the controller class
+    /// (`ApplicationController.on_field_error`) that subclass bodies and
+    /// the class-side of the registry reach.
+    ClassMethod {
+        method: MethodDef,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         leading_comments: Vec<Comment>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
