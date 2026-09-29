@@ -89,6 +89,12 @@ pub struct App {
     /// replaces Action Text's `rich_text_area`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gem_lock: Option<crate::gems::Lockfile>,
+    /// The classes and method headers the locked gems' Tapioca RBIs
+    /// declare ([`crate::gem_boundary`]). Declarations only, read at
+    /// ingest when the tree (or the real location of its lockfile) has
+    /// `sorbet/rbi/gems/`; empty otherwise.
+    #[serde(default, skip_serializing_if = "crate::gem_boundary::GemBoundary::is_empty")]
+    pub gem_boundary: crate::gem_boundary::GemBoundary,
     /// Attributes the app (and its gems) add to Action Text's sanitizer
     /// allow-list at boot — `ActionText::ContentHelper.allowed_attributes`
     /// as the initializers leave it, minus the framework defaults the
@@ -689,6 +695,7 @@ impl App {
             rbs_signatures: HashMap::new(),
             rbs_includes: HashMap::new(),
             gem_lock: None,
+            gem_boundary: Default::default(),
             content_helper_allowed_attributes: Vec::new(),
             inferred_method_params: HashMap::new(),
             helper_method_index: HashMap::new(),

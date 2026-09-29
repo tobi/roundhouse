@@ -220,6 +220,16 @@ pub struct ClassInfo {
     /// class's own methods and before walking the parent. Empty for
     /// most classes.
     pub includes: Vec<crate::ident::ClassId>,
+    /// Declared by a gem's RBI rather than by the app or the catalog
+    /// (`crate::gem_boundary`). Its own table is the gem's whole
+    /// declared surface, so a miss on the class itself is a real miss --
+    /// but an APP class that inherits from it also inherits whatever the
+    /// gem's macros generate, which no declaration lists.
+    pub gem_boundary: bool,
+    /// The surface cannot be enumerated (`method_missing`, an unresolved
+    /// mixin, an ancestor the RBI could not name): a lookup that misses
+    /// is unknown, not wrong.
+    pub open: bool,
 }
 
 /// Resolve a single-segment Const ref (like `Const { path:

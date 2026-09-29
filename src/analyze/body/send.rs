@@ -1066,6 +1066,10 @@ impl<'a> BodyTyper<'a> {
                 // to find the method, so it is held here and applied
                 // after the walk, never in place of a real method.
                 let mut method_missing_ty: Option<Ty> = None;
+                // Whether the walk has been through a class the RBI did not
+                // declare: an app class inheriting a gem class gets what the
+                // gem's macros generate on top of the declared surface.
+                let mut via_undeclared = false;
                 while let Some(cid) = current_id {
                     depth += 1;
                     if depth > 32 {
@@ -1078,6 +1082,12 @@ impl<'a> BodyTyper<'a> {
                         break;
                     };
                     steps += 1;
+                    if cls.open || (cls.gem_boundary && via_undeclared) {
+                        unknown_named_ancestor = true;
+                    }
+                    if !cls.gem_boundary {
+                        via_undeclared = true;
+                    }
                     // A signature found ANYWHERE on this walk may name
                     // the receiving class as `instance` /
                     // `T.attached_class` — a fact the declaring class
