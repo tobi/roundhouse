@@ -637,6 +637,8 @@ fn named_ty(name: &str) -> Ty {
         "Integer" => Ty::Int,
         "Float" => Ty::Float,
         "String" => Ty::Str,
+        "Hash" => Ty::Hash { key: Box::new(Ty::Untyped), value: Box::new(Ty::Untyped) },
+        "Array" => Ty::Array { elem: Box::new(Ty::Untyped) },
         "Symbol" => Ty::Sym,
         "TrueClass" | "FalseClass" => Ty::Bool,
         "NilClass" => Ty::Nil,
