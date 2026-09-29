@@ -839,7 +839,8 @@ impl<'a> BodyTyper<'a> {
         if let Some(t) = self.block_value_return(recv_ty, method, block_ret) {
             return t;
         }
-        if method.as_str() == "transaction"
+        if (method.as_str() == "transaction"
+            || super::super::registry::ar::CONNECTION_SCOPING_METHODS.contains(&method.as_str()))
             && matches!(recv_ty, Some(Ty::Class { .. }))
         {
             if let Some(ret) = block_ret {
