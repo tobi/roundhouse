@@ -111,6 +111,11 @@ pub struct Ctx {
     /// it `String` instead of the generic `Untyped`. Off elsewhere, where a
     /// block's return type isn't tracked through the method signature.
     pub in_view: bool,
+    /// Set while typing the body of a class-side method (`def self.x`,
+    /// `class << self; def x`). `self` there is the class object, so an
+    /// implicit-self `new` answers "an instance of whichever class
+    /// received the call", not of the class the `def` sits in.
+    pub class_side: bool,
 }
 
 /// User-class dispatch data: table name (if any), instance shape,
@@ -1069,6 +1074,21 @@ impl<'a> BodyTyper<'a> {
                     }
                     other => other,
                 };
+                // `new` on the implicit or explicit `self` of a class-side
+                // method builds an instance of the class that RECEIVED the
+                // call: `CurrencyDb.load` runs `YamlDb.load` with `self ==
+                // CurrencyDb`. Typing it as the class the `def` sits in made
+                // every subclass factory answer the base class.
+                if ctx.class_side
+                    && method.as_str() == "new"
+                    && recv.as_ref().map_or(true, |r| matches!(&*r.node, ExprNode::SelfRef))
+                    && matches!(recv_ty, Some(Ty::Class { .. }))
+                {
+                    for a in args.iter_mut() {
+                        self.analyze_expr(a, ctx);
+                    }
+                    return Ty::SelfInstance;
+                }
                 // `defined?(Foo)` keeps the written path but must not
                 // resolve or autoload it. Absence is a runtime answer.
                 let defined_constant = recv.is_none()
