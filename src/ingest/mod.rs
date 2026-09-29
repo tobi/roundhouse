@@ -30,6 +30,7 @@ pub mod delegate;
 pub mod thread_mattr;
 pub mod model;
 pub mod on_load_reopen;
+pub mod pattern;
 pub mod prism;
 pub mod rate_limit;
 pub mod roda_app;
