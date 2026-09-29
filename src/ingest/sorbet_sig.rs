@@ -585,6 +585,19 @@ fn sorbet_ty(
         if method == "[]" {
             let receiver = index.receiver()?;
             let container = constant_path_name(&receiver);
+            // A generic app or gem class: `Shopify::Adt::Result[Ok, Err]`
+            // is an instance of that class whatever its parameters; a
+            // parameter this grammar cannot read is `untyped`, not a
+            // reason to lose the class.
+            if !container.is_empty() && !container.starts_with("T::") {
+                let args = index
+                    .arguments()?
+                    .arguments()
+                    .iter()
+                    .map(|a| sorbet_ty(&a, self_is_instance, aliases).unwrap_or(Ty::Untyped))
+                    .collect();
+                return Some(Ty::Class { id: ClassId(Symbol::new(&container)), args });
+            }
             let args: Vec<Ty> = index
                 .arguments()?
                 .arguments()
@@ -596,11 +609,6 @@ fn sorbet_ty(
                 ("T::Hash", [key, value]) => Some(Ty::Hash {
                     key: Box::new(key.clone()),
                     value: Box::new(value.clone()),
-                }),
-                // A generic class applied to arguments (`Shopify::Adt::Result[A, B]`).
-                (name, _) if !name.starts_with("T::") && !name.is_empty() => Some(Ty::Class {
-                    id: ClassId(Symbol::new(name)),
-                    args,
                 }),
                 _ => None,
             };

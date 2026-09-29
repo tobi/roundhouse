@@ -87,6 +87,34 @@ pub struct GemClass {
 /// The catalog. One entry per gem class/module; add a gem by adding a
 /// row.
 pub const GEM_CATALOG: &[GemClass] = &[
+    // shopify-adt — the ADT `Result` core returns from its operations
+    // (`Shopify::Adt::Result.ok(v)` / `.error(e)`; `type_alias`es like
+    // `Shopify::Adt::Result[Tokens, Err]` name its parameterization).
+    // The predicates answer Booleans. The value readers are typed by
+    // the instance's `OkType`/`ErrorType`, which this catalog shape
+    // cannot carry, so they are the gradual floor rather than a guess;
+    // the combinators (`map`, `and_then`, …) hand back another Result.
+    GemClass {
+        name: "Shopify::Adt::Result",
+        class_methods: &[
+            ("ok", GemTy::Instance("Shopify::Adt::Result")),
+            ("error", GemTy::Instance("Shopify::Adt::Result")),
+        ],
+        instance_methods: &[
+            ("ok?", GemTy::Bool),
+            ("error?", GemTy::Bool),
+            ("ok_value", GemTy::Untyped),
+            ("error_value", GemTy::Untyped),
+            ("ok_value_or", GemTy::Untyped),
+            ("ok_value_or_else", GemTy::Untyped),
+            ("map", GemTy::Instance("Shopify::Adt::Result")),
+            ("map_error", GemTy::Instance("Shopify::Adt::Result")),
+            ("and_then", GemTy::Instance("Shopify::Adt::Result")),
+            ("or_else", GemTy::Instance("Shopify::Adt::Result")),
+            ("each", GemTy::Untyped),
+            ("each_error", GemTy::Untyped),
+        ],
+    },
     // Faker — synthetic data. Production code shouldn't call it, but
     // lobsters' /cabinet dev-tools page renders sample content
     // inline; every generator returns a String.
