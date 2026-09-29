@@ -629,6 +629,24 @@ impl<'a> BodyTyper<'a> {
                 return self.dispatch(Some(&as_hash), method, block_ret, args);
             }
         }
+        // `self[:generated_at]` / `read_attribute(:generated_at)` read
+        // the attribute TYPECAST, so `Time?` for a datetime column and
+        // `BigDecimal?` for a decimal one -- the same value the
+        // column's own reader answers. The catalog entry for `[]`
+        // and `read_attribute` says `String`, the shape of the
+        // storage text the lowered model deals in, which is not what
+        // the source program reads: `self[:rate] || BigDecimal("1")`
+        // was `String`, and `1 / rate` an "Integer / String" error.
+        // Only a literal name that IS an attribute is answered; any
+        // other key keeps the catalog's answer.
+        if let (true, Some(Ty::Class { id, .. })) = (
+            matches!(method.as_str(), "[]" | "read_attribute" | "_read_attribute"),
+            recv_ty,
+        ) {
+            if let Some(ty) = self.attribute_by_name(id, args) {
+                return ty;
+            }
+        }
         // A tuple (a method returning `[a, b]` of mixed types — see
         // `tuple_return_ty`) is still an Array at runtime: anything but
         // destructuring reads it as one, over the union of its slots.
@@ -1629,6 +1647,29 @@ impl<'a> BodyTyper<'a> {
             // resolves the read instead of leaving it `Var`.
             _ => conversion_fallback(method).unwrap_or_else(unknown),
         }
+    }
+
+    /// The type of the attribute a literal `:name` / `"name"` argument
+    /// names on `class`, its own or an ancestor's (`self[:name]`).
+    fn attribute_by_name(&self, class: &ClassId, args: &[Expr]) -> Option<Ty> {
+        let [arg] = args else { return None };
+        let ExprNode::Lit { value } = &*arg.node else { return None };
+        let key = match value {
+            crate::expr::Literal::Sym { value } => value.clone(),
+            crate::expr::Literal::Str { value } => Symbol::from(value.as_str()),
+            _ => return None,
+        };
+        let mut cursor = Some(class.clone());
+        // Bounded: a parent link that cycles must not hang the typer.
+        for _ in 0..16 {
+            let cur = cursor?;
+            let info = self.classes().get(&cur)?;
+            if let Some(ty) = info.attributes.fields.get(&key) {
+                return Some(ty.clone());
+            }
+            cursor = info.parent.clone();
+        }
+        None
     }
 
     /// Resolve `method` against a mixed-in module's registered methods,
