@@ -1663,6 +1663,60 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             };
             ExprNode::While { cond, body, until_form: false }
         }
+        // `for x in xs … end` is `xs.each { |x| … }`: Ruby literally
+        // expands it to an `each` call, with `break`/`next` behaving as
+        // they do in a block. The one difference is scope (a `for` body
+        // shares the enclosing scope, a block gets its own), which only
+        // shows for locals first assigned inside the body and read after
+        // it. `for a, b in pairs` destructures, as a two-parameter block
+        // does. Targets other than plain locals (`for @x in …`) stay
+        // unsupported.
+        n if n.as_for_node().is_some() => {
+            let f = n.as_for_node().unwrap();
+            let unsupported = |what: &str| IngestError::Unsupported {
+                file: file.into(),
+                message: format!("`for` with a non-local loop variable is not supported: {what}"),
+            };
+            let index = f.index();
+            let params: Vec<Symbol> = if let Some(lv) = index.as_local_variable_target_node() {
+                vec![Symbol::from(constant_id_str(&lv.name()))]
+            } else if let Some(mt) = index.as_multi_target_node() {
+                if mt.rest().is_some() || !mt.rights().is_empty() {
+                    return Err(unsupported("splat in a destructuring target"));
+                }
+                let mut names = Vec::new();
+                for t in mt.lefts().iter() {
+                    match t.as_local_variable_target_node() {
+                        Some(lv) => names.push(Symbol::from(constant_id_str(&lv.name()))),
+                        None => return Err(unsupported(&format!("{t:?}"))),
+                    }
+                }
+                names
+            } else {
+                return Err(unsupported(&format!("{index:?}")));
+            };
+            let iterable = ingest_expr(&f.collection(), file)?;
+            let body = match f.statements() {
+                Some(s) => ingest_expr(&s.as_node(), file)?,
+                None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+            };
+            ExprNode::Send {
+                recv: Some(iterable),
+                method: Symbol::from("each"),
+                args: vec![],
+                block: Some(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Lambda {
+                        params,
+                        rest_param: None,
+                        block_param: None,
+                        body,
+                        block_style: crate::expr::BlockStyle::Do,
+                    },
+                )),
+                parenthesized: false,
+            }
+        }
         n if n.as_until_node().is_some() => {
             let u = n.as_until_node().unwrap();
             if u.is_begin_modifier() {
