@@ -291,6 +291,56 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
     body_has_direct_method_decl(m.body())
         || body_has_included_block(m.body())
         || body_has_constant_decl(m.body())
+        || body_has_route_helpers_include(m.body())
+}
+
+/// A module whose whole content is the route-helper mixin — core's
+/// `UrlHelpers`, `class << self` around `self.include(Rails.application.
+/// routes.url_helpers)` — is the app's handle on the route table.
+/// Callers reach it as `UrlHelpers.<route>_url`, so it must surface for
+/// the include marker to reach the analyzer and give it the helper set.
+fn body_has_route_helpers_include(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    flatten_statements(body).iter().any(|stmt| {
+        if let Some(sc) = stmt.as_singleton_class_node() {
+            return body_has_route_helpers_include(sc.body());
+        }
+        let Some(call) = stmt.as_call_node() else { return false };
+        constant_id_str(&call.name()) == "include"
+            && call.receiver().is_none_or(|r| r.as_self_node().is_some())
+            && call
+                .arguments()
+                .is_some_and(|a| a.arguments().iter().any(|arg| is_rails_url_helpers_chain(&arg)))
+    })
+}
+
+/// Match the `Rails.application.routes.url_helpers` receiver chain (a
+/// nested CallNode ladder rooted at the `Rails` constant).
+pub(super) fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
+    let mut expected = ["url_helpers", "routes", "application"].iter();
+    let mut cur = match node.as_call_node() {
+        Some(c) => c,
+        None => return false,
+    };
+    loop {
+        let Some(want) = expected.next() else { return false };
+        if cur.name().as_slice() != want.as_bytes() {
+            return false;
+        }
+        match cur.receiver() {
+            Some(r) => {
+                if let Some(cr) = r.as_constant_read_node() {
+                    return expected.next().is_none()
+                        && cr.name().as_slice() == b"Rails";
+                }
+                match r.as_call_node() {
+                    Some(next) => cur = next,
+                    None => return false,
+                }
+            }
+            None => return false,
+        }
+    }
 }
 
 /// A module whose only content is a CONSTANT is still app state the
