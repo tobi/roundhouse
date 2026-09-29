@@ -61,7 +61,11 @@ pub fn lower_delegates(app: &mut crate::App) {
             continue;
         }
         let src = synthesized_source(lc, &delegates);
-        let methods = match crate::ingest::ingest_library_classes(src.as_bytes(), "<delegate>") {
+        // A source name per class: the registry keeps the first text
+        // for a path, so one shared name rendered every parse
+        // diagnostic against the first class's snippet.
+        let file = format!("<delegate {}>", lc.name.0.as_str());
+        let methods = match crate::ingest::ingest_library_classes(src.as_bytes(), &file) {
             Ok(classes) => classes.into_iter().flat_map(|c| c.methods).collect(),
             Err(err) => {
                 super::survey::record(&err);
@@ -167,6 +171,25 @@ fn collect_calls_with_args(expr: &Expr, out: &mut std::collections::HashSet<Stri
 /// The forwarders, as Ruby source — parsed back through ingest so the
 /// generated bodies are ordinary IR, indistinguishable from a method
 /// the app wrote. Same construction `current_attributes` uses.
+/// The receiver Rails writes for `to:`: `self.<to>` when the name is a
+/// Ruby keyword (`to: :class`, a model's `return` association) or one of
+/// the names its generated method uses itself, the name otherwise
+/// (`DELEGATION_RESERVED_METHOD_NAMES` in active_support/delegation.rb).
+fn receiver(target: &str) -> std::borrow::Cow<'_, str> {
+    const RESERVED: &[&str] = &[
+        "__ENCODING__", "__LINE__", "__FILE__", "alias", "and", "BEGIN", "begin", "break",
+        "case", "class", "def", "defined?", "do", "else", "elsif", "END", "end", "ensure",
+        "false", "for", "if", "in", "module", "next", "nil", "not", "or", "redo", "rescue",
+        "retry", "return", "self", "super", "then", "true", "undef", "unless", "until", "when",
+        "while", "yield", "_", "arg", "args", "block",
+    ];
+    if RESERVED.contains(&target) {
+        format!("self.{target}").into()
+    } else {
+        target.into()
+    }
+}
+
 fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
     let defines = |name: &str| {
         lc.methods
@@ -178,7 +201,7 @@ fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
         if defines(&d.name) {
             continue;
         }
-        let (t, m) = (d.target.as_str(), d.method.as_str());
+        let (t, m) = (receiver(d.target.as_str()), d.method.as_str());
         if d.allow_nil {
             // A ternary, not `return nil if …`: it leaves the method
             // ending in a read, which is what the strict targets want

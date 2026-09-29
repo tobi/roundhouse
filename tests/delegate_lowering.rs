@@ -144,3 +144,24 @@ end
     assert!(out.contains("\"already mine\""), "got:\n{out}");
     assert_eq!(out.matches("def fragment").count(), 1, "got:\n{out}");
 }
+
+/// `to: :class` (or any other Ruby keyword) is `self.class` in the
+/// forwarder, as Rails writes it: a bare `class.label` does not parse.
+/// Shopify core has dozens (`delegate :context, to: :class`).
+#[test]
+fn a_keyword_target_is_read_through_self() {
+    let out = emit(
+        r#"class Filter
+  attr_reader :return
+  delegate :label, to: :class
+  delegate :id, to: :return
+
+  def self.label
+    "f"
+  end
+end
+"#,
+    );
+    assert!(out.contains("self.class.label"), "got:\n{out}");
+    assert!(out.contains("self.return.id"), "got:\n{out}");
+}
