@@ -625,7 +625,9 @@ impl<'a> BodyTyper<'a> {
         if let Some(Ty::Class { id, .. }) = recv_ty {
             if id.0.as_str() == "ActionController::Parameters"
                 && method.as_str() != "new"
-                && !self.classes().get(id).is_some_and(|c| c.instance_methods.contains_key(method))
+                && !self.classes().get(id).is_some_and(|c| {
+                    c.instance_methods.contains_key(method) || c.class_methods.contains_key(method)
+                })
             {
                 let as_hash = params_as_hash();
                 return self.dispatch(Some(&as_hash), method, block_ret, args);
