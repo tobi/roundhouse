@@ -70,6 +70,16 @@ impl ConstScope {
     pub fn get(&self, name: &Symbol) -> Option<&Ty> {
         self.own.get(name).or_else(|| self.global.get(name))
     }
+
+    /// Only the constants this scope's class declares itself.
+    pub fn get_own(&self, name: &Symbol) -> Option<&Ty> {
+        self.own.get(name)
+    }
+
+    /// Only the app-wide, by-bare-name registry.
+    pub fn get_global(&self, name: &Symbol) -> Option<&Ty> {
+        self.global.get(name)
+    }
 }
 
 /// Recursion context — what `self` is, what locals/ivars are in scope.
