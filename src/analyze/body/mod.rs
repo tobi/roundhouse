@@ -1101,7 +1101,8 @@ impl<'a> BodyTyper<'a> {
                         if id.0.as_str() == "ActionController::Parameters"
                             && method.as_str() != "new"
                             && !self.classes().get(&id).is_some_and(|c|
-                                c.instance_methods.contains_key(method)) =>
+                                c.instance_methods.contains_key(method)
+                                    || c.class_methods.contains_key(method)) =>
                     {
                         Some(send::params_as_hash())
                     }
