@@ -975,3 +975,24 @@ fn nested_routes_under_an_only_empty_parent_run() {
         .run_test("test/controllers/comments_controller_test.rb")
         .assert_passes();
 }
+
+/// A collection render with `as: :for` emitted a
+/// positional `for` param and a `|for|` block param.
+#[test]
+fn a_collection_render_with_a_reserved_word_as_local_runs() {
+    let run = on_the_index(
+        emit_and_run::real_blog().write(
+            "app/views/articles/_row.html.erb",
+            "<li class=\"for-row\"><%= binding.local_variable_get(:for).title %></li>\n",
+        )
+        .write(
+            "app/views/articles/_assigns_row.html.erb",
+            "<li class=\"for-assigns-row\"><%= local_assigns[:for].title %></li>\n",
+        ),
+        "<%= render partial: \"row\", collection: @articles, as: :for %>\n\
+         <%= render partial: \"assigns_row\", collection: @articles, as: :for %>\n",
+        "    assert_select \"li.for-row\", Article.count\n    \
+             assert_select \"li.for-assigns-row\", Article.count\n",
+    );
+    run.assert_passes();
+}
