@@ -1407,6 +1407,61 @@ end
     );
 }
 
+#[test]
+fn unclaimed_model_class_writes_report_spanned_warnings() {
+    use roundhouse::diagnostic::{DiagnosticKind, Severity};
+    use roundhouse::ingest::ingest_model;
+    use roundhouse::schema::Schema;
+
+    for (statement, setter) in [
+        ("self.probe_flag = true", "probe_flag="),
+        ("self.table_name = computed_table", "table_name="),
+        ("self.table_name_prefix = computed_prefix", "table_name_prefix="),
+    ] {
+        let source = format!("class Widget < ApplicationRecord\n  {statement}\nend\n");
+        let model = ingest_model(
+            source.as_bytes(), "app/models/widget.rb", &Schema::default(), &Default::default(),
+        ).expect("ingest").expect("model");
+        let (_, diags) = roundhouse::emit::diagnostics::scope(|| {
+            lower_model_to_library_class(&model, &Schema::default())
+        });
+        assert_eq!(diags.len(), 1, "dropped class-body write must report: {diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.severity, Severity::Warning);
+        assert!(matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
+            if construct.as_str() == setter));
+        assert_eq!(&source[d.span.start as usize..d.span.end as usize], statement);
+        assert!(d.message.contains("Widget"), "{d:?}");
+    }
+}
+
+#[test]
+fn claimed_model_settings_and_method_body_writes_do_not_warn() {
+    use roundhouse::ingest::ingest_model;
+    use roundhouse::schema::Schema;
+
+    let source = br#"class Widget < ApplicationRecord
+  self.table_name = "custom_widgets"
+  self.table_name_prefix = "custom_"
+  self.primary_key = :uuid
+  FLAG = true
+
+  def update_flag
+    self.probe_flag = true
+  end
+end
+"#;
+    let model = ingest_model(source, "app/models/widget.rb", &Schema::default(), &Default::default())
+        .expect("ingest").expect("model");
+    let (lc, diags) = roundhouse::emit::diagnostics::scope(|| {
+        lower_model_to_library_class(&model, &Schema::default())
+    });
+    assert!(diags.is_empty(), "claimed declarations and emitted methods must not warn: {diags:?}");
+    assert_eq!(model.table.0.as_str(), "custom_widgets");
+    assert_eq!(model.primary_key.as_ref().unwrap().as_str(), "uuid");
+    assert!(lc.methods.iter().any(|m| m.name.as_str() == "update_flag"));
+}
+
 // ── to_param ─────────────────────────────────────────────────────────
 //
 // Rails gives every ActiveRecord::Base a `to_param` (`id&.to_s`); the
