@@ -143,6 +143,8 @@ pub struct ClassInfo {
     pub attributes: Row,
     /// Methods callable on the class itself: `Post.all`, `Post.find(id)`.
     pub class_methods: HashMap<Symbol, Ty>,
+    /// Source declares its own class-side `new`, whose result need not be self.
+    pub declares_constructor: bool,
     /// Which of `class_methods` had their return type inferred FROM a
     /// query chain over this model — every `scope`, plus any class
     /// method whose body tail is such a chain.
@@ -1176,6 +1178,7 @@ impl<'a> BodyTyper<'a> {
                     && method.as_str() == "new"
                     && recv.as_ref().map_or(true, |r| matches!(&*r.node, ExprNode::SelfRef))
                     && matches!(recv_ty, Some(Ty::Class { .. }))
+                    && !self.has_declared_constructor(recv_ty.as_ref())
                 {
                     for a in args.iter_mut() {
                         self.analyze_expr(a, ctx);
@@ -3873,6 +3876,26 @@ fn time_parse_ty(recv: &Expr, method: &Symbol, args: &[Expr]) -> Option<Ty> {
             Some(Ty::Union { variants: vec![Ty::Time, Ty::Nil] })
         }
         _ => None,
+    }
+}
+
+impl BodyTyper<'_> {
+    // A declared constructor can return another class. Only the default
+    // Class#new operation promises an instance of the receiving class.
+    fn has_declared_constructor(&self, ty: Option<&Ty>) -> bool {
+        let Some(Ty::Class { id, .. }) = ty else { return false };
+        let mut next = Some(id);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = next {
+            if !seen.insert(id) { break; }
+            let Some(class) = self.classes().get(id) else { break };
+            if class.declares_constructor
+                || matches!(class.class_methods.get(&Symbol::from("new")), Some(Ty::Fn { .. })) {
+                return true;
+            }
+            next = class.parent.as_ref();
+        }
+        false
     }
 }
 
