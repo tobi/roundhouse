@@ -581,9 +581,9 @@ fn report_unclaimed_unknowns(model: &Model) {
             {
                 continue;
             }
-            // Literal table names are consumed by ingest::model; other
-            // class settings remain unsupported unless a recognizer claims them.
-            if name == "table_name="
+            // Literal table settings are consumed by ingest::model's
+            // explicit_class_setting; dynamic values remain unsupported.
+            if matches!(name, "table_name=" | "table_name_prefix=")
                 && args.len() == 1
                 && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })
             {

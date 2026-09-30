@@ -1535,7 +1535,6 @@ fn unclaimed_model_class_writes_report_spanned_warnings() {
     for (statement, setter) in [
         ("self.probe_flag = true", "probe_flag="),
         ("self.table_name_prefix = computed_prefix", "table_name_prefix="),
-        ("self.table_name_prefix = \"custom_\"", "table_name_prefix="),
     ] {
         let source = format!("class Widget < ApplicationRecord\n  {statement}\nend\n");
         let model = ingest_model(
@@ -1570,6 +1569,7 @@ fn claimed_model_settings_and_method_body_writes_do_not_warn() {
 
     let source = br#"class Widget < ApplicationRecord
   self.table_name = "custom_widgets"
+  self.table_name_prefix = "custom_"
   self.primary_key = :uuid
   FLAG = true
 
