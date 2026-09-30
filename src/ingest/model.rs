@@ -31,6 +31,192 @@ use super::{IngestError, IngestResult};
 /// table is `push_subscriptions`.
 pub type TablePrefixes = std::collections::HashMap<String, String>;
 
+/// One entry per declared name, so unsupported values still shadow outer
+/// namespaces. Only unique direct string-array assignments can be folded.
+enum EnumConstant {
+    Namespace,
+    Mapping(Vec<(String, Literal)>),
+    Unsupported,
+}
+
+#[derive(Default)]
+pub(super) struct EnumConstants {
+    values: std::collections::HashMap<String, EnumConstant>,
+    nesting: std::collections::HashMap<(String, usize), Vec<String>>,
+    writes: Vec<(String, Vec<String>)>,
+}
+
+impl EnumConstants {
+    pub(super) fn record(&mut self, source: &[u8], file: &str) {
+        // Prism walks every write (including RHSs and multi-write targets).
+        // Track syntactic parents to fold only direct namespace declarations,
+        // while still invalidating writes beneath conditionals or blocks.
+        struct Collector<'a, 'pr> {
+            constants: &'a mut EnumConstants,
+            file: &'a str,
+            nesting: Vec<String>,
+            parents: Vec<Node<'pr>>,
+        }
+        impl<'pr> ruby_prism::Visit<'pr> for Collector<'_, 'pr> {
+            fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
+                let direct = self.parents.iter().all(|parent| matches!(parent,
+                    Node::ProgramNode { .. } | Node::StatementsNode { .. }
+                    | Node::ClassNode { .. } | Node::ModuleNode { .. }
+                ));
+                self.constants.record_write(&node, &self.nesting, direct);
+                let path = node.as_class_node().map(|c| c.constant_path())
+                    .or_else(|| node.as_module_node().map(|m| m.constant_path()));
+                if let Some(path) = path.and_then(|p| EnumConstants::path(&p)) {
+                    let owner = self.nesting.last().map(String::as_str).unwrap_or("");
+                    let name = EnumConstants::qualify(owner, &path);
+                    self.constants.values.entry(name.clone()).or_insert(EnumConstant::Namespace);
+                    if node.as_class_node().is_some() {
+                        self.constants.nesting.insert(
+                            (self.file.to_string(), node.location().start_offset()),
+                            std::iter::once(name.clone()).chain(self.nesting.iter().rev().cloned()).collect(),
+                        );
+                    }
+                    self.nesting.push(name);
+                }
+                self.parents.push(node);
+            }
+
+            fn visit_branch_node_leave(&mut self) {
+                let node = self.parents.pop().unwrap();
+                let path = node.as_class_node().map(|c| c.constant_path())
+                    .or_else(|| node.as_module_node().map(|m| m.constant_path()));
+                if path.and_then(|p| EnumConstants::path(&p)).is_some() {
+                    self.nesting.pop();
+                }
+            }
+
+            fn visit_leaf_node_enter(&mut self, node: Node<'pr>) {
+                self.constants.record_write(&node, &self.nesting, false);
+            }
+        }
+        let result = super::prism::parse(source, file);
+        if result.errors().next().is_none() {
+            ruby_prism::Visit::visit(&mut Collector {
+                constants: self, file, nesting: Vec::new(), parents: Vec::new(),
+            }, &result.node());
+        }
+    }
+
+    fn record_write(&mut self, node: &Node<'_>, nesting: &[String], direct: bool) {
+        let owner = nesting.last().map(String::as_str).unwrap_or("");
+        if let Some(write) = node.as_constant_write_node() {
+            let name = Self::qualify(owner, constant_id_str(&write.name()));
+            let value = write.value();
+            let literal = match value.as_call_node() {
+                Some(call) if constant_id_str(&call.name()) == "freeze"
+                    && call.arguments().is_none() && call.block().is_none() => call.receiver(),
+                _ => Some(value),
+            };
+            let labels = literal.filter(|_| direct).and_then(|node| {
+                node.as_array_node()?.elements().iter().enumerate()
+                    .map(|(i, el)| string_value(&el)
+                        .map(|label| (label, Literal::Int { value: i as i64 })))
+                    .collect()
+            });
+            // Reassignments/reopens have load-order-dependent semantics.
+            // Refuse them rather than choosing whichever file was read last.
+            self.values.entry(name)
+                .and_modify(|value| *value = EnumConstant::Unsupported)
+                .or_insert(labels.map_or(EnumConstant::Unsupported, EnumConstant::Mapping));
+        } else {
+            // Prism uses distinct nodes for qualified, compound and multi-
+            // writes. None is a direct literal declaration. Resolve qualified
+            // destinations only after every namespace has been collected.
+            let bare = node.as_constant_and_write_node().map(|w| w.name())
+                .or_else(|| node.as_constant_or_write_node().map(|w| w.name()))
+                .or_else(|| node.as_constant_operator_write_node().map(|w| w.name()))
+                .or_else(|| node.as_constant_target_node().map(|w| w.name()));
+            if let Some(name) = bare {
+                self.values.insert(Self::qualify(owner, constant_id_str(&name)), EnumConstant::Unsupported);
+            }
+            let target = node.as_constant_path_write_node().map(|w| w.target().as_node())
+                .or_else(|| node.as_constant_path_and_write_node().map(|w| w.target().as_node()))
+                .or_else(|| node.as_constant_path_or_write_node().map(|w| w.target().as_node()))
+                .or_else(|| node.as_constant_path_operator_write_node().map(|w| w.target().as_node()))
+                .or_else(|| node.as_constant_path_target_node().map(|w| w.as_node()));
+            if let Some(target) = target {
+                if let Some(path) = Self::path(&target) {
+                    self.writes.push((path, nesting.iter().rev().cloned().collect()));
+                }
+            }
+        }
+    }
+
+    pub(super) fn finish(&mut self) {
+        for (path, owners) in std::mem::take(&mut self.writes) {
+            if let Some(name) = self.resolve_name(&path, &owners) {
+                self.values.insert(name, EnumConstant::Unsupported);
+            }
+        }
+    }
+
+    fn qualify(owner: &str, name: &str) -> String {
+        if let Some(rooted) = name.strip_prefix("::") {
+            rooted.to_string()
+        } else if owner.is_empty() {
+            name.to_string()
+        } else {
+            format!("{owner}::{name}")
+        }
+    }
+
+    /// A static path, preserving root qualification and rejecting runtime
+    /// receivers such as `some_call::VALUES`. Also handles multi-write targets.
+    fn path(node: &Node<'_>) -> Option<String> {
+        if let Some(read) = node.as_constant_read_node() {
+            return Some(constant_id_str(&read.name()).to_string());
+        }
+        let (parent, name) = if let Some(path) = node.as_constant_path_node() {
+            (path.parent(), path.name()?)
+        } else {
+            let target = node.as_constant_path_target_node()?;
+            (target.parent(), target.name()?)
+        };
+        let mut path = match parent {
+            Some(parent) => format!("{}::", Self::path(&parent)?),
+            None if node.location().as_slice().starts_with(b"::") => "::".to_string(),
+            None => String::new(),
+        };
+        path.push_str(constant_id_str(&name));
+        Some(path)
+    }
+
+    fn resolve_name(&self, path: &str, owners: &[String]) -> Option<String> {
+        if let Some(rooted) = path.strip_prefix("::") {
+            return Some(rooted.to_string());
+        }
+        let first = path.split("::").next()?;
+        for owner in owners.iter().map(String::as_str).chain(std::iter::once("")) {
+            if self.values.contains_key(&Self::qualify(owner, first)) {
+                return Some(Self::qualify(owner, path));
+            }
+        }
+        None
+    }
+
+    fn resolve(&self, node: &Node<'_>, owners: &[String]) -> Option<Vec<(String, Literal)>> {
+        // Resolve the FIRST segment lexically, then read the rest strictly
+        // through that owner. Never fall back past a shadowing namespace.
+        let name = self.resolve_name(&Self::path(node)?, owners)?;
+        let mut namespace = name.as_str();
+        while let Some((parent, _)) = namespace.rsplit_once("::") {
+            if !matches!(self.values.get(parent), Some(EnumConstant::Namespace)) {
+                return None;
+            }
+            namespace = parent;
+        }
+        match self.values.get(&name)? {
+            EnumConstant::Mapping(mapping) => Some(mapping.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// Scan one file for `module <Ns>; def self.table_name_prefix; "<p>"; end`.
 /// Deliberately narrow: only a module-level `self.` def whose body is a
 /// single string literal. A computed prefix would have to run to be known,
@@ -110,6 +296,16 @@ pub fn ingest_model(
     schema: &Schema,
     prefixes: &TablePrefixes,
 ) -> IngestResult<Option<Model>> {
+    ingest_model_with_enum_constants(source, file, schema, prefixes, &EnumConstants::default())
+}
+
+pub(super) fn ingest_model_with_enum_constants(
+    source: &[u8],
+    file: &str,
+    schema: &Schema,
+    prefixes: &TablePrefixes,
+    enum_constants: &EnumConstants,
+) -> IngestResult<Option<Model>> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -126,6 +322,11 @@ pub fn ingest_model(
         return Ok(None);
     };
 
+    // Syntactic nesting, not every prefix of the class name: `module
+    // Admin::Nested` does not put `Admin` in Ruby's lexical search path.
+    let enum_owners = enum_constants.nesting
+        .get(&(file.to_string(), class.location().start_offset()))
+        .cloned().unwrap_or_default();
     let mut name_path = scope;
     name_path.extend(class_name_path(&class).ok_or_else(|| IngestError::Unsupported {
         file: file.into(),
@@ -175,6 +376,7 @@ pub fn ingest_model(
         // labels spelled with a constant (`NAME => NAME`).
         let stmts = flatten_statements(class_body);
         let class_consts = ClassConsts::collect(&stmts, file);
+        let resolve_constant = |node: &Node<'_>| enum_constants.resolve(node, &enum_owners);
         for stmt in stmts {
             // `self.primary_key = "key"` is recognized into
             // `Model::primary_key` instead of being kept as a body item:
@@ -199,7 +401,7 @@ pub fn ingest_model(
             // scope + predicate + bang writer per label, so it expands
             // in the walk loop for the same reason `class << self` does.
             if let Some(call) = stmt.as_call_node() {
-                match expand_enum_decl(&call, file, &leading, &class_consts) {
+                match expand_enum_decl(&call, file, &leading, &class_consts, &resolve_constant) {
                     Ok(Some(expanded)) => {
                         if let Some(mapping) = expanded.mapping {
                             enums.insert(expanded.column, mapping);
@@ -583,6 +785,7 @@ pub(super) fn expand_enum_decl(
     file: &str,
     leading_comments: &[crate::dialect::Comment],
     class_consts: &ClassConsts,
+    resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
 ) -> IngestResult<Option<EnumExpansion>> {
     use crate::dialect::{MethodDef, MethodReceiver, Scope};
     use crate::effect::EffectSet;
@@ -630,7 +833,7 @@ pub(super) fn expand_enum_decl(
     // body assigned above (`STATUSES = %i[…].freeze`).
     let labels = match mapping_node.as_constant_read_node() {
         Some(cr) => class_consts.mappings.get(constant_id_str(&cr.name())).cloned(),
-        None => enum_label_values(&mapping_node, file, class_consts)?,
+        None => enum_label_values(&mapping_node, file, class_consts, resolve_constant)?,
     }
     .ok_or_else(|| IngestError::Unsupported {
         file: file.into(),
@@ -639,6 +842,7 @@ pub(super) fn expand_enum_decl(
             column
         ),
     })?;
+    let all_labels = labels.clone();
     // A label that is not a Ruby identifier (`32bits`, `64bits`) has no
     // predicate, scope or bang writer Ruby could name: Rails reaches them
     // through `send`, which the emit has no equivalent of. Skipped.
@@ -749,7 +953,41 @@ pub(super) fn expand_enum_decl(
             items.push(method_def(format!("{base}!"), call_with_pair("update!")));
         }
     }
-    let mapping = labels
+    // `Model.statuses`: every label, identifier or not, keyed by String as Rails' mapping is.
+    let mapping_hash = Expr::new(
+        span,
+        ExprNode::Hash {
+            entries: all_labels
+                .iter()
+                .map(|(label, value)| {
+                    (
+                        Expr::new(span, ExprNode::Lit { value: Literal::Str { value: label.clone() } }),
+                        match value { EnumStored::Lit(value) => Expr::new(span, ExprNode::Lit { value: value.clone() }), EnumStored::Expr(expr) => expr.clone() },
+                    )
+                })
+                .collect(),
+            kwargs: false,
+        },
+    );
+    items.push(ModelBodyItem::Method {
+        method: MethodDef {
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from(crate::naming::pluralize_snake(&column)),
+            receiver: MethodReceiver::Class,
+            params: Vec::new(),
+            block_param: None,
+            body: mapping_hash,
+            signature: None,
+            effects: EffectSet::pure(),
+            enclosing_class: None,
+            kind: crate::dialect::AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+        },
+        leading_comments: Vec::new(),
+        leading_blank_line: false,
+    });
+    let mapping = all_labels
         .iter()
         .map(|(l, v)| match v {
             EnumStored::Lit(lit) => Some((l.clone(), lit.clone())),
@@ -839,7 +1077,7 @@ impl ClassConsts {
             // A failure to ingest a value is not this pass's to report:
             // the constant is simply not usable as a mapping, and the
             // enum that names it says so.
-            if let Ok(Some(mapping)) = enum_label_values(&value, file, &out) {
+            if let Ok(Some(mapping)) = enum_label_values(&value, file, &out, &|_| None) {
                 out.mappings.insert(name, mapping);
             }
         }
@@ -929,12 +1167,17 @@ fn enum_label_values(
     node: &Node<'_>,
     file: &str,
     consts: &ClassConsts,
+    resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
 ) -> IngestResult<Option<Vec<(String, EnumStored)>>> {
+    if node.as_constant_path_node().is_some() {
+        return Ok(resolve_constant(node).map(|pairs| pairs.into_iter().map(|(label, value)| (label, EnumStored::Lit(value))).collect()));
+    }
+
     // `%i[…].freeze` / `{ … }.freeze` — the literal is the receiver.
     if let Some(call) = node.as_call_node() {
         if constant_id_str(&call.name()) == "freeze" && call.arguments().is_none() {
             if let Some(recv) = call.receiver() {
-                return enum_label_values(&recv, file, consts);
+                return enum_label_values(&recv, file, consts, resolve_constant);
             }
         }
     }
@@ -969,7 +1212,7 @@ fn enum_label_values(
     // class-body constant naming one.
     let labels = || match recv.as_constant_read_node() {
         Some(cr) => consts.labels.get(constant_id_str(&cr.name())).cloned(),
-        None => label_list(&recv),
+        None => label_list(&recv).or_else(|| resolve_constant(&recv).map(|pairs| pairs.into_iter().map(|(label, _)| label).collect())),
     };
     let identity = |labels: Vec<String>| {
         labels
@@ -996,7 +1239,7 @@ fn enum_label_values(
             let Some(source) = map.receiver() else { return Ok(None) };
             let labels = match source.as_constant_read_node() {
                 Some(cr) => consts.labels.get(constant_id_str(&cr.name())).cloned(),
-                None => label_list(&source),
+                None => label_list(&source).or_else(|| resolve_constant(&source).map(|pairs| pairs.into_iter().map(|(label, _)| label).collect())),
             };
             Ok(labels.map(identity))
         }

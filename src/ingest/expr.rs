@@ -363,7 +363,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // name into its enclosing namespace (`qualify_lexical_consts`
             // made it `BackgroundQueue::StatsD`) and emits as `::StatsD`.
             let mut path = constant_path_segments(&p);
-            if p.parent().is_none() {
+            if super::util::constant_path_is_rooted(&p) {
                 path.insert(0, Symbol::from(""));
             }
             ExprNode::Const { path }
@@ -2243,6 +2243,55 @@ fn ingest_call_block(
                     },
                 )));
             }
+            // `&method(:name)` / `&self.method(:name)` / `&recv.method(:name)`
+            // — a bound-method reference (Procore's dominant non-`&:sym`
+            // block-argument shape — `entities.map(&method(:name))`).
+            // `method` must be a bare, receiverless-or-not call to
+            // Kernel's `method`, taking exactly one Symbol argument;
+            // anything else falls through to the other shapes below.
+            if let Some(call) = expr.as_call_node() {
+                if constant_id_str(&call.name()) == "method" {
+                    if let Some(method_ref) = try_ingest_method_ref(&call, file)? {
+                        return Ok(Some(method_ref));
+                    }
+                }
+                // `&proc { ... }` / `&lambda { ... }` — Kernel's proc-
+                // construction methods. Semantics differ from a plain
+                // block only in `return`/arity strictness (a lambda's
+                // `return` exits the lambda, not the enclosing method);
+                // Roundhouse doesn't yet distinguish that, so desugaring
+                // to the same `Lambda` IR a literal block would produce
+                // is an approximation, not a mis-compile, for the
+                // common no-`return`-inside case.
+                if matches!(constant_id_str(&call.name()), "proc" | "lambda")
+                    && call.receiver().is_none()
+                    && call.arguments().is_none()
+                {
+                    if let Some(blk) = call.block() {
+                        if let Some(b) = blk.as_block_node() {
+                            return Ok(Some(ingest_block_node_as_lambda(&b, file)?));
+                        }
+                    }
+                }
+            }
+            // `&->(params) { body }` — a stabby lambda literal. Same
+            // params/body grammar as a plain block (`BlockParametersNode`
+            // either way), so it desugars identically; only the
+            // standalone-lambda-vs-attached-block distinction is lost,
+            // which is immaterial once it sits in block-argument position.
+            if let Some(lam) = expr.as_lambda_node() {
+                let params = block_param_names(lam.parameters());
+                let rest_param = block_rest_param(lam.parameters());
+                let body = match lam.body() {
+                    Some(body) => ingest_expr(&body, file)?,
+                    None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+                };
+                let block_style = block_style_from_opening(lam.opening_loc().as_slice());
+                return Ok(Some(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
+                )));
+            }
             // Any other `&expr` — `&method(:foo)`, `&@callback`,
             // `&SORT_ORDERS[key]`, `&record.block`, `&->(x) { … }` — is
             // a proc-valued EXPRESSION handed to the callee as its
@@ -2270,16 +2319,51 @@ fn ingest_call_block(
             message: format!("unexpected block-position node: {node:?}"),
         });
     };
-    let params = block_param_names(&b);
-    let rest_param = block_rest_param(&b);
+    Ok(Some(ingest_block_node_as_lambda(&b, file)?))
+}
+
+/// Ingest a literal block's params/body into a `Lambda` `Expr`. Shared
+/// by the ordinary `foo { ... }`/`foo do ... end` path above and the
+/// `&proc { ... }`/`&lambda { ... }` block-argument desugar, which
+/// hands this the same `BlockNode` shape one level deeper (inside the
+/// `proc`/`lambda` call's own block).
+fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> IngestResult<Expr> {
+    let params = block_param_names(b.parameters());
+    let rest_param = block_rest_param(b.parameters());
     let body = match b.body() {
         Some(body) => ingest_expr(&body, file)?,
         None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
     };
     let block_style = block_style_from_opening(b.opening_loc().as_slice());
-    Ok(Some(Expr::new(
+    Ok(Expr::new(
         Span::synthetic(),
         ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
+    ))
+}
+
+/// `method(:name)` / `recv.method(:name)` → `ExprNode::MethodRef`.
+/// Returns `Ok(None)` when `call`'s shape doesn't match (wrong arg
+/// count, non-Symbol argument) so the caller falls through to the
+/// other block-argument forms rather than committing to a wrong
+/// desugar. `call.name()` (`== "method"`) is checked by the caller.
+fn try_ingest_method_ref(
+    call: &ruby_prism::CallNode<'_>,
+    file: &str,
+) -> IngestResult<Option<Expr>> {
+    let Some(args_node) = call.arguments() else { return Ok(None) };
+    let args: Vec<Node<'_>> = args_node.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return Ok(None) };
+    if arg.as_symbol_node().is_none() {
+        return Ok(None);
+    }
+    let name = symbol_value(arg).unwrap_or_default();
+    let recv = match call.receiver() {
+        Some(r) => Some(ingest_expr(&r, file)?),
+        None => None,
+    };
+    Ok(Some(Expr::new(
+        Span::synthetic(),
+        ExprNode::MethodRef { recv, name: Symbol::from(name) },
     )))
 }
 
@@ -2294,8 +2378,8 @@ fn block_style_from_opening(bytes: &[u8]) -> crate::expr::BlockStyle {
     }
 }
 
-fn block_param_names(b: &ruby_prism::BlockNode<'_>) -> Vec<Symbol> {
-    let Some(params_node) = b.parameters() else { return vec![] };
+fn block_param_names(params_node: Option<Node<'_>>) -> Vec<Symbol> {
+    let Some(params_node) = params_node else { return vec![] };
     if params_node.as_it_parameters_node().is_some() {
         return vec![Symbol::from("it")];
     }
@@ -2323,8 +2407,8 @@ fn block_param_names(b: &ruby_prism::BlockNode<'_>) -> Vec<Symbol> {
 /// An ANONYMOUS rest (`|*|`) has no name to bind and no body reference
 /// to serve, so it stays absent. The trailing `**` in that same
 /// campfire block is likewise nameless.
-fn block_rest_param(b: &ruby_prism::BlockNode<'_>) -> Option<Symbol> {
-    let params_node = b.parameters()?;
+fn block_rest_param(params_node: Option<Node<'_>>) -> Option<Symbol> {
+    let params_node = params_node?;
     let bpn = params_node.as_block_parameters_node()?;
     let pn = bpn.parameters()?;
     let rest = pn.rest()?;

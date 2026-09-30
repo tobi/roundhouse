@@ -286,10 +286,8 @@ fn classify(ty: Option<&Ty>, defs: &AppDefinitions) -> Grounding {
                 // errors_for-style guards unconditionally.
                 Container { nilable: false, whitespace: false }
             } else if last == "ParamValue" {
-                // Param access wraps possibly-absent input; blankness
-                // is semantic there and needs a runtime predicate on
-                // the ParamValue type, not a fold.
-                Skip("ParamValue receiver needs a runtime predicate")
+                // Not a fold nor the method: a request value is a string, a hash or an array, and only the runtime predicate answers all three.
+                Runtime
             } else {
                 NeverBlank { nilable: false }
             }
@@ -409,6 +407,11 @@ fn walk(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) {
             walk(body, defs, diags);
         }
         ExprNode::Lambda { body, .. } => walk(body, defs, diags),
+        ExprNode::MethodRef { recv, .. } => {
+            if let Some(r) = recv {
+                walk(r, defs, diags);
+            }
+        }
         ExprNode::If { cond, then_branch, else_branch } => {
             walk(cond, defs, diags);
             walk(then_branch, defs, diags);

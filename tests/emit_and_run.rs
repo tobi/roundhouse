@@ -69,6 +69,86 @@ raise "keyed pattern accepted a missing key" if HashPatternProbe.key_match({ y: 
         .assert_passes();
 }
 
+/// A delegated setter going from broken (`def behavior=\n  x.behavior=\n
+/// end` — a `def` with no parameter and a bare `x.y=` call, two syntax
+/// errors) to working is a claim the emitted program actually runs a
+/// SET through it, not just that `check` stays clean (invariant 6). A
+/// PORO under `app/lib` (the same shape `procore_os/deprecation.rb`
+/// declares: `attr_accessor` on the target, `delegate` for a setter)
+/// forwards to another object — reusing `Article`, since it already
+/// has a `title` column — and a model test sets through the forwarder
+/// and reads the value back off the target.
+#[test]
+fn a_delegated_setter_forwards_through_to_its_target() {
+    emit_and_run::real_blog()
+        .write(
+            "app/lib/deprecation.rb",
+            "class Deprecation\n  attr_accessor :inner\n\n  delegate :title=, to: :inner\nend\n",
+        )
+        .write(
+            "test/models/deprecation_test.rb",
+            "require \"test_helper\"\n\n\
+             class DeprecationTest < ActiveSupport::TestCase\n  \
+               test \"a delegated setter forwards through to its target\" do\n    \
+                 d = Deprecation.new\n    \
+                 d.inner = Article.new\n    \
+                 d.title = \"Reused\"\n    \
+                 assert_equal \"Reused\", d.inner.title\n  \
+               end\n\
+             end\n",
+        )
+        .run_test("test/models/deprecation_test.rb")
+        .assert_passes();
+}
+
+/// A lambda-target `before_action` — `before_action -> { … }, only:
+/// […]`, no Symbol target and no attached block either — going from
+/// "controller class-body macro not recognized" to clean is a claim
+/// the emitted dispatcher actually RUNS the lambda's body and applies
+/// its `only:` scoping (invariant 6), not just that `check` stops
+/// complaining. 233 Procore controllers write exactly this shape for
+/// a policy guard closing over a receiverless call
+/// (`ensure_permission(documents_policy.configure_tab?)`), not a
+/// literal condition inline in the lambda — so this pins that exact
+/// pattern: the lambda calls a private predicate method, and the
+/// existing "should show article" test is updated to expect the
+/// redirect the (permanently failing, for the test) predicate causes.
+///
+/// NOTE ON SCOPE: a lambda body that reads `params[...]` directly
+/// (rather than through a named method) is a NARROWER, separate gap —
+/// `rewrite_params`, the pass that turns `params[:x]` into the
+/// runtime's string-keyed `@params.fetch("x", ...)`, runs over each
+/// action/helper body individually and is never reached by a
+/// `PreambleStmt::Block`'s body, which is assembled straight into
+/// `process_action` after that pass has already run. None of the 233
+/// real sites hit it (`ensure_permission`, `policy.can_view_recycle_bin?`,
+/// … all delegate to a named method, whose OWN body goes through the
+/// normal per-method pipeline and gets `params` rewritten there); a
+/// site that inlined `params[...]` directly in the lambda would not.
+/// Recorded here rather than silently left for the next person to
+/// rediscover.
+#[test]
+fn a_lambda_target_before_action_gates_the_action_it_guards() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "before_action :set_article, only: %i[ show edit update destroy ]",
+            "before_action :set_article, only: %i[ show edit update destroy ]\n  before_action -> { redirect_to root_path unless allowed_to_view? }, only: [:show]",
+        )
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "  private\n",
+            "  private\n\n  def allowed_to_view?\n    false\n  end\n",
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "test \"should show article\" do\n    get article_url(@article)\n    assert_response :success\n    assert_select \"h1\", @article.title\n    assert_select \"h2\", \"Comments\"\n    assert_select \"#comments .p-4\", minimum: 1\n  end",
+            "test \"a lambda-target before_action redirects when its guard fails\" do\n    get article_url(@article)\n    assert_redirected_to root_url\n  end",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
 /// #139 typed `Model.human_attribute_name` as a String, which took the
 /// call from an error to clean, but no runtime defines it, so every
 /// page rendering the form raises `undefined method
@@ -156,6 +236,53 @@ fn computed_enum_map_to_h_runs() {
              end\n",
         )
         .run_test("test/models/article_enum_test.rb")
+        .assert_passes();
+}
+
+/// A module constant in another file is the same string-backed enum
+/// input as an inline array. Exercise the mapping AND generated methods,
+/// including a scope that must exclude the record after a persisted write.
+#[test]
+fn cross_file_literal_enum_mapping_runs() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/article_states.rb",
+            "module ArticleStates\n  VALUES = %w[draft active archived].freeze\nend\n",
+        )
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.string \"state\", default: \"draft\", null: false",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  enum :state, ArticleStates::VALUES.index_with(&:itself)",
+        )
+        .write(
+            "test/models/article_cross_file_enum_test.rb",
+            r#"require "test_helper"
+
+class ArticleCrossFileEnumTest < ActiveSupport::TestCase
+  test "a cross-file literal constant expands to a working string enum" do
+    assert_equal({"draft" => "draft", "active" => "active", "archived" => "archived"}, Article.states)
+    assert_equal "active", Article.states[:active]
+    article = articles(:one)
+    other = articles(:two)
+    assert article.draft?
+    assert_not article.active?
+    article.active!
+    assert_equal "active", article.reload.state
+    assert article.active?
+    assert_not article.draft?
+    assert_equal article.id, Article.active.first.id
+    assert_equal other.id, Article.draft.first.id
+    assert_nil Article.archived.first
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_cross_file_enum_test.rb")
         .assert_passes();
 }
 
@@ -445,5 +572,391 @@ end
 "#,
         )
         .run_test("test/models/article_as_hash_boolean_test.rb")
+        .assert_passes();
+}
+
+/// Not a diagnostic count: each core method's value is held to what CRuby answers.
+#[test]
+fn core_integer_float_string_array_methods_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r##"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+
+  def core_surface_probe
+    n = 17
+    ints = [n.clamp(1, 10), n.div(5), n.modulo(5), n.gcd(4), n.lcm(4), n.pow(2), n.bit_length, n.divmod(5).first]
+    f = 7.5
+    floats = [n.fdiv(2), f.clamp(1.0, 5.0), f.modulo(2.0), f.fdiv(2)]
+    ups = 1.upto(3).map { |i| i * 2 }
+    downs = 3.downto(1).map { |i| i }
+    steps = 0.step(6, 3).map { |i| i }
+    seen = []
+    3.times { |i| seen << i }
+    labels = %w[a b c].map.with_index { |s, i| "#{i}#{s}" }
+    arr = [3, 1, 2]
+    arr.sort_by! { |x| -x }
+    arr.select! { |x| x > 1 }
+    arr.insert(1, 9)
+    s = "hello".dup
+    s.gsub!("l", "L")
+    [ints.join(","), floats.join(","), ups.join(","), downs.join(","), steps.join(","), seen.join(","), labels.join(","), arr.join(","), s, Regexp.escape("a.b")].join("|")
+  end"##,
+        )
+        .write(
+            "test/models/article_core_surface_test.rb",
+            r#"require "test_helper"
+
+class ArticleCoreSurfaceTest < ActiveSupport::TestCase
+  test "core Integer, Float, String and Array methods answer as CRuby does" do
+    assert_equal "10,3,2,1,68,289,5,3|8.5,5.0,1.5,3.75|2,4,6|3,2,1|0,3,6|0,1,2|0a,1b,2c|3,9,2|heLLo|a\\.b",
+                 Article.new.core_surface_probe
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_core_surface_test.rb")
+        .assert_passes();
+}
+
+/// Not only the `check` side: an enum, scope and method a namespaced abstract base declares have to run when another model reaches them.
+#[test]
+fn an_abstract_base_reaches_its_model() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"state\", default: 0, null: false",
+        )
+        .write(
+            "app/models/base_model/content_base.rb",
+            r#"class BaseModel::ContentBase < ApplicationRecord
+  self.abstract_class = true
+  self.table_name = "articles"
+  enum :state, { draft: 0, live: 1 }
+  scope :titled, -> { where.not(title: nil) }
+
+  def shout
+    title.to_s.upcase
+  end
+end
+"#,
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < BaseModel::ContentBase\n  has_many :comments, dependent: :destroy\n  scope :newest_first, -> { order(id: :desc) }",
+        )
+        .edit(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord",
+            r#"class Comment < ApplicationRecord
+  def base_probe
+    a = Article.find(article_id)
+    [article.draft?, a.shout, Article.titled.newest_first.to_a.size, Article.newest_first.titled.first.nil?, Article.draft.count].join("|")
+  end
+"#,
+        )
+        .write(
+            "test/models/comment_abstract_base_test.rb",
+            r#"require "test_helper"
+
+class CommentAbstractBaseTest < ActiveSupport::TestCase
+  test "another model reaches an abstract base's enum, scope and method" do
+    comment = comments(:one)
+    title = comment.article.title.to_s.upcase
+    assert_equal "true|#{title}|#{Article.count}|false|#{Article.count}", comment.base_probe
+  end
+end
+"#,
+        )
+        .run_test("test/models/comment_abstract_base_test.rb")
+        .assert_passes();
+}
+
+/// Not a plain Hash: Rails' mapping reads `statuses[:paid]` as the `"paid"` entry, so the Symbol keys are held to that.
+#[test]
+fn an_enum_plural_mapping_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"state\", default: 0, null: false",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r##"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+  enum :state, { "draft" => 0, "live" => 1, "on hold" => 2 }
+
+  def self.mapping_probe
+    [states.keys.join(","), states[:live], self.states["draft"], states.key?(:live), states.fetch(:draft), states.key(1), states.map { |k, v| "#{k}=#{v}" }.join(";")].join("|")
+  end
+
+  def live_value
+    self.class.states[:live]
+  end"##,
+        )
+        .write(
+            "test/models/article_enum_mapping_test.rb",
+            r#"require "test_helper"
+
+class ArticleEnumMappingTest < ActiveSupport::TestCase
+  test "the plural mapping answers as Rails' indifferent Hash does" do
+    assert_equal "draft,live,on hold|1|0|true|0|live|draft=0;live=1;on hold=2", Article.mapping_probe
+    assert_equal 1, articles(:one).live_value
+    assert_equal 0, Article.states.fetch(:draft)
+    assert_equal 2, Article.states[:"on hold"]
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_enum_mapping_test.rb")
+        .assert_passes();
+}
+
+/// Not left on the receiver: no ruby-family runtime ships Numeric#to_fs or an errors object with `messages`.
+#[test]
+fn delimited_numbers_and_errors_messages_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r##"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+
+  def errors_probe
+    bad = Article.new(title: "", body: "short")
+    bad.valid?
+    good = Article.new(title: "t", body: "long enough body")
+    good.valid?
+    [bad.errors.messages.key?(:title), bad.errors.messages.key?(:created_at), bad.errors.messages.blank?, bad.errors.messages[:body].join(";"),
+     good.errors.messages.blank?, good.errors.messages.present?, 1234567.to_fs(:delimited), 1234.5.to_fs(:delimited), -1234.to_fs(:delimited)].join("|")
+  end"##,
+        )
+        .write(
+            "test/models/article_errors_messages_test.rb",
+            r#"require "test_helper"
+
+class ArticleErrorsMessagesTest < ActiveSupport::TestCase
+  test "errors.messages and to_fs(:delimited) answer as ActiveModel and ActiveSupport do" do
+    assert_equal "true|false|false|is too short (minimum is 10 characters)|true|false|1,234,567|1,234.5|-1,234",
+                 Article.new.errors_probe
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_errors_messages_test.rb")
+        .assert_passes();
+}
+
+/// Not one value per process: a `thread_mattr_accessor` written on one thread reads nil on another, as in Rails.
+#[test]
+fn a_thread_mattr_accessor_runs_per_thread() {
+    emit_and_run::real_blog()
+        .write(
+            "lib/request_context.rb",
+            "module RequestContext\n  thread_mattr_accessor :article\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r#"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+
+  def remember
+    RequestContext.article = self
+  end
+
+  def self.remembered_title
+    RequestContext.article.title
+  end"#,
+        )
+        .run_ruby(
+            r#"article = Article.new(title: "kept", body: "long enough body")
+article.remember
+raise "the writing thread lost it" unless Article.remembered_title == "kept"
+raise "another thread saw it" unless Thread.new { RequestContext.article.nil? }.value
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// Not a String: `params.expect(article: [...])` answers the permitted hash, so a `merge` onto it has to run as one.
+#[test]
+fn an_expected_params_hash_merges() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "    @article = Article.new(article_params)\n",
+            "    @article = Article.new(article_params.merge(title: \"Merged Title\"))\n",
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "    assert_equal \"New Title\", Article.last.title\n",
+            "    assert_equal \"Merged Title\", Article.last.title\n    assert_equal \"A sufficiently long body for validation.\", Article.last.body\n",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
+/// Not read with the Symbol keys the source writes: every hash in a request's params is String-keyed at run time.
+#[test]
+fn nested_request_params_read_as_the_request_carried_them() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "    @article = Article.new(article_params)\n",
+            r##"    @article = Article.new(article_params)
+    if params[:extra].present? && params[:extra].key?(:suffix)
+      @article.title = @article.title.to_s + " " + params[:extra][:suffix].to_s
+    end
+    if params[:tags].present?
+      params[:tags].each { |t| @article.body = @article.body.to_s + " #" + t.to_s }
+    end
+"##,
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "      post articles_url, params: { article: { body: \"A sufficiently long body for validation.\", title: \"New Title\" } }\n",
+            "      post articles_url, params: { article: { body: \"A sufficiently long body for validation.\", title: \"New Title\" }, extra: { suffix: \"Extra\" }, tags: [\"a\", \"b\"] }\n",
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "    assert_equal \"New Title\", Article.last.title\n",
+            "    assert_equal \"New Title Extra\", Article.last.title\n    assert_equal \"A sufficiently long body for validation. #a #b\", Article.last.body\n",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
+/// Not left as `permit`/`to_unsafe_h`/`require`: the emitted request's params are plain hashes, which answer none of them.
+#[test]
+fn nested_request_params_permit_and_require_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "    @article = Article.new(article_params)\n",
+            r##"    @article = Article.new(article_params)
+    if params.to_unsafe_h.key?(:extra)
+      @article.title = @article.title.to_s + " " + params[:extra].permit(:suffix)[:suffix].to_s
+      @article.body = @article.body.to_s + " " + params[:extra].to_unsafe_h.keys.join(",") + " " + params[:extra].require(:suffix).to_s
+    end
+"##,
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "      post articles_url, params: { article: { body: \"A sufficiently long body for validation.\", title: \"New Title\" } }\n",
+            "      post articles_url, params: { article: { body: \"A sufficiently long body for validation.\", title: \"New Title\" }, extra: { suffix: \"Extra\", other: \"x\" } }\n",
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "    assert_equal \"New Title\", Article.last.title\n",
+            "    assert_equal \"New Title Extra\", Article.last.title\n    assert_equal \"A sufficiently long body for validation. suffix,other Extra\", Article.last.body\n",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
+/// Not only a `params[...]` chain: a local assigned from one holds the same request value, and reads through it the same way.
+#[test]
+fn a_local_holding_a_request_params_value_reads_it() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "    @article = Article.new(article_params)\n",
+            r##"    @article = Article.new(article_params)
+    extra = params[:extra]
+    tags = params[:tags]
+    if extra.present? && extra.key?(:suffix)
+      @article.title = @article.title.to_s + " " + extra[:suffix].to_s
+    end
+    if tags.present?
+      tags.each { |t| @article.body = @article.body.to_s + " #" + t.to_s }
+    end
+"##,
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "      post articles_url, params: { article: { body: \"A sufficiently long body for validation.\", title: \"New Title\" } }\n",
+            "      post articles_url, params: { article: { body: \"A sufficiently long body for validation.\", title: \"New Title\" }, extra: { suffix: \"Extra\" }, tags: [\"a\", \"b\"] }\n",
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "    assert_equal \"New Title\", Article.last.title\n",
+            "    assert_equal \"New Title Extra\", Article.last.title\n    assert_equal \"A sufficiently long body for validation. #a #b\", Article.last.body\n",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
+/// Gap F15 took `&method(:name)` from an ingest error (block-argument
+/// forms other than `&:symbol`/`&local_var` were unsupported) to
+/// clean, emitting `&method(:name)` verbatim (`ExprNode::MethodRef`).
+/// Invariant 6: prove the emitted PROGRAM runs it, not just that
+/// `check` stays quiet — a PORO under `app/lib` maps an array through
+/// a bound-method reference to its own helper, and a model test reads
+/// the result back.
+#[test]
+fn method_ref_block_arg_runs() {
+    emit_and_run::real_blog()
+        .write(
+            "app/lib/doubler.rb",
+            "class Doubler\n  \
+               def self.doubled(list)\n    \
+                 list.map(&method(:double))\n  \
+               end\n\n  \
+               def self.double(n)\n    \
+                 n * 2\n  \
+               end\n\
+             end\n",
+        )
+        .write(
+            "test/models/doubler_test.rb",
+            "require \"test_helper\"\n\n\
+             class DoublerTest < ActiveSupport::TestCase\n  \
+               test \"&method(:name) as a block argument runs\" do\n    \
+                 assert_equal [2, 4, 6], Doubler.doubled([1, 2, 3])\n  \
+               end\n\
+             end\n",
+        )
+        .run_test("test/models/doubler_test.rb")
+        .assert_passes();
+}
+
+/// Not only `Model.scope`: a scope the target model inherits from an abstract base answers on an association reaching it too.
+#[test]
+fn an_inherited_scope_answers_on_an_association() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/remark_base.rb",
+            "class RemarkBase < ApplicationRecord\n  self.abstract_class = true\n  scope :by_alice, -> { where(commenter: \"Alice\") }\nend\n",
+        )
+        .edit("app/models/comment.rb", "class Comment < ApplicationRecord", "class Comment < RemarkBase")
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n\n  def alice_count\n    comments.by_alice.count\n  end",
+        )
+        .write(
+            "test/models/article_inherited_scope_test.rb",
+            r#"require "test_helper"
+
+class ArticleInheritedScopeTest < ActiveSupport::TestCase
+  test "an association answers a scope its model inherits" do
+    article = articles(:one)
+    before = article.alice_count
+    article.comments.create!(commenter: "Alice", body: "A comment from Alice.")
+    article.comments.create!(commenter: "Bob", body: "A comment from Bob.")
+    assert_equal before + 1, article.alice_count
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_inherited_scope_test.rb")
         .assert_passes();
 }

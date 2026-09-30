@@ -35,11 +35,10 @@ pub fn go_zero_value(ty_str: &str) -> &'static str {
 
 pub fn go_ty_stub(ty: Option<&Ty>) -> String {
     match ty {
-        Some(Ty::Str) => "string".to_string(),
+        Some(ty) if ty.is_stringish() => "string".to_string(),
         Some(Ty::Int) => "int64".to_string(),
         Some(Ty::Float) => "float64".to_string(),
         Some(Ty::Bool) => "bool".to_string(),
-        Some(Ty::Sym) => "string".to_string(),
         // Native datetime seam: temporal readers return `time.Time`;
         // the zero Time stands in for nil (same empty-as-absent
         // convention as "" for nilable strings).
@@ -167,6 +166,7 @@ pub fn go_ty(ty: &Ty) -> String {
             "interface{}".to_string()
         }
         Ty::Record { .. } => "map[string]interface{}".to_string(),
+        Ty::Union { .. } if ty.is_stringish() => "string".to_string(),
         Ty::Union { variants } => option_shape(variants).unwrap_or_else(|| {
             // Arbitrary union -> empty interface; would be a sum type emit later.
             "interface{}".to_string()

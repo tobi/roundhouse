@@ -23,6 +23,7 @@ use crate::ty::{Row, Ty};
 mod diagnostic;
 mod narrowing;
 mod send;
+pub(crate) use send::PARAM_VALUE;
 pub(crate) use send::string_answers;
 
 /// Recursion context — what `self` is, what locals/ivars are in scope.
@@ -281,6 +282,10 @@ fn resolve_owner_path(
     classes: &HashMap<ClassId, ClassInfo>,
     index: &ConstIndex,
 ) -> Option<ClassId> {
+    if let Some(absolute) = written.strip_prefix("::") {
+        let id = ClassId(Symbol::from(absolute));
+        return classes.contains_key(&id).then_some(id);
+    }
     if let Some(Ty::Class { id, .. }) = &ctx.self_ty {
         let mut scope: Vec<&str> = id.0.as_str().split("::").collect();
         while !scope.is_empty() {
@@ -721,7 +726,8 @@ impl<'a> BodyTyper<'a> {
                     .collect::<Vec<_>>()
                     .join("::");
                 Ty::Class {
-                    id: ClassId(Symbol::from(joined_path)),
+                    // Rooting changes lookup, not the registry's class identity.
+                    id: ClassId(Symbol::from(joined_path.trim_start_matches("::"))),
                     args: vec![],
                 }
             }
@@ -1036,6 +1042,42 @@ impl<'a> BodyTyper<'a> {
                 }
             }
 
+            // `method(:name)` / `recv.method(:name)`. Unlike `&:sym`
+            // (desugared to a real `Lambda` calling through
+            // `block_ctx_for`'s elem-type binding), there is no body
+            // here to give per-block-arg types to — the callee's arity
+            // is a fact about `name`'s *definition*, not this call
+            // site. So type it the same way ordinary dispatch types
+            // any other call: resolve `name` on the receiver (explicit,
+            // or `self` when elided) through the SAME registry lookup
+            // `Send` uses, with no argument evidence (`&[]`) since none
+            // is available yet — the block's yielded values become
+            // ARGUMENTS to `name` at runtime, not evidence about ITS
+            // return type. `block_ret` in the `Send` arm below reads
+            // this node's type as the element type for map/select/etc.
+            //
+            // Known gap: `name`'s OWN param types come from its
+            // inferred/declared signature (call sites elsewhere,
+            // an RBS sig, …) — never from THIS site, since
+            // `collect_send_sites`'s evidence-gathering walk only
+            // reads `Send` nodes, and `&method(:name)` isn't one. A
+            // helper referenced ONLY via `&method(:name)` therefore
+            // types its params `Untyped` rather than the block's
+            // element type — a gradual fallback (not an unresolved
+            // `Var`, so invariant 1's zero-unresolved-type gate still
+            // holds), just a weaker inference than `&:sym` gets. See
+            // `tests/analyze.rs`'s `method_ref_block_arg_types_map_
+            // result_by_referenced_method_return_ty` for the case this
+            // does resolve (the common one — a helper also called
+            // directly somewhere feeds its own param types).
+            ExprNode::MethodRef { recv, name } => {
+                let recv_ty = match recv {
+                    Some(r) => Some(self.analyze_expr(r, ctx)),
+                    None => ctx.self_ty.clone(),
+                };
+                self.dispatch(recv_ty.as_ref(), name, None, &[])
+            }
+
             ExprNode::Apply { fun, args, block } => {
                 self.analyze_expr(fun, ctx);
                 for a in args.iter_mut() { self.analyze_expr(a, ctx); }
@@ -1138,7 +1180,7 @@ impl<'a> BodyTyper<'a> {
                 // `Parameters` is a Hash-shaped bag: what its own class does
                 // not answer (`fetch`, `each`, `map`, `count`, ...) is the
                 // Hash reading, over Symbol -> param value.
-                let recv_ty = match recv_ty {
+                let mut recv_ty = match recv_ty {
                     Some(Ty::Class { id, .. })
                         if id.0.as_str() == "ActionController::Parameters"
                             && method.as_str() != "new"
@@ -1166,16 +1208,25 @@ impl<'a> BodyTyper<'a> {
                     return Ty::SelfInstance;
                 }
                 for a in args.iter_mut() { self.analyze_expr(a, ctx); }
+                if let Some(r) = recv.as_mut() {
+                    if promotes_to_param_value(r, recv_ty.as_ref(), method, args, &ctx.local_bindings) {
+                        r.ty = Some(send::param_value_ty());
+                        recv_ty = r.ty.clone();
+                    }
+                }
                 let block_ret = if let Some(b) = block {
                     let block_ctx = self.block_ctx_for(ctx, recv_ty.as_ref(), method, args, b);
-                    self.analyze_expr(b, &block_ctx);
+                    let method_ref_ty = self.analyze_expr(b, &block_ctx);
                     // The Lambda walker stores the analyzed body's type
                     // on the body expr itself. `map`/`collect`/similar
                     // use that to determine the output element type.
-                    if let ExprNode::Lambda { body, .. } = &*b.node {
-                        body.ty.clone()
-                    } else {
-                        None
+                    // `MethodRef` (`&method(:name)`) has no body to
+                    // read from — its own computed type already IS
+                    // the referenced method's return type.
+                    match &*b.node {
+                        ExprNode::Lambda { body, .. } => body.ty.clone(),
+                        ExprNode::MethodRef { .. } => Some(method_ref_ty),
+                        _ => None,
                     }
                 } else {
                     None
@@ -1293,6 +1344,15 @@ impl<'a> BodyTyper<'a> {
                 }
                 if let Some(t) = recv.as_ref().and_then(|r| time_parse_ty(r, method, args)) {
                     return t;
+                }
+                if let Some(t) = expect_hash_arg_ty(recv_ty.as_ref(), method.as_str(), args) {
+                    return t;
+                }
+                // Not `Integer?`: `nil.to_fs` raises in Rails, so only a number that cannot be nil types.
+                if matches!(recv_ty, Some(Ty::Int) | Some(Ty::Float))
+                    && crate::lower::number_to_fs::is_delimited_to_fs(method, args)
+                {
+                    return Ty::Str;
                 }
                 if let Some(t) = recv_ty
                     .as_ref()
@@ -1430,6 +1490,12 @@ impl<'a> BodyTyper<'a> {
                 // {}`) — the Hash counterpart of `array_seed_idx`.
                 let mut hash_seed_idx: HashMap<(bool, Symbol), usize> = HashMap::new();
                 for i in 0..exprs.len() {
+                    let read_structurally_later = match &*exprs[i].node {
+                        ExprNode::Assign { target: LValue::Var { name, .. }, .. } => {
+                            exprs[i + 1..].iter().any(|later| reads_structurally(later, name))
+                        }
+                        _ => false,
+                    };
                     let e = &mut exprs[i];
                     last = self.analyze_expr(e, &local_ctx);
                     if let ExprNode::Assign { target, value } = &*e.node {
@@ -1444,6 +1510,20 @@ impl<'a> BodyTyper<'a> {
                                     local_ctx.ivar_bindings.insert(name.clone(), ty);
                                 } else {
                                     local_ctx.local_bindings.insert(name.clone(), ty);
+                                }
+                            }
+                            if !is_ivar {
+                                let mark = param_local_mark(&name);
+                                if is_params_rooted(value, &local_ctx.local_bindings)
+                                    || is_ivar_params_rooted(value, &local_ctx.local_bindings)
+                                {
+                                    local_ctx.local_bindings.insert(mark, Ty::Nil);
+                                    // Not per use: a local the rest of the body reads as a hash or an array is one from its assignment on, so its `present?` grounds for that too.
+                                    if read_structurally_later {
+                                        local_ctx.local_bindings.insert(name.clone(), send::param_value_ty());
+                                    }
+                                } else {
+                                    local_ctx.local_bindings.remove(&mark);
                                 }
                             }
                             let empty_seed = matches!(&*value.node,
@@ -3523,6 +3603,136 @@ fn is_time_const(e: &Expr) -> bool {
     matches!(&*e.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Time")
 }
 
+// Not the value type for `expect(article: [:title, …])`: it answers the permitted Parameters; the array forms (`ids: []`, `[[…]]`) stay unmodeled until their lowering runs.
+fn expect_hash_arg_ty(recv_ty: Option<&Ty>, method: &str, args: &[crate::expr::Expr]) -> Option<Ty> {
+    use crate::expr::ExprNode;
+    if method != "expect" {
+        return None;
+    }
+    let (key, value) = match recv_ty {
+        Some(Ty::Hash { key, value }) => (key.clone(), value.clone()),
+        Some(Ty::Class { id, .. }) if id.0.as_str() == "ActionController::Parameters" => {
+            (Box::new(Ty::Str), Box::new(Ty::Untyped))
+        }
+        _ => return None,
+    };
+    let [arg] = args else { return None };
+    let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+    let [(_, permitted)] = entries.as_slice() else { return None };
+    let ExprNode::Array { elements, .. } = &*permitted.node else { return None };
+    if elements.is_empty() || !elements.iter().all(|e| matches!(&*e.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } })) {
+        return None;
+    }
+    Some(Ty::Hash { key: key.clone(), value: value.clone() })
+}
+
+// Not every `params[...]` read: a scalar read stays a String, and only a call no String answers (or a Symbol-keyed index) reads the request's nested shape.
+fn promotes_to_param_value(
+    recv: &crate::expr::Expr,
+    recv_ty: Option<&Ty>,
+    method: &crate::ident::Symbol,
+    args: &[crate::expr::Expr],
+    locals: &HashMap<Symbol, Ty>,
+) -> bool {
+    use crate::expr::{ExprNode, Literal};
+    // Keep the canonical strong-params chain intact for typed factory
+    // discovery. Nested indexed values still use the request-value runtime.
+    if method.as_str() == "permit"
+        && matches!(&*recv.node, ExprNode::Send { recv: Some(root), method, .. }
+            if method.as_str() == "require" && matches!(&*root.node,
+                ExprNode::Send { recv: None, method, args, .. }
+                if method.as_str() == "params" && args.is_empty()))
+    {
+        return false;
+    }
+    let stringish = match recv_ty {
+        Some(Ty::Str) => true,
+        Some(Ty::Union { variants }) => {
+            variants.iter().any(|v| matches!(v, Ty::Str)) && variants.iter().all(|v| matches!(v, Ty::Str | Ty::Nil))
+        }
+        _ => false,
+    };
+    // Not only the source's `params`: after the controller lowering it reads `@params`, a `Hash[String, untyped]`.
+    let untyped = match recv_ty {
+        Some(Ty::Untyped) => true,
+        Some(Ty::Union { variants }) => variants.iter().all(|v| matches!(v, Ty::Untyped | Ty::Nil)),
+        _ => false,
+    };
+    // The fork models the full parameter-value union before this
+    // contextual runtime lowering, including nested Parameters/uploads.
+    let parameter_value = recv_ty.is_some_and(|ty| match ty {
+        Ty::Union { variants } => variants.iter().any(|v|
+            matches!(v, Ty::Class { id, .. } if id.0.as_str() == "ActionController::Parameters")),
+        _ => false,
+    });
+    let lowered = untyped && is_ivar_params_rooted(recv, locals);
+    if !((stringish || parameter_value) && is_params_rooted(recv, locals)) && !lowered {
+        return false;
+    }
+    let keyed = matches!(
+        method.as_str(),
+        "[]" | "[]=" | "fetch" | "dig" | "key?" | "has_key?" | "delete" | "slice" | "except"
+    ) && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { .. } }));
+    let structural = STRUCTURAL.contains(&method.as_str());
+    keyed || (structural && matches!(send::str_method(method), Ty::Var { .. }))
+}
+
+// Not a field on `Ctx`: a name no Ruby local can take rides in `local_bindings`, which every scope already clones.
+fn param_local_mark(name: &Symbol) -> Symbol {
+    Symbol::from(format!("#params-local:{}", name.as_str()).as_str())
+}
+
+fn is_param_local(e: &crate::expr::Expr, locals: &HashMap<Symbol, Ty>) -> bool {
+    matches!(&*e.node, crate::expr::ExprNode::Var { name, .. } if locals.contains_key(&param_local_mark(name)))
+}
+
+fn reads_structurally(e: &crate::expr::Expr, name: &Symbol) -> bool {
+    use crate::expr::{ExprNode, Literal};
+    if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node {
+        if matches!(&*r.node, ExprNode::Var { name: n, .. } if n == name) {
+            let keyed = matches!(method.as_str(), "[]" | "[]=" | "fetch" | "dig" | "key?" | "has_key?")
+                && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { .. } }));
+            if keyed || STRUCTURAL.contains(&method.as_str()) {
+                return true;
+            }
+        }
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || reads_structurally(c, name));
+    found
+}
+
+const STRUCTURAL: &[&str] = &[
+    "each", "each_pair", "each_value", "each_key", "each_with_index", "reverse_each", "map", "collect",
+    "flat_map", "filter_map", "select", "filter", "reject", "any?", "all?", "none?", "keys", "values", "to_a",
+    "first", "last", "compact", "uniq", "sort", "sort_by", "merge", "key?", "has_key?", "dig", "permit",
+    "permit!", "to_unsafe_h", "require",
+];
+
+fn is_params_rooted(e: &crate::expr::Expr, locals: &HashMap<Symbol, Ty>) -> bool {
+    use crate::expr::ExprNode;
+    match &*e.node {
+        ExprNode::Send { recv: None, method, args, .. } => method.as_str() == "params" && args.is_empty(),
+        ExprNode::Send { recv: Some(r), method, .. } => {
+            matches!(method.as_str(), "[]" | "fetch" | "dig" | "require") && is_params_rooted(r, locals)
+        }
+        _ => is_param_local(e, locals),
+    }
+}
+
+fn is_ivar_params_rooted(e: &crate::expr::Expr, locals: &HashMap<Symbol, Ty>) -> bool {
+    use crate::expr::ExprNode;
+    match &*e.node {
+        ExprNode::Send { recv: Some(r), method, .. }
+            if matches!(method.as_str(), "[]" | "fetch" | "dig" | "slice" | "except" | "to_h" | "merge") =>
+        {
+            matches!(&*r.node, ExprNode::Ivar { name } if name.as_str() == "params")
+                || is_ivar_params_rooted(r, locals)
+                || is_param_local(r, locals)
+        }
+        _ => is_param_local(e, locals),
+    }
+}
 /// Top-level constants Ruby and its default/bundled gems define. A bare
 /// reference to one of these means the stdlib constant; see
 /// `expand_bare_const`.

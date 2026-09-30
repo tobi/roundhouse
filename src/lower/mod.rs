@@ -89,6 +89,7 @@ pub mod as_json_super;
 pub mod parameterize;
 pub mod random_formatter;
 pub mod to_json;
+pub mod number_to_fs;
 pub mod presence_in;
 pub mod relation_ivar_materialize;
 pub mod records_to_relation_arg;
@@ -119,6 +120,7 @@ pub mod route_url_options;
 pub mod route_helper_receiver;
 pub mod config_reader;
 pub mod symbolize_keys;
+pub mod enum_mapping_keys;
 pub mod exists_conditions;
 pub mod destroy_by;
 pub mod has_one_builder;
@@ -133,6 +135,8 @@ pub mod session_options;
 pub mod status_literal;
 pub mod to_param_residue;
 pub mod relation_residue;
+pub mod params_residue;
+pub mod params_permit;
 pub mod relation_select_block;
 pub mod send_dispatch;
 pub(crate) mod secure_password;
@@ -179,6 +183,7 @@ pub use as_json_super::apply_as_json_super_grounding;
 pub use parameterize::apply_parameterize_grounding;
 pub use random_formatter::apply_random_formatter_grounding;
 pub use to_json::apply_to_json_lowering;
+pub use number_to_fs::apply_number_to_fs_grounding;
 pub use presence_in::apply_presence_in_grounding;
 pub use relation_ivar_materialize::apply_relation_ivar_materialize;
 pub use defined_ivar_memo::apply_defined_ivar_memo_lowering;
@@ -274,6 +279,10 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // Deletes provably-dead `false && …` tails before any pass can
     // ledger residue for (or rewrite inside) code that cannot run.
     ("bool_fold", &[]),
+    // Reads the analyzer's nested request-params types before any pass rewrites the controller bodies that carry them.
+    ("params_residue", &["bool_fold"]),
+    // After the ledger, which reads the calls this rewrites; before the controller lowering turns `params` into `@params`.
+    ("params_permit", &["params_residue"]),
     ("blank", &[]),
     ("time_current", &[]),
     ("as_json_super", &[]),
@@ -313,6 +322,9 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // Const no pass produces and writes a name no pass consumes, so
     // no ordering constraints.
     ("random_formatter", &[]),
+    // `number.to_fs(:delimited)` → `ActiveSupport.number_delimited(number)`;
+    // a rewrite of a name no other pass produces or consumes.
+    ("number_to_fs", &[]),
     // `hash.to_json` → `JSON.generate(hash)`; a receiver-shape rewrite
     // of a name no other pass produces or consumes.
     ("to_json", &[]),
@@ -463,6 +475,8 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // until that pass has rewritten the `config` chain and stamped its
     // type.
     ("symbolize_keys", &["config_reader"]),
+    // No runs_after: it reads the ingested enum tables and rewrites only the key argument.
+    ("enum_mapping_keys", &[]),
     ("arel_attribute", &[]),
     // `"lit" << x` → `"lit" + x`; local expression rewrite, no ordering
     // constraints.
@@ -698,6 +712,10 @@ pub fn apply_post_analyze_lowerings(
     ran!("spliced_concern_bodies");
     bool_fold::apply_bool_fold_lowering(app);
     ran!("bool_fold");
+    diags.extend(params_residue::apply_params_residue_ledger(app));
+    ran!("params_residue");
+    params_permit::apply_params_permit_lowering(app);
+    ran!("params_permit");
     diags.extend(blank::apply_blank_lowering(app));
     ran!("blank");
     time_current::apply_time_current_lowering(app);
@@ -726,6 +744,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("try_guard");
     random_formatter::apply_random_formatter_grounding(app);
     ran!("random_formatter");
+    number_to_fs::apply_number_to_fs_grounding(app);
+    ran!("number_to_fs");
     to_json::apply_to_json_lowering(app);
     ran!("to_json");
     csv_generate::apply_csv_generate_lowering(app);
@@ -804,6 +824,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("config_reader");
     symbolize_keys::apply_symbolize_keys_grounding(app);
     ran!("symbolize_keys");
+    enum_mapping_keys::apply_enum_mapping_keys(app);
+    ran!("enum_mapping_keys");
     arel_attribute::apply_arel_attribute_lowering(app);
     ran!("arel_attribute");
     literal_append::apply_literal_append_lowering(app);

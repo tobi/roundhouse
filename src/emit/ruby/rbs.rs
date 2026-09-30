@@ -169,13 +169,13 @@ fn render_typed_params(params: &[Param], enclosing: &[&str]) -> String {
     let mut parts = Vec::new();
     for p in params {
         let name = p.name.as_str();
-        // A param only ever seen passed nil has no storage type in spinel
-        // (`method 'uri?' param 'name' has unsupported type nil`); the
-        // sighting says nothing about what else it takes, so leave it open.
-        let ty = match &p.ty {
-            Ty::Nil => "untyped".to_string(),
-            t => ty_to_rbs_in(t, enclosing),
-        };
+        let mut ty = ty_to_rbs_in(&p.ty, enclosing);
+        // A parameter whose every observed call site passed nil is not a
+        // `nil`-typed parameter: seeded as such, spinel refuses the method
+        // ("param has unsupported type nil"). Widen to untyped.
+        if ty == "nil" {
+            ty = "untyped".to_string();
+        }
         let part = match p.kind {
             ParamKind::Required => format!("{ty} {name}"),
             ParamKind::Optional => format!("?{ty} {name}"),

@@ -26,6 +26,7 @@ pub mod library_class;
 pub mod channel_callbacks;
 pub mod current_attributes;
 pub mod delegate;
+pub mod thread_mattr;
 pub mod model;
 pub mod on_load_reopen;
 pub mod pattern;

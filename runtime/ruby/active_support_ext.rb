@@ -743,4 +743,24 @@ module ActiveSupport
     epoch = guess - zone.offset_at(guess - zone.offset_at(guess))
     Time.at(epoch, nsec, :nsec).getlocal(zone.offset_at(epoch))
   end
+
+  # Not `number.to_s` with commas everywhere: only an all-digit integer part takes them, so `1.0e+20` and `Infinity` pass through.
+  def self.number_delimited(number)
+    text = number.to_s
+    dot_at = text.index(".")
+    int = dot_at.nil? ? text : text[0, dot_at].to_s
+    rest = dot_at.nil? ? "" : text[dot_at, text.length - dot_at].to_s
+    sign = int.start_with?("-") ? "-" : ""
+    digits = sign == "" ? int : int[1, int.length - 1].to_s
+    return text unless digits.match?(/\A\d+\z/)
+    out = +""
+    i = 0
+    n = digits.length
+    while i < n
+      out << "," if i > 0 && (n - i) % 3 == 0
+      out << digits[i]
+      i = i + 1
+    end
+    sign + out + rest
+  end
 end

@@ -46,6 +46,7 @@ pub fn rust_ty(ty: &Ty) -> String {
             format!("({})", parts.join(", "))
         }
         Ty::Record { .. } => "serde_json::Value".to_string(),
+        Ty::Union { .. } if ty.is_stringish() => "String".to_string(),
         Ty::Union { variants } => option_shape(variants).unwrap_or_else(|| {
             // Multi-variant non-Nilable unions (lowerer-synthesized
             // `set_index`/`get_index` value/return Tys are a

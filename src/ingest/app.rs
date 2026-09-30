@@ -27,7 +27,7 @@ use super::library_class::{
     ingest_concern_filters, ingest_concern_model_items, ingest_helper_method_names,
     ingest_library_classes, ingest_rails_application_singleton_methods,
 };
-use super::model::ingest_model;
+use super::model::ingest_model_with_enum_constants;
 use super::routes::ingest_routes_with_dsl;
 use super::schema::{ingest_migration, ingest_schema};
 use super::structure_sql::ingest_structure_sql;
@@ -353,8 +353,18 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         .into_iter()
         .filter(|ignored| !lib_dir_is_explicitly_required(vfs, dir, ignored))
         .collect();
+    let ignored_lib_file = |entry: &Path| {
+        entry.strip_prefix(dir.join("lib")).is_ok_and(|rel| {
+            rel.components().next().is_some_and(|c| {
+                lib_ignores.iter().any(|ig| c.as_os_str() == ig.as_str())
+            })
+        })
+    };
 
     let mut table_prefixes = super::model::TablePrefixes::new();
+    // Qualified enum arrays can live in a later file (e.g. a service
+    // module). Collect literal inputs before expanding any model DSL.
+    let mut enum_constants = super::model::EnumConstants::default();
     // The same pre-pass answers a second question: which classes are
     // ActiveRecord bases. A model descending through the app's own
     // abstract base was classified a library class and lost its DSL,
@@ -372,6 +382,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             table_prefixes
                 .extend(super::model::ingest_table_name_prefixes(&source, &entry.display().to_string()));
             model_bases.record(&source, &mut base_pairs);
+            enum_constants.record(&source, &entry.display().to_string());
         }
     }
     // An abstract base can live outside `app/models` too — in a
@@ -391,8 +402,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 &entry.display().to_string(),
             ));
             model_bases.record(&source, &mut base_pairs);
+            if sub != "lib" || !ignored_lib_file(&entry) {
+                enum_constants.record(&source, &entry.display().to_string());
+            }
         }
     }
+    enum_constants.finish();
     model_bases.close_over(&base_pairs);
     for root in &roots {
         let models_dir = dir.join(root).join("models");
@@ -405,7 +420,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             match classify_class_file(&source, &model_bases) {
                 Some(ClassKind::Model) | None => {
                     if let Some(maybe_model) =
-                        unwrap_or_record(ingest_model(&source, &path_str, &app.schema, &table_prefixes))?
+                        unwrap_or_record(ingest_model_with_enum_constants(
+                            &source, &path_str, &app.schema, &table_prefixes, &enum_constants,
+                        ))?
                     {
                         if let Some(model) = maybe_model {
                             // Classes nested in the model's body are
@@ -505,13 +522,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         }
         let Ok(entries) = read_rb_files(vfs, &support_dir) else { continue };
         for entry in entries {
-            if sub == "lib"
-                && entry.strip_prefix(&support_dir).is_ok_and(|rel| {
-                    rel.components().next().is_some_and(|c| {
-                        lib_ignores.iter().any(|ig| c.as_os_str() == ig.as_str())
-                    })
-                })
-            {
+            if sub == "lib" && ignored_lib_file(&entry) {
                 continue;
             }
             let Ok(source) = vfs.read(&entry) else { continue };
@@ -528,7 +539,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             // library class here, unlike under `app/models` where the
             // directory itself is the app saying what the file is.
             if super::library_class::has_active_record_base(&source, &model_bases) {
-                match ingest_model(&source, &path_str, &app.schema, &table_prefixes) {
+                match ingest_model_with_enum_constants(
+                    &source, &path_str, &app.schema, &table_prefixes, &enum_constants,
+                ) {
                     Ok(Some(model)) => {
                         let outer = model.name.clone();
                         app.models.push(model);
@@ -1505,7 +1518,19 @@ end
         }
     }
 
-    app.sources = super::sources::drain();
+    // A SNAPSHOT, not the real `drain`: `keep_initializer_defined` just
+    // below needs to read the app's real source text right now, but
+    // the real files' `FileId`s must stay live (not reset to empty)
+    // through every synthesizing pass below — `current_attributes`,
+    // `delegate`, `channel_callbacks`, `allow_browser`, `rate_limit` —
+    // each of which re-ingests generated Ruby of its own. Draining here
+    // and letting the registry start over at `FileId(1)` mid-pipeline
+    // is exactly how a synthesized parse failure once rendered against
+    // an unrelated real file that happened to share the reused id (see
+    // `ingest::sources`'s module doc). The real `drain` — the one that
+    // actually clears the registry and becomes `app.sources` for
+    // good — runs after all of them, below.
+    app.sources = super::sources::snapshot();
     keep_initializer_defined(&mut app, dir, initializer_defined);
     // Registered source paths are prefixed with this (the fs walk
     // joins `dir`); map-VFS trees pass `""` and register app-relative.
@@ -1518,6 +1543,7 @@ end
     // Before the concern splices: they read `library_classes`, and this
     // turns `Current`'s metaprogrammed surface into real methods first.
     super::current_attributes::lower_current_attributes(&mut app);
+    super::thread_mattr::lower_thread_mattr(&mut app);
     // After it, not before: `Current`'s own `delegate` reads an
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
@@ -1537,6 +1563,14 @@ end
     // the controller that called it directly.
     super::allow_browser::lower_allow_browser(&mut app);
     super::rate_limit::lower_rate_limit(&mut app);
+    // The real drain, now that every pass re-ingesting synthesized
+    // Ruby has run — see the snapshot comment above. `app.sources`
+    // held the pre-synthesis snapshot until now; this replaces it with
+    // the complete, contiguously-numbered table (each synthesized
+    // pass's own `"<label>"` re-ingest never took a slot in it at all —
+    // `sources::register` refuses a label starting with `<` — so this
+    // is the same real-file list the snapshot already had).
+    app.sources = super::sources::drain();
     splice_concerns_into_controllers(&mut app);
     // After the splice: a macro has to resolve against the concern's
     // class-side methods, and its expansion joins the same filter chain.
@@ -2384,7 +2418,61 @@ const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
     // decision recorded in docs/pipeline/runtime.md ("Conditional GET
     // is ALWAYS FRESH"), so the importmap ETag macro has nothing to do.
     "stale_when_importmap_changes",
+    // `prepend Mod` — read the same way `include Mod` is, by
+    // `controller_includes`/`controller_include_groups` (which now
+    // scan for both). Ruby's MRO puts a prepended module AHEAD of the
+    // class rather than behind it — not modeled, so a prepended
+    // module that redefines a name the controller ALSO defines itself
+    // resolves to the controller's own version rather than the
+    // module's, the opposite of Rails. No controller in this
+    // codebase's fixtures collides that way; a real one would need the
+    // priority modeled, not just the membership.
+    "prepend",
+    // `private_constant :NAME` — restricts constant visibility outside
+    // the class. Roundhouse's targets have no notion of a private
+    // constant (nothing outside the app constant-resolves across a
+    // component boundary the same way), so there's nothing to enforce
+    // and nothing lost by not enforcing it.
+    "private_constant",
+    // `helper SomeHelper` / `helper :all` — registers Ruby view
+    // helpers for ERB. Rails core, same family as `helper_method`
+    // (already recognized): it changes what a VIEW can call, not the
+    // controller's own instance surface, so it has nothing to do here.
+    "helper",
+    // `delegate :a, :b, to: :assoc` — consumed by the controller→
+    // library lowering (`lower::controller_to_library::
+    // collect_delegate_calls` + `ingest::delegate::
+    // expand_delegates_in_class`), the same machinery a model's or
+    // concern's `delegate` already goes through. Left here rather
+    // than typed at ingest because the shape it can and can't expand
+    // (zero-arg forwarders only) is exactly `delegate.rs`'s call, and
+    // duplicating that decision would risk the two disagreeing.
+    "delegate",
+    // `attr_reader`/`attr_writer`/`attr_accessor` — consumed by
+    // `lower::controller_to_library::collect_attr_accessor_methods`,
+    // which synthesizes the same accessor `MethodDef`s
+    // `ingest::library_class` already does for models and concerns.
+    "attr_reader",
+    "attr_writer",
+    "attr_accessor",
+    // `alias_method :new, :old` / `undef_method :a, :b` — consumed by
+    // `lower::controller_to_library::apply_alias_methods` /
+    // `apply_undef_methods`, which resolve against the controller's
+    // own already-built methods. A target that resolves to nothing
+    // (an inherited or concern-defined name this same-class-only scan
+    // can't see) earns its OWN specific ledger line from there, not
+    // this generic one — see those functions' doc comments.
+    "alias_method",
+    "undef_method",
 ];
+
+/// `using SomeRefinement` — Ruby's block-scoped monkey-patch
+/// mechanism. Recognized so it earns its own ledger line rather than
+/// the generic "not recognized" one, but never modeled: refinement
+/// semantics (a method visible only within the `using` scope) have no
+/// analogue in any target here, and pretending the refined methods
+/// exist everywhere would be worse than not modeling them at all.
+const REFINEMENT_MACROS: &[&str] = &["using"];
 
 /// A receiverless, blockless call left in a controller's class body
 /// after every consumer has run is a macro roundhouse does not
@@ -2409,8 +2497,43 @@ fn report_unrecognized_controller_macros(app: &App) {
             if CONSUMED_CONTROLLER_MACROS.contains(&method.as_str()) {
                 continue;
             }
+            // `before_action -> { … }, only: […]` (233 controllers) and
+            // its `prepend_before_action`/`after_action` siblings — a
+            // lambda/proc argument target instead of a Symbol, with no
+            // block attached (a block-attached filter already failed
+            // the `block: None` match above and never reaches here).
+            // `super::controller::lambda_filter_target` is the same
+            // recognizer `build_filter_preamble` lowers it with and
+            // `build_sourced_filter_chain` seeds its ivars with, so this
+            // exclusion is exactly as wide as the support actually is.
+            if super::controller::lambda_filter_target(expr).is_some() {
+                continue;
+            }
             let file = super::sources::path_of(expr.span.file)
                 .unwrap_or_else(|| controller.name.0.as_str().to_string());
+            if REFINEMENT_MACROS.contains(&method.as_str()) {
+                // `using SomeRefinement` — name the refinement in the
+                // ledger so the gap is actionable, rather than folding
+                // it into the generic "not recognized" bucket every
+                // other dropped macro shares.
+                let refinement = match &*expr.node {
+                    ExprNode::Send { args, .. } => args.first().and_then(|a| match &*a.node {
+                        ExprNode::Const { path } => {
+                            Some(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"))
+                        }
+                        _ => None,
+                    }),
+                    _ => None,
+                }
+                .unwrap_or_else(|| "?".to_string());
+                survey::record(&IngestError::Unsupported {
+                    file,
+                    message: format!(
+                        "refinement activated: `using {refinement}` (not modeled)"
+                    ),
+                });
+                continue;
+            }
             survey::record(&IngestError::Unsupported {
                 file,
                 message: format!(
@@ -2725,6 +2848,7 @@ fn filter_from_send(
                 if_cond_expr: None,
                 unless_cond_expr: None,
                 block: None,
+                prepend: false,
             })
             .collect(),
     )

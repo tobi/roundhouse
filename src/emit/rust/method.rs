@@ -269,7 +269,7 @@ fn render_return(m: &MethodDef) -> String {
 /// closures + lifetimes pressure surfaces).
 pub(crate) fn rust_param_ty(ty: &Ty) -> String {
     match ty {
-        Ty::Str | Ty::Sym => "&str".to_string(),
+        ty if ty.is_stringish() => "&str".to_string(),
         other => rust_ty(other),
     }
 }

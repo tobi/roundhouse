@@ -81,7 +81,7 @@ end
     );
     assert!(
         out.contains(
-            "def request_host\n    if request.nil?\n      nil\n    else\n      request.host\n    end\n  end"
+            "def request_host\n    __delegate_target = request\n    if __delegate_target.nil?\n      nil\n    else\n      __delegate_target.host\n    end\n  end"
         ),
         "got:\n{out}"
     );
@@ -206,4 +206,64 @@ end
     assert!(out.contains("@set[key]"), "got:\n{out}");
     assert!(out.contains("@set << other"), "got:\n{out}");
     assert!(out.contains("@set == other"), "got:\n{out}");
+}
+
+fn run_emitted(source: &str, exercise: &str) -> String {
+    let emitted = emit(source);
+    let script = format!("{emitted}\n{exercise}");
+    let output = std::process::Command::new("ruby")
+        .args(["-e", &script]).output().expect("ruby");
+    assert!(output.status.success(), "{}\n{script}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).expect("UTF-8")
+}
+
+#[test]
+fn writer_arguments_do_not_shadow_the_target_method() {
+    let source = r#"class Filter
+  attr_reader :value
+  def initialize(value)
+    @value = value
+  end
+  delegate :title=, to: :value
+end
+"#;
+    assert_eq!(run_emitted(source,
+        "target = Struct.new(:title).new; Filter.new(target).title = 'changed'; puts target.title"),
+        "changed\n");
+}
+
+#[test]
+fn nil_operators_return_nil_without_evaluating_the_target_twice() {
+    let source = r#"class Filter
+  attr_reader :calls
+  def initialize(value)
+    @value = value
+    @calls = 0
+  end
+  def key
+    @calls += 1
+    @value
+  end
+  delegate :[], :[]=, :<<, to: :key, allow_nil: true
+end
+"#;
+    assert_eq!(run_emitted(source,
+        "f = Filter.new(nil); p [f[0], f.[]=(0, 'x'), f << 'x', f.calls]"),
+        "[nil, nil, nil, 3]\n");
+    assert_eq!(run_emitted(source,
+        "f = Filter.new(['old']); p [f[0], f.[]=(0, 'new'), f << 'tail', f.calls]"),
+        "[\"old\", \"new\", [\"new\", \"tail\"], 3]\n");
+}
+
+#[test]
+fn nil_comparison_operators_keep_their_boolean_result() {
+    let source = r#"class Filter
+  def initialize
+    @target = nil
+  end
+  delegate :==, :!=, to: :@target, allow_nil: true
+end
+"#;
+    assert_eq!(run_emitted(source, "f = Filter.new; p [f == nil, f != nil, f == 1]"),
+        "[true, false, false]\n");
 }

@@ -229,3 +229,43 @@ fn an_erb_tag_inside_a_scalar_interpolates() {
         .expect("test/fixtures/widgets.rb");
     assert!(loader.contains(r#""w-#{1 + 1} \"q\" \#x""#), "{loader}");
 }
+
+#[test]
+fn anchor_like_text_in_scalars_and_comments_is_unchanged() {
+    let f = fixture(
+        "# &x is a comment\none:\n  name: 'literal &x token'\ntwo:\n  name: \"literal &x token\"\nthree:\n  name: literal *x token\nfour:\n  name: |\n    literal &x token\n    literal *x token\n",
+    ).expect("ingest");
+    assert_eq!(field(&f, "one", "name").as_deref(), Some("literal &x token"));
+    assert_eq!(field(&f, "two", "name").as_deref(), Some("literal &x token"));
+    assert_eq!(field(&f, "three", "name").as_deref(), Some("literal *x token"));
+    assert_eq!(field(&f, "four", "name").as_deref(), Some("literal &x token\nliteral *x token\n"));
+}
+
+#[test]
+fn inline_aliases_refer_to_completed_nodes_on_the_same_line() {
+    let f = fixture("one: {name: &x hello, copy: *x, metadata: {a: &y [1, 2], b: *y}}\n")
+        .expect("ingest");
+    assert_eq!(field(&f, "one", "copy").as_deref(), Some("hello"));
+    assert_eq!(field(&f, "one", "metadata").as_deref(), Some(r#"{"a":[1,2],"b":[1,2]}"#));
+}
+
+#[test]
+fn anchor_names_cannot_collide_with_generated_names() {
+    let f = fixture("a: &x {name: first}\nb: &x {name: second}\nc: &x__rh1 {name: third}\nd: {<<: *x}\n")
+        .expect("ingest");
+    assert_eq!(field(&f, "d", "name").as_deref(), Some("second"));
+}
+
+#[test]
+fn recursive_values_are_reported_instead_of_becoming_empty_objects() {
+    assert!(fixture("one: &x {metadata: *x}\n").is_err());
+}
+
+#[test]
+fn plain_scalar_values_are_not_reparsed_as_documents() {
+    let f = fixture("one: {name: ---, copy: ..., metadata: {number: 12, float: 1.5, flag: true, empty: null, string: 012}}\n")
+        .expect("ingest");
+    assert_eq!(field(&f, "one", "name").as_deref(), Some("---"));
+    assert_eq!(field(&f, "one", "copy").as_deref(), Some("..."));
+    assert_eq!(field(&f, "one", "metadata").as_deref(), Some(r#"{"number":12,"float":1.5,"flag":true,"empty":null,"string":"012"}"#));
+}

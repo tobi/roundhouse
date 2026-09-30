@@ -104,6 +104,18 @@ fn emit_node(n: &ExprNode) -> String {
                 format!("->({}) {{ {} }}", ps.join(", "), emit_expr(body))
             }
         }
+        // `method(:name)` / `recv.method(:name)` — verbatim. Spinel
+        // supports `Method` objects natively (see
+        // `~/working/spinel/README.md`'s block-methods list and
+        // `docs/limitations.md`'s `obj.method(:m)` coverage), so this
+        // is not an approximation: the emitted call is exactly the
+        // Ruby source's own construct. In block-argument position
+        // (`&method(:name)`), `emit_do_block`'s non-Lambda fallback
+        // re-attaches this as `&` — see its doc comment.
+        ExprNode::MethodRef { recv, name } => match recv {
+            Some(r) => format!("{}.method(:{name})", emit_expr(r)),
+            None => format!("method(:{name})"),
+        },
         ExprNode::Apply { fun, args, block } => {
             let args_s: Vec<String> = args.iter().map(emit_arg).collect();
             let base = format!("{}.call({})", emit_expr(fun), args_s.join(", "));
@@ -185,7 +197,10 @@ fn emit_node(n: &ExprNode) -> String {
             // and an op-assign target reads it as a value. Expand to the
             // read-then-write Ruby defines it as.
             if let LValue::Index { recv, index } = target {
-                if matches!(&*recv.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "ENV") {
+                // Only duplicate a literal key. A computed key must retain
+                // Ruby's native single-evaluation compound assignment.
+                if matches!(&*index.node, ExprNode::Lit { value: Literal::Str { .. } })
+                    && matches!(&*recv.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "ENV") {
                     let k = emit_expr(index);
                     let v = emit_expr(value);
                     let infix = op.as_ruby().trim_end_matches('=');
@@ -820,7 +835,12 @@ fn recv_needs_parens(r: &Expr) -> bool {
 /// indifferent-access *effect/color* would be consulted in place of the
 /// raw type: the emit site stays put, only the predicate swaps.
 fn is_string_keyed_hash(recv: &Expr) -> bool {
-    matches!(recv.ty.as_ref(), Some(Ty::Hash { key, .. }) if matches!(key.as_ref(), Ty::Str))
+    match recv.ty.as_ref() {
+        Some(Ty::Hash { key, .. }) => matches!(key.as_ref(), Ty::Str),
+        // Not left to the source's Symbol keys: every hash in a request's params is String-keyed at run time.
+        Some(Ty::Class { id, .. }) => id.0.as_str() == crate::analyze::PARAM_VALUE,
+        _ => false,
+    }
 }
 
 /// Coerce a key indexing a string-keyed hash: a symbol literal `:id` →

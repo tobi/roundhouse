@@ -243,7 +243,7 @@ pub(super) fn library_class_and_struct_base(
         // provide.
         unknown_calls.retain(|call| !is_struct_declaration(call));
         includes.retain(|i| !i.0.as_str().starts_with("T::"));
-        let mut synthesized = synth_sorbet_struct_methods(&owner, &members, comparable);
+        let mut synthesized = synth_sorbet_struct_methods(&owner, &members, comparable, true);
         synthesized.append(&mut methods);
         methods = synthesized;
         None
@@ -704,6 +704,7 @@ fn synth_sorbet_struct_methods(
     owner: &ClassId,
     members: &[SorbetStructMember],
     comparable: bool,
+    with_constructor: bool,
 ) -> Vec<MethodDef> {
     let mut methods = Vec::new();
     for member in members {
@@ -731,6 +732,16 @@ fn synth_sorbet_struct_methods(
             )
         })
         .collect();
+    // A base that STAYS brings its own constructor. `T::Struct` is
+    // lowered away, so the class would have none — but a gem base
+    // whose ancestry reaches `T::Props` is still there at runtime and
+    // `T::Props::Constructor` generates one from the same
+    // declarations. Synthesizing ours on top overrides it, and a gem
+    // that checks its subclasses' signatures rejects the class for
+    // introducing required keywords its base does not declare.
+    if !with_constructor {
+        return methods;
+    }
     methods.push(MethodDef {
         name_span: Span::synthetic(),
         name: Symbol::from("initialize"),
@@ -1584,7 +1595,7 @@ pub(super) fn alias_source(
 
 /// Synthesize `def <name>; @<name>; end` (instance receiver) or
 /// `def self.<name>; @<name>; end` (class receiver).
-pub(super) fn synth_attr_reader(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
+pub(crate) fn synth_attr_reader(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
     let body = Expr::new(
         Span::synthetic(),
         ExprNode::Ivar { name: name.clone() },
@@ -1630,7 +1641,7 @@ fn retarget_module_function_calls(expr: &mut Expr, owner: &ClassId, promoted: &[
 
 /// Synthesize the writer pair for `attr_writer` / `attr_accessor`,
 /// honoring the receiver (Instance vs Class).
-pub(super) fn synth_attr_writer(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
+pub(crate) fn synth_attr_writer(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
     let value_param = Symbol::from("value");
     let rhs = Expr::new(
         Span::synthetic(),
@@ -2330,6 +2341,7 @@ fn block_form_concern_filter(stmt: &ruby_prism::Node<'_>, file: &str) -> Option<
         if_cond_expr: None,
         unless_cond_expr: None,
         block: Some(expr),
+        prepend: false,
     })
 }
 
@@ -2456,7 +2468,7 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // User::Role. Expanded here for the same reason the
                 // model walk expands it: one statement, many items.
                 if let Some(call) = inner.as_call_node() {
-                    match super::model::expand_enum_decl(&call, file, &[], &super::model::ClassConsts::default()) {
+                    match super::model::expand_enum_decl(&call, file, &[], &super::model::ClassConsts::default(), &|_| None) {
                         Ok(Some(expanded)) => {
                             if let Some(mapping) = expanded.mapping {
                                 enums.push((expanded.column, mapping));
@@ -2639,7 +2651,7 @@ pub(super) fn expand_props_bases(app: &mut crate::App) {
             .iter()
             .any(|i| i.0.as_str() == "T::Struct::ActsAsComparable");
         lc.unknown_calls.retain(|call| !is_struct_declaration(call));
-        let mut synthesized = synth_sorbet_struct_methods(&lc.name, &members, comparable);
+        let mut synthesized = synth_sorbet_struct_methods(&lc.name, &members, comparable, false);
         synthesized.append(&mut lc.methods);
         lc.methods = synthesized;
     }

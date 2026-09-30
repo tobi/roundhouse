@@ -29,6 +29,7 @@ serde_yaml_ng = "0.10"
 indexmap = { version = "2", features = ["serde"] }
 ruby-prism = "1.9.0"
 ruby-rbs = "0.3"
+yaml-rust2 = { version = "0.13.0", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 

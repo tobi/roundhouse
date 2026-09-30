@@ -174,3 +174,25 @@ end
         "`serialize` dispatches against the enum; diagnostics = {diagnostics:?}"
     );
 }
+
+#[test]
+fn an_absolute_class_uses_the_same_registry_identity_as_a_bare_class() {
+    let app = app_with("@a = ::Time.now");
+    assert_eq!(
+        ty_at(&app, 2, 16),
+        Some(Ty::Class { id: ClassId(Symbol::from("Time")), args: vec![] }),
+    );
+}
+
+#[test]
+fn an_absolute_nested_constant_keeps_its_root_and_resolves_its_owner() {
+    let app = app_with("@a = ::Core::StageEnum::Drafting");
+    assert_eq!(
+        ty_at(&app, 2, 9),
+        Some(Ty::Class { id: ClassId(Symbol::from("Core::StageEnum")), args: vec![] }),
+    );
+    let parsed = ruby_prism::parse(b"::Core::StageEnum::Drafting");
+    let expr = roundhouse::ingest::ingest_expr(&parsed.node().as_program_node().unwrap().statements().as_node(), "root.rb")
+        .expect("ingest");
+    assert_eq!(roundhouse::emit::ruby::emit_expr(&expr), "::Core::StageEnum::Drafting");
+}

@@ -256,6 +256,17 @@ impl<'a> BodyTyper<'a> {
         method: &Symbol,
     ) -> Option<Vec<Ty>> {
         let recv_ty = recv_ty?;
+        if matches!(recv_ty, Ty::Class { id, .. } if id.0.as_str() == PARAM_VALUE) {
+            return match method.as_str() {
+                "each_with_index" | "each_with_object" => Some(vec![param_value_ty(), Ty::Int]),
+                "each" | "each_pair" | "map" | "collect" | "flat_map" | "filter_map" | "select"
+                | "filter" | "reject" | "any?" | "all?" | "none?" | "count" | "find" | "detect"
+                | "each_value" | "each_key" | "sort_by" | "group_by" | "partition" | "sum" => {
+                    Some(vec![param_value_ty(), param_value_ty()])
+                }
+                _ => None,
+            };
+        }
         // `then` / `yield_self` / `tap` yield the RECEIVER itself, on
         // every type — Kernel methods, not container ones, so they are
         // answered before the shape match rather than repeated inside
@@ -280,7 +291,12 @@ impl<'a> BodyTyper<'a> {
                 | "index" | "find_index"
                 | "any?" | "all?" | "none?" | "one?"
                 | "to_h" => Some(vec![(**elem).clone()]),
-                "each_with_index" => Some(vec![(**elem).clone(), Ty::Int]),
+                "each_with_index" | "with_index" => Some(vec![(**elem).clone(), Ty::Int]),
+                "sort_by!" | "select!" | "reject!" | "keep_if" | "delete_if" => Some(vec![(**elem).clone()]),
+                _ => None,
+            },
+            Ty::Int => match method.as_str() {
+                "times" | "upto" | "downto" | "step" => Some(vec![Ty::Int]),
                 _ => None,
             },
             // A relation iterates its element model — same block
@@ -544,6 +560,23 @@ impl<'a> BodyTyper<'a> {
         }
     }
 
+    fn ancestor_defining_class_method(&self, of: &ClassId, method: &Symbol) -> Option<ClassId> {
+        let own = self.classes().get(of)?;
+        if own.class_methods.contains_key(method) {
+            return None;
+        }
+        let mut current = own.parent.clone();
+        for _ in 0..32 {
+            let id = current?;
+            let cls = self.classes().get(&id)?;
+            if cls.table.is_some() && cls.class_methods.contains_key(method) {
+                return Some(id);
+            }
+            current = cls.parent.clone();
+        }
+        None
+    }
+
     pub(super) fn dispatch(
         &self,
         recv_ty: Option<&Ty>,
@@ -602,6 +635,9 @@ impl<'a> BodyTyper<'a> {
         if let Some(Ty::Class { id, args: of }) = recv_ty {
             if id.0.as_str() == "Class" && of.len() == 1 {
                 return self.dispatch(Some(&of[0]), method, block_ret, args);
+            }
+            if id.0.as_str() == PARAM_VALUE {
+                return param_value_method(method, block_ret).unwrap_or_else(|| str_method(method));
             }
         }
         // `obj.class` is receiver-aware: our type system flattens the
@@ -991,8 +1027,11 @@ impl<'a> BodyTyper<'a> {
                     // before `unwrap_fn_ret` so a signature's params
                     // are substituted too, and the arity and
                     // kwargs-flip checks see a concrete type.
+                    // Not the ancestor's own class either: an inherited scope or finder answers the receiver's (`User.active` is a `Relation[User]`).
                     let subst = |ty: &Ty| {
-                        ty.subst_self(&Ty::Class { id: id.clone(), args: Vec::new() })
+                        let ty = ty.subst_self(&Ty::Class { id: id.clone(), args: Vec::new() });
+                        let receiver_is_model = self.classes().get(id).is_some_and(|c| c.table.is_some());
+                        if cid != id && cls.table.is_some() && receiver_is_model { ty.rebind_class(cid, id) } else { ty }
                     };
                     // The class object and its instances share this one type, so a
                     // name both sides define is ambiguous. The catalog gives every model
@@ -1209,6 +1248,7 @@ impl<'a> BodyTyper<'a> {
                         "match?" | "===" => return Ty::Bool,
                         "source" | "to_s" | "inspect" => return Ty::Str,
                         "options" | "casefold?" => return Ty::Int,
+                        "escape" | "quote" => return Ty::Str,
                         _ => {}
                     }
                 }
@@ -1245,6 +1285,11 @@ impl<'a> BodyTyper<'a> {
                 if let Ty::Class { id, .. } = elem {
                     if let Some(t) = self.column_projection(id, method, args) {
                         return t;
+                    }
+                    // Not only the element model's own scopes: one inherited from an abstract base answers on an association of the subclass too.
+                    if let Some(anc) = self.ancestor_defining_class_method(id, method) {
+                        let base = Ty::Array { elem: Box::new(Ty::Class { id: anc.clone(), args: vec![] }) };
+                        return self.dispatch(Some(&base), method, block_ret, args).rebind_class(&anc, id);
                     }
                     if let Some(cls) = self.classes().get(id) {
                         match cls.class_methods.get(method) {
@@ -1390,6 +1435,11 @@ impl<'a> BodyTyper<'a> {
                     if let Some(kind) = entry.return_kind {
                         return crate::analyze::instantiate_return_kind(kind, of);
                     }
+                }
+                // Not only the element model's own scopes: one inherited from an abstract base answers on the subclass's relation.
+                if let Some(anc) = self.ancestor_defining_class_method(of, method) {
+                    let t = self.dispatch(Some(&Ty::Relation { of: anc.clone() }), method, block_ret, args);
+                    return t.rebind_class(&anc, of);
                 }
                 if let Some(cls) = self.classes().get(of) {
                     match cls.class_methods.get(method) {
@@ -2073,7 +2123,9 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
         },
         // In-place / index-yielding transforms return the array itself.
         "each_with_index" | "keep_if" | "delete_if" | "select!" | "reject!" | "sort!"
-        | "uniq!" | "compact!" | "reverse!" => Ty::Array { elem: Box::new(elem.clone()) },
+        | "uniq!" | "compact!" | "reverse!" | "sort_by!" | "insert" => Ty::Array { elem: Box::new(elem.clone()) },
+        // Not the receiver's elements: `map.with_index { }` builds from the block, the only enumerator its callers chain.
+        "with_index" => Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or_else(|| elem.clone())) },
         // `group_by`/`index_by` (ActiveSupport) force evaluation to a Hash.
         "group_by" => Ty::Hash {
             key: Box::new(Ty::Untyped),
@@ -2208,6 +2260,7 @@ pub(super) fn hash_method(
         "values" => Ty::Array { elem: Box::new(value.clone()) },
         "empty?" | "any?" | "none?" | "all?" | "one?" | "key?" | "has_key?" | "include?" => Ty::Bool,
         "keys" => Ty::Array { elem: Box::new(key.clone()) },
+        "key" => Ty::Union { variants: vec![key.clone(), Ty::Nil] },
         // `Hash#fetch(k, default)` answers `default` when the key is
         // missing, so the result is `value | typeof(default)` — a Nil
         // arm appears only when the default IS nil. Reading the
@@ -2288,7 +2341,7 @@ pub(super) fn hash_method(
         // ActiveSupport's `compact_blank` — `reject(&:blank?)`, so the
         // same shape as the `compact` beside it.
         | "compact_blank" | "compact_blank!"
-        | "to_unsafe_h" => Ty::Hash {
+        | "to_unsafe_h" | "permit!" => Ty::Hash {
             key: Box::new(key.clone()),
             value: Box::new(value.clone()),
         },
@@ -2355,10 +2408,9 @@ pub(super) fn hash_method(
             }
         }
         // The first key that maps to a value, or nil.
-        "key" => Ty::Union { variants: vec![key.clone(), Ty::Nil] },
         "filter_map" => Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or_else(unknown)) },
         // Strong-parameters `permit!` marks everything permitted.
-        "permit!" | "to_hash" => Ty::Hash {
+        "to_hash" => Ty::Hash {
             key: Box::new(key.clone()),
             value: Box::new(value.clone()),
         },
@@ -2424,6 +2476,9 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // Case-insensitive comparison: `casecmp` returns -1/0/1 (Int),
         // `casecmp?` returns Bool.
         "casecmp" => Ty::Int,
+        // Bang forms answer nil when nothing changed, so the value is `String?`.
+        "gsub!" | "sub!" | "strip!" | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "squeeze!"
+        | "downcase!" | "upcase!" | "capitalize!" | "slice!" | "tr!" | "delete!" | "squish!" => Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
         "casecmp?" => Ty::Bool,
         // `ord` → the codepoint of the first character.
         "ord" => Ty::Int,
@@ -2449,10 +2504,6 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         "insert" | "to_str" | "encode" | "first" | "last" => Ty::Str,
         // The in-place forms answer the receiver, or nil when nothing
         // changed.
-        "gsub!" | "sub!" | "strip!" | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "squeeze!"
-        | "downcase!" | "upcase!" | "capitalize!" | "slice!" | "tr!" | "delete!" | "squish!" => {
-            Ty::Union { variants: vec![Ty::Str, Ty::Nil] }
-        }
         // `String#unpack` decodes into an Array of whatever the
         // template names; `unpack1` its first element.
         "unpack" => Ty::Array { elem: Box::new(Ty::Untyped) },
@@ -2562,7 +2613,11 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
         "==" | "!=" | "<" | ">" | "<=" | ">=" | "<=>" | "eql?" | "equal?" => Ty::Bool,
         // Bit access (`flags[0]`) returns the bit as Int; `times` returns
         // the receiver (Int) — `n.times { }` evaluates to `n`.
-        "[]" | "times" => Ty::Int,
+        "[]" | "times" | "clamp" | "div" | "modulo" | "gcd" | "lcm" | "pow" | "bit_length" => Ty::Int,
+        "fdiv" => Ty::Float,
+        "divmod" => Ty::Array { elem: Box::new(Ty::Int) },
+        // Not the block form's receiver: the corpus chains these (`1.upto(5).map`), so the enumerator's values are what flows.
+        "upto" | "downto" | "step" => Ty::Array { elem: Box::new(Ty::Int) },
         // ActiveSupport byte-size helpers — like the duration helpers,
         // they yield a Numeric-ish value we don't model structurally.
         "bytes" | "kilobytes" | "megabytes" | "gigabytes" | "terabytes"
@@ -2572,18 +2627,16 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
         // `Integer` give it and which the table above left out.
         // `clamp` answers one of its bounds or the receiver: Integer for
         // Integer bounds, the common shape (`page.clamp(1, 100)`).
-        "clamp" | "to_int" | "size" | "bit_length" | "gcd" | "lcm" | "div"
-        | "modulo" | "remainder" | "ceildiv" | "pow" | "ord" | "magnitude" => Ty::Int,
+        "to_int" | "size" | "remainder" | "ceildiv" | "ord" | "magnitude" => Ty::Int,
         "between?" | "integer?" | "finite?" | "infinite?" | "nan?" | "allbits?"
         | "anybits?" | "nobits?" => Ty::Bool,
-        "fdiv" => Ty::Float,
-        "divmod" | "digits" => Ty::Array { elem: Box::new(Ty::Int) },
+        "digits" => Ty::Array { elem: Box::new(Ty::Int) },
         "nonzero?" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
         // `upto` / `downto` / `step` return the receiver with a block and
         // an Enumerator without one; the two are not told apart here.
         // `to_d` / `to_r` / `to_c` build BigDecimal / Rational / Complex,
         // which the registry does not model.
-        "upto" | "downto" | "step" | "to_d" | "to_r" | "to_c" | "rationalize" | "coerce" => Ty::Untyped,
+        "to_d" | "to_r" | "to_c" | "rationalize" | "coerce" => Ty::Untyped,
         // ActiveSupport Numeric duration helpers — `1.day`, `2.hours`,
         // `30.minutes`, etc. Each returns an ActiveSupport::Duration
         // instance; we don't model that structurally so propagate
@@ -2608,7 +2661,9 @@ pub(super) fn float_method(method: &Symbol) -> Ty {
         // arg it returns Float, but we don't see args here — Int is the
         // safer default for the bare call.
         "to_i" | "to_int" | "round" | "ceil" | "floor" | "truncate" => Ty::Int,
-        "to_f" | "abs" => Ty::Float,
+        "to_f" | "abs" | "fdiv" | "clamp" | "modulo" => Ty::Float,
+        "div" => Ty::Int,
+        "divmod" => Ty::Array { elem: Box::new(Ty::Float) },
         // Unary minus/plus: `-x` desugars to `x.-@`. Float stays Float.
         "-@" | "+@" => Ty::Float,
         "zero?" | "positive?" | "negative?" | "nan?" | "finite?" | "infinite?" => Ty::Bool,
@@ -2793,4 +2848,40 @@ pub(super) fn params_as_hash() -> Ty {
         key: Box::new(Ty::Sym),
         value: Box::new(crate::analyze::registry::controllers::param_value_ty(false)),
     }
+}
+
+/// The request-params value a nested read answers: a scalar, a hash or an array, whichever the request carried.
+pub(crate) const PARAM_VALUE: &str = "Roundhouse::ParamValue";
+
+pub(crate) fn param_value_ty() -> Ty {
+    Ty::Class { id: crate::ident::ClassId(Symbol::from(PARAM_VALUE)), args: vec![] }
+}
+
+// Not `permit`/`to_unsafe_h`/`require`: ActionController::Parameters methods no ruby-family runtime Hash answers.
+fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
+    let pv = param_value_ty;
+    let maybe_pv = || Ty::Union { variants: vec![pv(), Ty::Nil] };
+    Some(match method.as_str() {
+        "[]" | "dig" | "first" | "last" | "presence" => maybe_pv(),
+        "fetch" | "[]=" => pv(),
+        "key?" | "has_key?" | "include?" | "member?" | "present?" | "blank?" | "empty?" | "any?"
+        | "all?" | "none?" | "nil?" | "is_a?" | "kind_of?" | "instance_of?" | "respond_to?" | "=="
+        | "!=" | "===" | "equal?" | "eql?" => Ty::Bool,
+        "each" | "each_pair" | "each_value" | "each_key" | "each_with_index" | "reverse_each"
+        | "select" | "filter" | "reject" | "compact" | "uniq" | "sort" | "sort_by" | "reverse"
+        | "merge" | "except" | "slice" | "permit" | "permit!" | "to_unsafe_h" | "to_h" | "require" => pv(),
+        "map" | "collect" | "flat_map" | "filter_map" => {
+            Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or(Ty::Untyped)) }
+        }
+        "keys" => Ty::Array { elem: Box::new(Ty::Str) },
+        "values" | "to_a" => Ty::Array { elem: Box::new(pv()) },
+        "size" | "length" | "count" | "to_i" => Ty::Int,
+        "to_f" => Ty::Float,
+        "to_s" | "join" => Ty::Str,
+        "to_sym" => Ty::Sym,
+        "tap" | "dup" | "freeze" => pv(),
+        "!" => Ty::Bool,
+        "inspect" | "to_json" => Ty::Str,
+        _ => return None,
+    })
 }

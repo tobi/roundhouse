@@ -337,6 +337,7 @@ fn run_transpile(
         &mut analyze_diags,
         target,
     );
+    roundhouse::lower::params_residue::elevate_nested_params_for_target(&mut analyze_diags, target);
 
     // A diagnostic whose root cause is a recorded ingest gap is OUR
     // coverage problem, not the app's: the nil placeholder survey mode

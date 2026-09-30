@@ -599,6 +599,11 @@ fn action_aggregate_equals_subtree_fold() {
                 fold(body, acc);
             }
             ExprNode::Lambda { body, .. } => fold(body, acc),
+            ExprNode::MethodRef { recv, .. } => {
+                if let Some(r) = recv {
+                    fold(r, acc);
+                }
+            }
             ExprNode::Apply { fun, args, block } => {
                 fold(fun, acc);
                 for a in args {
@@ -949,6 +954,11 @@ fn collect_ivar_reads(expr: &roundhouse::expr::Expr, out: &mut Vec<(Symbol, Opti
         ExprNode::Lambda { body, .. } => {
             collect_ivar_reads(body, out);
         }
+        ExprNode::MethodRef { recv, .. } => {
+            if let Some(r) = recv {
+                collect_ivar_reads(r, out);
+            }
+        }
         ExprNode::Apply { fun, args, block } => {
             collect_ivar_reads(fun, out);
             for a in args {
@@ -1128,6 +1138,11 @@ fn collect_bare_name_sends(
         }
         ExprNode::Lambda { body, .. } => {
             collect_bare_name_sends(body, out);
+        }
+        ExprNode::MethodRef { recv, .. } => {
+            if let Some(r) = recv {
+                collect_bare_name_sends(r, out);
+            }
         }
         ExprNode::Apply { fun, args, block } => {
             collect_bare_name_sends(fun, out);
@@ -1797,6 +1812,68 @@ end
 }
 
 #[test]
+fn a_model_inherits_from_its_abstract_base() {
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
+        ),
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+    t.integer "role"
+  end
+  create_table "trades", force: :cascade do |t|
+    t.integer "user_id"
+  end
+end
+"#,
+        ),
+        (
+            "app/models/base_model/user_base.rb",
+            r#"class BaseModel::UserBase < ApplicationRecord
+  self.abstract_class = true
+  self.table_name = "users"
+  enum :role, { admin: 1, staff: 3 }
+  scope :named, -> { where.not(name: nil) }
+
+  def greeting
+    "hi"
+  end
+end
+"#,
+        ),
+        (
+            "app/models/user.rb",
+            r#"class User < BaseModel::UserBase
+  has_many :trades
+  scope :recent, -> { order(id: :desc) }
+end
+"#,
+        ),
+        (
+            "app/models/trade.rb",
+            r#"class Trade < ApplicationRecord
+  belongs_to :user
+
+  def owner
+    u = User.find(1)
+    [user.staff?, u.greeting.upcase, User.named.recent.to_a, User.recent.named.first, User.first&.trades, User.staff.count]
+  end
+end
+"#,
+        ),
+    ]);
+
+    let failures = send_dispatch_failures(&app);
+    for m in ["staff?", "greeting", "upcase", "named", "recent", "to_a", "first", "trades", "staff", "count"] {
+        assert!(!failures.iter().any(|f| f == m), "`{m}` should resolve through the abstract base; failures = {failures:?}");
+    }
+}
+
+#[test]
 fn stdlib_singletons_and_set_resolve() {
     // The hardcoded Ruby stdlib catalog (SecureRandom, CGI, Digest::*,
     // Math, File, Dir, Set) resolves the common call surface, and unary
@@ -2336,6 +2413,43 @@ end
 }
 
 #[test]
+fn an_enum_answers_its_plural_mapping() {
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define(version: 1) do
+  create_table "trades", force: :cascade do |t|
+    t.integer "status"
+    t.integer "delivery_category"
+  end
+end
+"#,
+        ),
+        (
+            "app/models/trade.rb",
+            r#"class Trade < ApplicationRecord
+  enum :status, { pending: 0, "on hold" => 2 }
+  enum :delivery_category, %i[standard express]
+
+  def self.labels
+    [statuses.keys.first.upcase, Trade.statuses[:pending] + 1, Trade.delivery_categories.key(1)&.size, Trade.statuses.fetch("on hold")]
+  end
+end
+"#,
+        ),
+    ]);
+
+    let failures = send_dispatch_failures(&app);
+    for m in ["statuses", "delivery_categories", "keys", "upcase", "+", "key", "fetch"] {
+        assert!(!failures.iter().any(|f| f == m), "`{m}` should resolve; failures = {failures:?}");
+    }
+}
+
+#[test]
 fn time_operands_compare_without_incompatible_binop() {
     let app = app_from_files(&[
         (
@@ -2467,6 +2581,51 @@ end
 }
 
 #[test]
+fn delimited_to_fs_and_errors_messages_type() {
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        (
+            "app/models/thing.rb",
+            r#"class Thing < ApplicationRecord
+  def labels(ratio)
+    [1234.to_fs(:delimited).upcase, (ratio * 1.5).to_fs(:delimited).strip]
+  end
+
+  def problems
+    [errors.messages.key?(:name), errors.messages[:name].join(",") + 1]
+  end
+
+  def total
+    1234.to_fs(:delimited) + 1
+  end
+end
+"#,
+        ),
+    ]);
+
+    let failures = send_dispatch_failures(&app);
+    for m in ["upcase", "strip", "join", "key?"] {
+        assert!(
+            !failures.iter().any(|f| f == m),
+            "`{m}` should resolve; failures = {failures:?}"
+        );
+    }
+    let binops: Vec<String> = diagnose(&app)
+        .into_iter()
+        .filter(|d| matches!(d.kind, DiagnosticKind::IncompatibleBinop { .. }))
+        .map(|d| d.message)
+        .collect();
+    assert_eq!(
+        binops.len(),
+        2,
+        "a messages entry and a delimited number both type as String; binops = {binops:?}"
+    );
+}
+
+#[test]
 fn activesupport_calendar_methods_type_on_a_time() {
     let app = app_from_files(&[
         (
@@ -2522,6 +2681,38 @@ end
         assert!(!failures.iter().any(|f| f == m), "`{m}` should resolve; failures = {failures:?}");
     }
     assert!(failures.iter().any(|f| f == "frobnicate"), "the block's own gap still reports; failures = {failures:?}");
+}
+
+#[test]
+fn core_numeric_string_and_array_surface_types() {
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        (
+            "app/models/thing.rb",
+            r#"class Thing < ApplicationRecord
+  def compute(name)
+    doubled = 1.upto(3).map { |i| i * 2 }
+    indexed = [10, 20].map.with_index { |d, i| d + i }
+    ratio = 7.fdiv(2).round(1)
+    capped = 300.clamp(0, 255) + 1
+    list = [1, 2]
+    list.insert(1, 9).sort_by! { |x| -x }
+    quotient, rest = 17.divmod(5)
+    name.gsub!("-", "_")
+    [doubled.sum, indexed.first, ratio, capped, list.size, quotient + rest, Regexp.escape(name).size, 2.5.fdiv(2).floor]
+  end
+end
+"#,
+        ),
+    ]);
+
+    let failures = send_dispatch_failures(&app);
+    for m in ["upto", "with_index", "fdiv", "clamp", "insert", "sort_by!", "divmod", "gsub!", "escape", "sum", "round", "floor"] {
+        assert!(!failures.iter().any(|f| f == m), "`{m}` should resolve; failures = {failures:?}");
+    }
 }
 
 #[test]
@@ -4326,4 +4517,54 @@ end
     for m in ["cast", "stringify_keys", "deep_symbolize_keys", "symbolize_keys", "upcase", "keys"] {
         assert!(!failures.iter().any(|f| f == m), "`{m}` should resolve; failures = {failures:?}");
     }
+}
+
+// ── Gap F15: `&method(:name)` types via the referenced method's own
+// registered signature, same as ordinary dispatch. ──
+
+#[test]
+fn method_ref_block_arg_types_map_result_by_referenced_method_return_ty() {
+    // `double`'s param type comes from ITS OWN inferred/declared
+    // signature (the same registry lookup ordinary `Send` dispatch
+    // uses) — NOT from the block's yielded element type, since
+    // `&method(:double)` is not a `Send`, so `n` gets no evidence
+    // from `[1, 2, 3].map(...)` directly. `seed_double_arity`'s direct
+    // call is what makes `n`, and so `double`'s return, resolve to
+    // `Int` — the realistic case, since a helper referenced by
+    // `&method(:name)` is usually also called directly somewhere.
+    let files: &[(&str, &str)] = &[(
+        "app/lib/doubler.rb",
+        concat!(
+            "class Doubler\n",
+            "  def double(n)\n",
+            "    n * 2\n",
+            "  end\n",
+            "\n",
+            "  def seed_double_arity\n",
+            "    double(1)\n",
+            "  end\n",
+            "\n",
+            "  def doubled_list\n",
+            "    [1, 2, 3].map(&method(:double))\n",
+            "  end\n",
+            "end\n",
+        ),
+    )];
+    let app = app_from_files(files);
+    let lc = app
+        .library_classes
+        .iter()
+        .find(|lc| lc.name.0.as_str() == "Doubler")
+        .expect("Doubler ingested as a library class");
+    let doubled_list = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "doubled_list")
+        .expect("doubled_list present");
+    assert_eq!(
+        doubled_list.body.ty,
+        Some(Ty::Array { elem: Box::new(Ty::Int) }),
+        "[1, 2, 3].map(&method(:double)) should type as Array[Integer], got {:?}",
+        doubled_list.body.ty,
+    );
 }
