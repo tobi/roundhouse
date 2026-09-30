@@ -1713,6 +1713,7 @@ fn ingest_resources_route(
     let mut controller: Option<String> = None;
     let mut param: Option<Symbol> = None;
     let mut concern_names: Vec<String> = Vec::new();
+    let mut only_none = false;
     for arg in iter {
         let Some(kh) = arg.as_keyword_hash_node() else { continue };
         for el in kh.elements().iter() {
@@ -1727,17 +1728,15 @@ fn ingest_resources_route(
                 // opposite of what a restriction means (#85).
                 "only" | "except" => {
                     let list = symbol_list_value(&value);
-                    // `only: []` is a literal list too — of nothing. The
-                    // expander reads an empty `only` as "all seven
-                    // actions", so the nothing is spelled as the other
-                    // restriction: everything excepted. Such a resource
-                    // exists to scope routes (`resources :api, only: []
-                    // do … end`), and those keep their nesting.
-                    let empty_literal = value
-                        .as_array_node()
-                        .is_some_and(|a| a.elements().iter().next().is_none());
-                    if empty_literal && key.as_str() == "only" {
-                        except = ALL_RESOURCE_ACTIONS.iter().map(|a| Symbol::from(*a)).collect();
+                    let empty_literal =
+                        value.as_array_node().is_some_and(|a| a.elements().iter().next().is_none());
+                    // `resources :users, only: [] do … end` is how an app
+                    // nests routes under a parent with no routes of its
+                    // own. The expander reads an empty `only` as "all
+                    // seven", so an empty literal becomes an `except:` of
+                    // every action. `except: []` restricts nothing.
+                    if empty_literal {
+                        only_none |= key.as_str() == "only";
                         continue;
                     }
                     if list.is_empty() {
@@ -1785,6 +1784,14 @@ fn ingest_resources_route(
                 _ => {}
             }
         }
+    }
+
+    if only_none {
+        only.clear();
+        except = ALL_RESOURCE_ACTIONS.iter().copied()
+            .into_iter()
+            .map(Symbol::from)
+            .collect();
     }
 
     let mut nested = block_entries(call, file, Some(name_str.as_str()), cx)?;
