@@ -996,3 +996,118 @@ fn a_collection_render_with_a_reserved_word_as_local_runs() {
     );
     run.assert_passes();
 }
+
+/// A clean factory call must construct the receiving T::Struct, not
+/// the concern or whichever includer was seen first. Exercise native
+/// emitted consumers as well as the objects, independently of the
+/// analyzer's inferred return types (invariant 6).
+#[test]
+fn a_shared_struct_factory_runs_for_both_includers_in_both_orders() {
+    let reading = "class Reading < T::Struct\n  include Factory\n  PREFIX = \"local:\"\n  const :label, String\nend\n";
+    let packet = "class Packet < T::Struct\n  include Factory\n  const :size, Integer\nend\n";
+    for declarations in [format!("{reading}{packet}"), format!("{packet}{reading}")] {
+        emit_and_run::real_blog()
+            .write("app/services/factory.rb", r#"module Factory
+  def self.included(base)
+    base.extend(ClassMethods)
+  end
+  module ClassMethods
+    def build(**fields)
+      new(**fields).freeze
+    end
+    def prefix
+      "old:"
+    end
+  end
+  def self.prefix
+    "initial module:"
+  end
+end
+"#)
+            // Reopening a carrier must retain build and take the newer
+            // prefix, whose default still belongs to Factory's scope.
+            .write("app/services/factory_extension.rb", r#"module Factory
+  PREFIX = "reading:"
+  module ClassMethods
+    def fixed
+      Reading.new(label: "fixed").freeze
+    end
+    def prefix(value = PREFIX)
+      value
+    end
+  end
+  def self.prefix
+    "module:"
+  end
+end
+"#)
+            .write("app/services/values.rb", &declarations)
+            .write("app/services/factory_consumer.rb", r#"class FactoryConsumer
+  def self.label
+    Reading.prefix + Reading.build(label: "sensor").label.upcase
+  end
+  def self.size
+    Packet.build(size: 7).size * 3
+  end
+end
+"#)
+            .write("app/controllers/factory_probes_controller.rb", r#"class FactoryProbesController < ApplicationController
+  def index
+    @label = Reading.build(label: "probe").label
+    @size = Packet.build(size: 7).size
+    render plain: FactoryConsumer.label
+  end
+end
+"#)
+            .run_ruby(r#"
+reading = Reading.build(label: "probe")
+packet = Packet.build(size: 7)
+raise "reading identity" unless reading.class == Reading
+raise "reading field" unless reading.label == "probe"
+raise "reading freeze" unless reading.frozen?
+raise "packet identity" unless packet.class == Packet
+raise "packet field" unless packet.size == 7
+raise "packet freeze" unless packet.frozen?
+raise "label consumer" unless FactoryConsumer.label == "reading:SENSOR"
+raise "size consumer" unless FactoryConsumer.size == 21
+raise "module singleton" unless Factory.prefix == "module:"
+fixed = Packet.fixed
+raise "fixed-other identity" unless fixed.class == Reading
+raise "fixed-other field" unless fixed.label == "fixed"
+raise "fixed-other freeze" unless fixed.frozen?
+"#)
+            .assert_passes();
+    }
+}
+
+#[test]
+fn a_shared_factory_respects_an_overridden_constructor() {
+    emit_and_run::real_blog()
+        .write("app/services/custom_factory.rb", r#"module CustomFactory
+  class_methods do
+    def build
+      new
+    end
+  end
+end
+class FactoryReading < T::Struct
+  const :label, String
+end
+class FactoryPacket
+  include CustomFactory
+  def self.new
+    FactoryReading.new(label: "custom")
+  end
+end
+class FactoryConsumer
+  def self.label
+    FactoryPacket.build.label.upcase
+  end
+end
+"#)
+        .run_ruby(r#"
+raise "constructor identity" unless FactoryPacket.build.class == FactoryReading
+raise "constructor consumer" unless FactoryConsumer.label == "CUSTOM"
+"#)
+        .assert_passes();
+}

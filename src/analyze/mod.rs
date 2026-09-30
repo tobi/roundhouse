@@ -834,6 +834,18 @@ impl Analyzer {
             }
         }
 
+        for (id, method) in app.models.iter()
+            .flat_map(|model| model.methods().map(move |method| (&model.name, method)))
+            .chain(app.library_classes.iter()
+                .flat_map(|class| class.methods.iter().map(move |method| (&class.name, method))))
+        {
+            if method.receiver == crate::dialect::MethodReceiver::Class
+                && method.name.as_str() == "new"
+            {
+                classes.entry(id.clone()).or_default().declares_constructor = true;
+            }
+        }
+
         // A class named in a signature means the lexically nearest one
         // (`Capabilities::Charge` inside `ShopifyPayments::Capability`),
         // which is only knowable once every class is registered.
@@ -4206,7 +4218,7 @@ impl Analyzer {
                 for name in names {
                     // The includer's OWN def wins — unless it is this
                     // module's def, spliced in verbatim
-                    // (`splice_concern_class_methods_into_models`).
+                    // (`splice_concern_class_methods_into_includers`).
                     // Then it is one method with two `MethodDef`s and
                     // the observations belong to both.
                     let spliced_from_here = app
