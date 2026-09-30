@@ -852,6 +852,18 @@ impl Analyzer {
             }
         }
 
+        for (id, method) in app.models.iter()
+            .flat_map(|model| model.methods().map(move |method| (&model.name, method)))
+            .chain(app.library_classes.iter()
+                .flat_map(|class| class.methods.iter().map(move |method| (&class.name, method))))
+        {
+            if method.receiver == crate::dialect::MethodReceiver::Class
+                && method.name.as_str() == "new"
+            {
+                classes.entry(id.clone()).or_default().declares_constructor = true;
+            }
+        }
+
         // A class named in a signature means the lexically nearest one
         // (`Capabilities::Charge` inside `ShopifyPayments::Capability`),
         // which is only knowable once every class is registered.

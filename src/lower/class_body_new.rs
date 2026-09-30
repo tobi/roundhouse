@@ -301,15 +301,12 @@ fn rewrite(expr: &mut Expr, owner: &str) {
     let span = expr.span;
     let path: Vec<Symbol> = owner.split("::").map(Symbol::from).collect();
     let mut konst = Expr::new(span, ExprNode::Const { path });
-    // The receiver is the class ITSELF, which is what the expression's
-    // own type already says the result is — no new type is invented
-    // here, and the send keeps whatever analyze stamped on it.
-    konst.ty = expr.ty.clone().map(|t| match t {
-        crate::ty::Ty::Class { id, args } => crate::ty::Ty::Class { id, args },
-        _ => crate::ty::Ty::Untyped,
+    // Receiver identity is independent of the constructor's result: the
+    // result may be SelfInstance or an overridden constructor's other class.
+    // Later keyword expansion resolves initialize against this receiver.
+    konst.ty = Some(crate::ty::Ty::Class {
+        id: crate::ident::ClassId(Symbol::from(owner)),
+        args: Vec::new(),
     });
-    if matches!(konst.ty, Some(crate::ty::Ty::Untyped)) {
-        konst.ty = None;
-    }
     *recv = Some(konst);
 }
