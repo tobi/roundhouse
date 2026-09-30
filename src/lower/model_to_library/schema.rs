@@ -3211,16 +3211,17 @@ fn synth_update_hash(
                     parenthesized: false,
                 },
             );
-            // The nil test rides the CAST value, not the raw hash read:
-            // `nil?` on an untyped hash value is a known rust gap (it
-            // renders `is_none()`, and `serde_json::Value` answers
-            // `is_null()`), while the cast has already produced the
-            // slot's own nilable type.
-            let cast_for_guard = Expr::new(
-                Span::synthetic(),
-                ExprNode::Cast { value: lookup(&col.name), target_ty: slot_ty.clone() },
-            );
-            stmts.push(guard_unless_nil(cast_for_guard, normalize_assign));
+            // Guarded by `attrs.key?`, the PATCH test the slot write
+            // above uses — NOT a nil test on the value. It used to be
+            // `!Cast(attrs[:col], slot).nil?` (a raw `nil?` on an untyped
+            // hash value is a rust gap), and on the ruby family a Cast to
+            // a String slot renders `.to_s`, which is never nil: every
+            // `update!(status: …)` ran `format_db_time(nil)` into the
+            // NOT NULL `created_at` and wrote it back EMPTY. Found by
+            // once-campfire-rust's model scenario
+            // (scripts/campfire-db-differential): every user a ban, an
+            // unban or a deactivation touched lost its created_at.
+            stmts.push(when_present(&col.name, normalize_assign));
         }
     }
 

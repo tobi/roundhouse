@@ -2834,11 +2834,16 @@ header. Grouped by cause, largest first:
   infinite scroll sends past 500 users) reaches a view whose
   `turbo_stream` helper is not lowered (`NameError` on ruby, `replace`
   on an untyped receiver on spinel).
-- **Blob URLs are signed differently.** Rails' `blob_id` purpose signs
-  with SHA1 over padded Base64 (`…fQ==--<40 hex>`); ours with SHA256
-  over unpadded (`…fQ--<64 hex>`). A blob URL minted by Rails (in a
-  page, an email, a cache) does not verify on the emit after a
-  migration, and vice versa.
+- **Blob URLs were signed differently — FIXED.** Rails' `blob_id`
+  purpose signs with SHA1 over URL-safe padded Base64
+  (`…fQ==--<40 hex>`); ours signed with SHA256 over unpadded, so a blob
+  URL minted by Rails (in a page, an email, a cache) did not verify on
+  the emit, and vice versa. Byte-identical now; see the next entry.
+- **A variant URL's variation key is ours.** Rails' representation URL
+  carries the variation SIGNED under the same verifier (purpose
+  `variation`); ours carries a readable `limit-1200x800-keep`. The blob
+  half of the URL is Rails' now; a representation URL minted by Rails
+  still does not resolve on the emit, and vice versa.
 - Smaller: `Last-Modified` absent on the paginated messages (5),
   `X-Total-Count` absent on the autocompleter JSON (2),
   `Content-Disposition` absent on avatar and logo images (2).
@@ -2846,6 +2851,133 @@ header. Grouped by cause, largest first:
 Each group is a fix in `runtime/ruby/` or an entry here; the sweep
 becomes a gate the way campfire-compare's room page did, once the list
 is ledgered.
+
+### Rails' signed-value contracts, held to Rails' vectors — MEASURED (2026-09-29)
+
+`tests/rails_compat_vectors.rb` runs the runtime's own signing and
+verifying code — the cookie jar's verifier, `ActiveRecord::SignedId`,
+`ActionText::SignedGlobalId`, Active Storage's blob verifier,
+`GlobalID.param`, tep's cookie codec — against
+`tests/rails_compat/rails_compat.json`: 500-odd cases minted by Rails
+inside campfire in production mode, with a fixed secret and a frozen
+clock (once-campfire-rust's generator, vendored beside it; our oracle's
+bundle regenerates every deterministic section byte for byte). The
+table it prints, and the gaps in it:
+
+| section | match | |
+|---|---|---|
+| key_generator | 6/6 | |
+| cookie_escaping.parse | 7/7 | |
+| cookie_escaping.write | 3/5 | tep writes `%20` for a space and escapes `*`; Rails writes `+` and leaves `*`. Both decode the same. |
+| signed_cookies.verify | 26/35 | see below |
+| signed_cookies.generate | 1/10 | the jar writes `"exp":null`: `cookies.signed.permanent` is not modeled, so a session_token has no expiry inside the signature (nor on the Set-Cookie — the header entry above). |
+| signed_cookies.generate_envelope | 10/10 | given Rails' expiry, the envelope is Rails' |
+| json_string | 20/20 | the runtime's JSON string codec against the JSON inside Rails' signed cookies, both ways |
+| signed_ids.generate / verify | 14/14, 29/31 | |
+| global_ids, sgids.generate | 4/4, 5/5 | |
+| sgids.verify | 19/24 | |
+| app_verifiers.blob_id / envelope / data | 8/8, 3/3, 7/7 | fixed with this entry: the blob verifier signed with signed-id's envelope |
+| encrypted_cookies | 0/28 | not implemented |
+| csrf | 0/208 | not implemented |
+| passwords | 0/45 | not held |
+
+**What Rails still accepts that the runtime rejects, or reads
+differently.** Signed cookies: a signed empty value reads as absent (the `""`
+sentinel); pre-5.2 cookies with no metadata, and metadata with no
+purpose, are rejected where Rails accepts them; an Integer or object
+value reads back as its JSON text (the jar is String-typed); a
+Marshal-serialized or unparseable value reads as its raw text where
+Rails answers nil. Signed ids: the legacy SHA1 fallback verifier
+(`use_legacy_signed_id_verifier`) is not consulted, and a String id
+reads back as an Integer. Signed GlobalIDs: the Marshal-era (Rails 7.0),
+JSON-legacy and globalid < 1.0 envelopes are rejected — campfire's own
+`lib/rails_ext` reads the first unverified for mentions, which is the
+path the runtime follows (`SignedGlobalId` unverified read), so a
+mention renders; any other attachable signed by an older install does
+not.
+
+**Not implemented.** The session cookie is SIGNED where Rails'
+`CookieStore` ENCRYPTS it (AES-256-GCM under
+`"authenticated encrypted cookie"`), so a Rails `_campfire_session` is
+not read after a migration — the flash and the CSRF secret start over,
+while the user stays signed in (the `session_token` cookie is signed and
+verifies). CSRF tokens are the session's own, unmasked (see
+`runtime/spinel/request_forgery_protection.rb`'s header), so a form
+rendered by Rails does not post to the emit. Passwords: the ruby family
+runs the bcrypt gem; spinel's package is not yet held to these vectors.
+
+**The JSON string codec — FIXED.** `MessageVerifier.json_string` was
+quote-wrapping and `json_value` quote-stripping, so a value Rails signed
+with a `<`, a quote or a newline in it read back as `\u003c` / `\"` /
+`\n`, and one the runtime signed carried a bare quote into the
+envelope; `extract_raw` ended a `data` value at its first `,` or `}`,
+cutting Active Storage's object payloads short. Both directions are
+ActiveSupport's JSON now (`<`, `>`, `&` escaped; control characters as
+`\n` or `\u00XX`; `\uXXXX` and surrogate pairs decoded), byte-wise so
+CRuby and spinel agree, and `extract_raw` reads a whole JSON value. The
+`json_string` and `app_verifiers.data` sections hold it to Rails' bytes
+(16/20 and 4/7 before).
+
+**On the spinel binary** (`tests/rails_compat_vectors_spinel.rs`): the
+same driver, compiled by spinel over sp_crypto and run under CRuby over
+OpenSSL, must print identical tables; the 155 clock-stable cases do.
+Running them there found a defect none of Rails' vectors could show —
+**FIXED**: the binary derived its signing keys through
+`sp_crypto_b64url_decode`, which returns a C string with no length, so a
+derived key holding a zero byte was cut at the zero. About one
+SECRET_KEY_BASE in five derives such a key (429 of 2,000 sampled); on
+those deployments every signed cookie, signed id, sgid and blob URL the
+binary made was signed with a key a few bytes long — forgeable, and
+matching nothing Rails signs. The key is decoded in Ruby now
+(`runtime/spinel/message_digest.rb`), and `nul_key` cases — secrets
+whose keys hold a zero, answered by OpenSSL — pin it. sp_crypto's HMAC
+itself is binary-safe (it reads the key's length off the String), so
+web push's HKDF was never affected.
+
+**The other direction** — Rails verifying what the runtime signs — needs
+no separate harness where generation is byte-identical to Rails', which
+is every deterministic section above; it matters where randomness is
+involved (encryption IVs, CSRF masks), which is exactly what is not
+implemented.
+
+### Campfire's models write what Rails writes — MEASURED (2026-09-29)
+
+`scripts/campfire-db-differential` runs once-campfire-rust's model
+scenario (30-odd operations: messages and boosts created and
+destroyed, an STI `becomes!`, closed and direct rooms, a membership's
+connection counter, ban/unban, deactivation, search history, a bot and
+its webhook, account settings) from campfire's fixtures, on Rails
+(`rails runner`) and through the transpiled models (the same statements
+in an overlay controller, one GET), then diffs every table with random
+and clock values reduced to their shape. Then Rails boots on the
+database the emit wrote and reads, authenticates, searches, edits and
+deletes through Active Record.
+
+**Both lanes: 13 of 13 tables match, rollback 17/17.** `memberships`
+passes under one printed forgiveness — the `insert_all` entry above
+(ids assigned in another order, microsecond timestamps where SQLite
+stamps milliseconds). Everything else is Rails' rows.
+
+It got there by finding seven defects, each fixed and each pinned in
+`tests/model_scenario_lowerings.rs` or `tests/spinel_db_lease.rs`:
+
+- `Room.find(id).messages.create!(…)` stayed on the plain reader's
+  Array (`create!` for an instance of Array): the association
+  constructor rewrite now takes any owner expression, which it names
+  once.
+- A scope-free app skipped the scope pass entirely, so its association
+  constructors never rewrote at all.
+- A local assigned inside `begin … rescue` read as unresolved after it,
+  and the rewrites keyed on its type silently declined.
+- `pluck(:id)` on a parameter holding an Array (`Rooms::Direct.find_for`)
+  had no Array `pluck`.
+- The mocha slot guard prepended to a stubbed app method named
+  `MochaStub`, which only the test helper loaded: destroying a
+  membership 500'd on both lanes in production.
+- `has_rich_text`'s `dependent: :destroy` was not expanded: a destroyed
+  message left its body in `action_text_rich_texts`.
+- An attribute-hash `update!(status: …)` wrote `created_at` back EMPTY:
+  its temporal normalize sat behind a `.to_s.nil?` that is never true.
 
 ### A raise inside a request leaked its connection lease (spinel) — FIXED
 
@@ -2862,27 +2994,35 @@ release is in an `ensure` now (`capture_sql` in the same file has used
 one on this lane all along); `tests/spinel_db_lease.rs` raises more
 times than the pool holds and checks the pool is whole again.
 
-### Array form params (`ids[]`) keep only the last value (spinel) — OPEN
+### Array form params (`ids[]`) kept only the last value (spinel) — FIXED
 
-`Tep::Url.parse_query` stores a form body into a String→String hash, so
-repeated `user_ids[]=2&user_ids[]=3` keys keep the last value, and
-`Main.nest_params` then reads `user_ids[]` as a sub-hash with the key
-`""`: the controller sees `{"" => "3"}` where Rails sees `["2", "3"]`.
+`Tep::Url.parse_query` stored a form body into a String→String hash, so
+repeated `user_ids[]=2&user_ids[]=3` keys kept the last value, and
+`Main.nest_params` then read `user_ids[]` as a sub-hash with the key
+`""`: the controller saw `{"" => "3"}` where Rails sees `["2", "3"]`.
 campfire's `Rooms::DirectsController#create` does
 `User.where(id: params.fetch(:user_ids, []).including(Current.user.id))`,
-so on the binary every new direct room — one-on-one or group — is
-created with its creator alone, and the request answers 302 as if it
-had worked. Silent, which is why the cable walk's direct-room probes
-were green on spinel without ever reaching a two-member room (they
-check status codes; the room's membership was never read). The ruby
-family parses through Rack and is correct.
+so on the binary every new direct room was created with its creator
+alone, and the request answered 302 as if it had worked. The cable
+walk's direct-room probes checked status codes only and stayed green.
+`nest_params` also knew one level of one resource per request, and let
+the body win over the query string, where Rails lets the query win.
 
-The fix belongs in the parser and the nesting together: an array value
-has to survive a flat String→String store, and the nested hash the
-controller reads has to carry an Array. once-campfire-rust's
-`crates/kit/tests/params_vectors.json` — 2,755 query strings parsed by
-`ActionDispatch::ParamBuilder`, with the cases Rails rejects — is the
-oracle to hold it to.
+`runtime/spinel/param_builder.rb` is now a port of Rails' own
+`QueryParser.each_pair` + `ParamBuilder#store_nested_param`, and
+`Main.request_params` merges body, query and path captures in Rails'
+order, answering 400 where Rails does. It is held to Rails' answers
+for 2,755 query strings (`tests/params_vectors/`, borrowed from
+once-campfire-rust and regenerated byte-identical with our oracle's
+bundle), under CRuby and compiled by spinel
+(`tests/spinel_param_builder.rs`); the walk's group-room probe checks
+the members are there.
+
+**Still open, smaller:** a MULTIPART body's text fields reach the
+builder by name from its parser (`Tep::Request#body_fields`), so a
+repeated field in a multipart form still keeps its last value. The
+other targets keep their own nesting (the Python overlay's
+`_nest_params`, Elixir's `nest_params`), not held to these vectors.
 
 ### The spinel binary WEDGES after a queued job raises — OPEN
 

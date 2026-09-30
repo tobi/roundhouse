@@ -105,6 +105,15 @@ pub fn safe_local(name: &str) -> String {
     }
 }
 
+/// True when `name` is a reserved word that a Ruby local can still have.
+/// Only a keyword parameter can (`def badge(class: "badge")`), and the
+/// body reads it as `binding.local_variable_get(:class)`, because a bare
+/// `class` does not parse as a read. A pseudo-variable (`self`, `nil`,
+/// `true`, `false`) is never a local, so it is not included.
+pub fn is_reserved_local(name: &str) -> bool {
+    RESERVED_LOCALS.contains(&name) && !matches!(name, "self" | "nil" | "true" | "false")
+}
+
 /// Base (final) segment of a `/`-separated view-dir path or a
 /// `::`-namespaced module name — the piece bare record/arg identifiers
 /// derive from (`mod/activities` → `activities`, `Mod::Activities` →

@@ -398,6 +398,14 @@ pub struct App {
     /// `sources` entries must not differ by ingest mode) strip it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root: String,
+    /// App-layer roots ingest walked, relative to `root`: `["app"]` for
+    /// an ordinary Rails app, `["app", "packs/blog/app", …]` for a
+    /// Packwerk app whose packages carry their own `app/` tree
+    /// (`ingest::app::app_roots`). `app` is always first; the rest are
+    /// sorted. Exists so a consumer (today, `check`'s summary line) can
+    /// report what got walked without recomputing it from the VFS.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub app_roots: Vec<String>,
 }
 
 /// One controller's resolved request machinery: the full filter chain
@@ -693,6 +701,7 @@ impl App {
             controller_resolutions: HashMap::new(),
             sources: Vec::new(),
             root: String::new(),
+            app_roots: Vec::new(),
         }
     }
 }

@@ -161,6 +161,7 @@ fn tiny_blog_round_trips() {
         controller_resolutions: std::collections::HashMap::new(),
         sources: vec![],
         root: String::new(),
+        app_roots: vec!["app".to_string()],
     };
 
     let json = serde_json::to_string_pretty(&app).expect("serialize");

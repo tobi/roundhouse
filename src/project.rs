@@ -4952,7 +4952,8 @@ fn trim_gemfile(content: &str, has_js: bool, has_cable: bool) -> String {
 ///    `ActionDispatch::IntegrationTest` — flatten from
 ///    `test/{models,controllers}/` to `test/<name>.rb`: spin treats
 ///    exactly the top-level `test/*.rb` files as test programs, no
-///    recursion.
+///    recursion. A lane test with no `def test_` leaves the tree, and
+///    a warning names it.
 /// 3. Top-level tests *outside* the lane (Minitest::Test shapes the
 ///    archive's TestBase helper never autoruns — compiled, they are
 ///    do-nothing binaries whose empty output vacuously matches an
@@ -5269,7 +5270,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
     // 2./3./4. Relocate test programs; rewrite requires of anything moved.
     let mut lane: Vec<(String, String, usize)> = Vec::new(); // (path, class, n)
     let mut renames: Vec<(String, String)> = Vec::new(); // old .rb → new .rb
-    let mut orphaned: Vec<String> = Vec::new(); // requires a file this app has no
+    let mut dropped: Vec<String> = Vec::new();
     for entry in files.iter_mut() {
         if !entry.0.starts_with("test/") || !entry.0.ends_with("_test.rb") {
             continue;
@@ -5295,7 +5296,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
         // fixtures it just emitted — so what this drops is always a
         // framework test that does not belong in this app's tree.
         if unresolvable_require(&entry.1, &entry.0, &rb_paths).is_some() {
-            orphaned.push(entry.0.clone());
+            dropped.push(entry.0.clone());
             continue;
         }
         // A Minitest-shaped file is CRuby-only whatever else it holds;
@@ -5304,6 +5305,45 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
         // disagree. See `lane_test_class` for what this replaced.
         let in_lane = !entry.1.lines().any(declares_minitest_class)
             && entry.1.lines().any(|l| lane_test_class(l).is_some());
+        // The class and the count come from one call, so the drop and
+        // the snapshot cannot disagree. The require rewrite below
+        // changes neither.
+        let counted = if in_lane {
+            match test_class_and_count(&entry.1, &entry.0) {
+                Ok(counted) => Some(counted),
+                // Preserve recovery for app tests outside the snapshot
+                // runner's supported shape, with their sidecars removed too.
+                Err(e) => {
+                    eprintln!("roundhouse: {e}; dropped");
+                    dropped.push(entry.0.clone());
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        // An emitted lane test with no `def test_` compiles to a program
+        // that tests nothing, so the spin tree omits it. `rails generate
+        // model` writes such a class. The same shape also comes from
+        // tests that the emit did not model (an `include`d module, a
+        // `define_method` loop), so the warning names what the emit
+        // wrote, not what the source holds.
+        if counted.as_ref().is_some_and(|(_, n)| *n == 0) {
+            let mut d = crate::diagnostic::Diagnostic::unsupported(
+                crate::span::Span::synthetic(),
+                Some(crate::ident::Symbol::from("spinel")),
+                "test_class_without_emitted_tests",
+                format!(
+                    "{}: the emitted test class has no `def test_` methods, so the spin \
+                     tree omits it; tests that the emit did not model are lost too",
+                    entry.0
+                ),
+            );
+            d.severity = crate::diagnostic::Severity::Warning;
+            emit::diagnostics::push(d);
+            dropped.push(entry.0.clone());
+            continue;
+        }
         let new_path = if in_lane {
             format!("test/{base}")
         } else if top_level {
@@ -5319,26 +5359,18 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
             entry.0 = new_path.clone();
             entry.1 = rewritten;
         }
-        if in_lane {
-            match test_class_and_count(&entry.1, &new_path) {
-                Ok((class, n)) => lane.push((new_path, class, n)),
-                // A test program the snapshot runner cannot shape is
-                // dropped with a note rather than failing the project:
-                // a large app's suite has files outside the lane shape.
-                Err(e) => {
-                    eprintln!("roundhouse: {e}; dropped");
-                    orphaned.push(new_path);
-                }
-            }
+        if let Some((class, n)) = counted {
+            lane.push((new_path, class, n));
         }
     }
 
-    // An orphaned framework test leaves with its sidecar and its
-    // `.expected` snapshot — a snapshot for a program that is not in
-    // the tree is what the next reader would have to explain away.
-    if !orphaned.is_empty() {
+    // An orphaned framework test or a test class without emitted tests
+    // (see above) leaves with its sidecar and its `.expected` snapshot —
+    // a snapshot for a program that is not in the tree is what the next
+    // reader would have to explain away.
+    if !dropped.is_empty() {
         files.retain(|(p, _)| {
-            !orphaned.iter().any(|o| {
+            !dropped.iter().any(|o| {
                 p == o
                     || *p == format!("{}.rbs", o.trim_end_matches(".rb"))
                     || *p == format!("{o}.expected")
@@ -5789,6 +5821,8 @@ fn declares_minitest_class(line: &str) -> bool {
 /// line (exactly one per lane test) plus the `def test_*` count —
 /// enough to synthesize the runner's `<Class>: <N> tests passed`
 /// footer (src/emit/ruby.rs prints it with no singular special-case).
+/// A zero count is not an error here: `spin_shape` drops that test
+/// with a warning.
 fn test_class_and_count(content: &str, path: &str) -> Result<(String, usize), String> {
     let mut class: Option<String> = None;
     for line in content.lines() {
@@ -5802,13 +5836,7 @@ fn test_class_and_count(content: &str, path: &str) -> Result<(String, usize), St
         }
     }
     let class = class.ok_or_else(|| format!("spin_shape: {path}: no test class found"))?;
-    let n = content.matches("def test_").count();
-    if n == 0 {
-        return Err(format!(
-            "spin_shape: {path}: no test methods — would be a vacuous test program"
-        ));
-    }
-    Ok((class, n))
+    Ok((class, content.matches("def test_").count()))
 }
 
 /// Rewrite the requires of a file moving `old_dir` → `new_dir` inside

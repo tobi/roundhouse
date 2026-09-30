@@ -23,7 +23,6 @@ module SpCrypto
   ffi_func :sp_crypto_hmac_sha1_hex,            [:str, :str],             :str
   ffi_func :sp_crypto_hmac_sha256_hex,          [:str, :str],             :str
   ffi_func :sp_crypto_pbkdf2_sha256_b64url_len, [:str, :str, :int, :int], :str
-  ffi_func :sp_crypto_b64url_decode,            [:str],                   :str
 end
 
 module MessageDigest
@@ -36,10 +35,19 @@ module MessageDigest
   end
 
   # sp_crypto returns the derived key base64url-encoded; the callers want
-  # the raw bytes (an HMAC key is bytes), so decode on the way out. Both
-  # results copy off the static buffer before the next FFI call.
+  # the raw bytes (an HMAC key is bytes), so decode on the way out — in
+  # Ruby, NOT through `sp_crypto_b64url_decode`. That one hands back a
+  # C string with no length, so a key with a zero byte in it arrived cut
+  # at the zero: about one SECRET_KEY_BASE in five derives such a key, and
+  # on those deployments every signed cookie, signed id, sgid and blob URL
+  # the binary made was signed with a key a few bytes long — forgeable,
+  # and matching nothing Rails signs. (HMAC itself is binary-safe: it
+  # reads the key's length off the String, `sp_str_byte_len`.) Found by
+  # running Rails' vectors on the binary; pinned by the `nul_key` cases in
+  # tests/rails_compat_vectors_spinel.rs, secrets whose keys hold a zero.
+  # The FFI declaration is gone with it, so nothing reaches for it again.
   def self.pbkdf2_sha256(secret, salt, iters, dklen)
     b64 = SpCrypto.sp_crypto_pbkdf2_sha256_b64url_len(secret, salt, iters, dklen) + ""
-    SpCrypto.sp_crypto_b64url_decode(b64) + ""
+    Base64.urlsafe_decode64(b64)
   end
 end

@@ -23,7 +23,7 @@ use crate::naming::camelize;
 use crate::{ClassId, Symbol};
 
 use super::util::{
-    constant_id_str, find_call_named, flatten_statements, string_value, symbol_list_value,
+    constant_id_str, constant_path_of, find_call_named, flatten_statements, string_value, symbol_list_value,
     symbol_or_string_value, symbol_value,
 };
 use super::{IngestError, IngestResult};
@@ -317,6 +317,28 @@ fn ingest_route_stmts<'pr>(
             continue;
         }
         let Some(call) = stmt.as_call_node() else { continue };
+        // `Dir.glob('rest_routes/**/*.rb', base: 'config/routes').each
+        // do |r| draw(r.sub(/\.rb$/, '')) end` (and `Dir[...]`) — the
+        // idiom a Mastodon-class app uses to mass-`draw` a whole
+        // directory instead of one call per file (Procore draws 1,561
+        // files this way). Checked BEFORE the receiver-skip below: that
+        // skip exists to avoid re-finding the outer `Rails.application
+        // .routes.draw` as a nested call, but `Dir.glob(...).each`
+        // legitimately has a receiver (`Dir.glob(...)`) and would
+        // otherwise fall through it and vanish with no ledger entry.
+        if constant_id_str(&call.name()) == "each" {
+            if let Some(recv) = call.receiver() {
+                if let Some(pattern) = dir_glob_routes_pattern(&recv) {
+                    match ingest_glob_draw_each(&call, &pattern, file, cx) {
+                        Ok(new_entries) => entries.extend(new_entries),
+                        Err(err) if super::survey::is_active() => super::survey::record(&err),
+                        Err(err) => return Err(err),
+                    }
+                    continue;
+                }
+            }
+        }
+
         if call.receiver().is_some() {
             // `Rails.application.routes.draw` gets re-found as a nested
             // call when we walk a weird input; skip anything with an
@@ -771,7 +793,7 @@ fn ingest_route_file_include(
             message: format!("{method} of a route file whose path is not a literal"),
         });
     };
-    let Some((source, path)) = cx.draws.get(&key) else {
+    let Some((source, path)) = resolve_draw_name(&key, cx.draws) else {
         return Err(IngestError::Unsupported {
             file: file.into(),
             message: format!("{method}(:{key}) — config/routes/{key}.rb not found"),
@@ -1139,6 +1161,211 @@ fn rsymbol(node: &Node<'_>) -> Option<String> {
 /// [`symbol_or_string_value`], with the same allowance.
 fn rname(node: &Node<'_>) -> Option<String> {
     rsymbol(node).or_else(|| rstring(node))
+}
+
+/// Resolve a `draw(:name)` argument against the `config/routes/` file
+/// map. `draws` is keyed by the path RELATIVE TO `config/routes/`
+/// (without `.rb`), so a subdirectory-nested file's full relative name
+/// (`draw('financials/financials_erp_routes')`) matches directly.
+/// Falls back to a bare-stem match (the last path segment) when exactly
+/// one file under `config/routes/` carries that stem, for backwards
+/// compatibility with a `draw(:name)` call that predates any
+/// subdirectory nesting; an ambiguous stem (two files share it in
+/// different subdirectories) reports not-found rather than guessing.
+fn resolve_draw_name<'a>(
+    name: &str,
+    draws: &'a HashMap<String, (Vec<u8>, String)>,
+) -> Option<&'a (Vec<u8>, String)> {
+    if let Some(entry) = draws.get(name) {
+        return Some(entry);
+    }
+    let mut matches = draws.iter().filter(|(key, _)| key.rsplit('/').next() == Some(name));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first.1)
+}
+
+/// Parse and ingest one `config/routes/<name>.rb` split file's
+/// top-level statements as route DSL (no `routes.draw` wrapper — Rails
+/// loads it straight into the calling `draw` block's context). Shared
+/// by a single named `draw(:name)` (`ingest_draw_route`) and by every
+/// file a `Dir.glob(...).each { draw(...) }` mass-draw matches
+/// (`ingest_glob_draw_each`) — both hand the same (source, path) pair
+/// from the `draws` map to the same parse-and-walk.
+fn ingest_routes_file_entries(
+    source: &[u8],
+    path: &str,
+    cx: &Ctx<'_>,
+) -> IngestResult<Vec<RouteSpec>> {
+    super::sources::register(path, &String::from_utf8_lossy(source));
+    let result = super::prism::parse(source, path);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else {
+        return Err(IngestError::Parse {
+            file: path.to_string(),
+            message: "route file is not a program".into(),
+        });
+    };
+    if cx.active.borrow().iter().any(|active| active == path) {
+        return Ok(Vec::new());
+    }
+    cx.active.borrow_mut().push(path.to_string());
+    let result = ingest_route_stmts(program.statements().body().iter(), path, None, cx);
+    cx.active.borrow_mut().pop();
+    result
+}
+
+/// Recognize the receiver of a top-level `<recv>.each do |v| draw(...)
+/// end` as `Dir.glob(PATTERN[, base: 'config/routes'])` or
+/// `Dir[PATTERN]`, and return PATTERN made relative to
+/// `config/routes/` — the same coordinate space `draws`' keys live in.
+/// `None` for any other receiver shape, or for a `base:`/prefix that
+/// doesn't target `config/routes/` (a glob over some other directory is
+/// not this idiom; let it fail loud downstream rather than guess).
+fn dir_glob_routes_pattern(recv: &Node<'_>) -> Option<String> {
+    let call = recv.as_call_node()?;
+    let dir_receiver = call.receiver()?;
+    let dir_path = constant_path_of(&dir_receiver)?;
+    if dir_path.len() != 1 || dir_path[0] != "Dir" {
+        return None;
+    }
+    let method = constant_id_str(&call.name());
+    let args = call.arguments()?;
+    if method == "glob" {
+        let mut pattern: Option<String> = None;
+        let mut base: Option<String> = None;
+        for arg in args.arguments().iter() {
+            if pattern.is_none() {
+                if let Some(s) = string_value(&arg) {
+                    pattern = Some(s);
+                    continue;
+                }
+            }
+            if let Some(kh) = arg.as_keyword_hash_node() {
+                for el in kh.elements().iter() {
+                    let Some(assoc) = el.as_assoc_node() else { continue };
+                    if symbol_value(&assoc.key()).as_deref() == Some("base") {
+                        base = string_value(&assoc.value());
+                    }
+                }
+            }
+        }
+        let pattern = pattern?;
+        return match base {
+            Some(b) if b.trim_end_matches('/') == "config/routes" => Some(pattern),
+            Some(_) => None,
+            None => pattern.strip_prefix("config/routes/").map(|s| s.to_string()),
+        };
+    }
+    if method == "[]" {
+        let pattern = args.arguments().iter().next().and_then(|a| string_value(&a))?;
+        return pattern.strip_prefix("config/routes/").map(|s| s.to_string());
+    }
+    None
+}
+
+/// `Dir.glob(PATTERN, base: 'config/routes').each do |v| draw(...) end`
+/// — draw every `config/routes/` file the glob matches, sorted, each
+/// riding its own facet-less Scope exactly like a single named
+/// `draw(:name)` does. The block's own argument expression (typically
+/// `v.sub(/\.rb$/, '')`, stripping the extension `Dir.glob` includes) is
+/// NOT evaluated — the glob match against the VFS already gives the
+/// exact file set and their `.rb`-stripped names, which is what that
+/// expression is written to reproduce. Only the block SHAPE is
+/// checked: a single bare `draw(...)` statement, so a block that does
+/// anything else is ledgered by name rather than silently trusted to
+/// mean the same thing.
+fn ingest_glob_draw_each(
+    call: &ruby_prism::CallNode<'_>,
+    pattern: &str,
+    file: &str,
+    cx: &Ctx<'_>,
+) -> IngestResult<Vec<RouteSpec>> {
+    let Some(block) = call.block().and_then(|b| b.as_block_node()) else {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "unsupported routes DSL: `Dir.glob(...).each` without a block".into(),
+        });
+    };
+    let is_bare_draw = block.body().is_some_and(|body| {
+        let stmts = flatten_statements(body);
+        stmts.len() == 1
+            && stmts[0]
+                .as_call_node()
+                .is_some_and(|c| c.receiver().is_none() && constant_id_str(&c.name()) == "draw")
+    });
+    if !is_bare_draw {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "unsupported routes DSL: `Dir.glob(...).each` block body is not a bare `draw(...)` call".into(),
+        });
+    }
+
+    let mut matched: Vec<&String> =
+        cx.draws.keys().filter(|key| glob_matches(pattern, &format!("{key}.rb"))).collect();
+    matched.sort();
+
+    let mut entries = Vec::with_capacity(matched.len());
+    for key in matched {
+        let (source, path) = &cx.draws[key];
+        entries.push(RouteSpec::Scope {
+            path: None,
+            module: None,
+            as_prefix: None,
+            defaults: IndexMap::new(),
+            nest: false,
+            entries: ingest_routes_file_entries(source, path, cx)?,
+        });
+    }
+    Ok(entries)
+}
+
+/// Match `candidate` (a `/`-separated relative path) against a glob
+/// `pattern` supporting only `*` (any run of non-`/` characters, within
+/// one path segment) and `**` (zero or more whole path segments) — the
+/// two segment kinds `Dir.glob` actually uses in this idiom. No other
+/// glob metacharacter (`?`, `{a,b}`, character classes, …) is
+/// recognized.
+fn glob_matches(pattern: &str, candidate: &str) -> bool {
+    let pat: Vec<&str> = pattern.split('/').collect();
+    let cand: Vec<&str> = candidate.split('/').collect();
+    glob_match_segments(&pat, &cand)
+}
+
+fn glob_match_segments(pat: &[&str], cand: &[&str]) -> bool {
+    match pat.first() {
+        None => cand.is_empty(),
+        Some(&"**") => {
+            glob_match_segments(&pat[1..], cand)
+                || matches!(cand.split_first(), Some((_, rest)) if glob_match_segments(pat, rest))
+        }
+        Some(seg) => match cand.split_first() {
+            Some((first, rest)) => segment_matches(seg, first) && glob_match_segments(&pat[1..], rest),
+            None => false,
+        },
+    }
+}
+
+/// Match one path segment against a single-segment glob pattern whose
+/// only metacharacter is `*` (any run of characters — segments are
+/// already split on `/`, so it cannot cross a segment boundary).
+fn segment_matches(pattern: &str, s: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == s;
+    }
+    let Some(rest) = s.strip_prefix(parts[0]) else { return false };
+    let mut rest = rest;
+    for mid in &parts[1..parts.len() - 1] {
+        match rest.find(mid) {
+            Some(idx) => rest = &rest[idx + mid.len()..],
+            None => return false,
+        }
+    }
+    let last = parts[parts.len() - 1];
+    rest.len() >= last.len() && rest.ends_with(last)
 }
 
 /// Raw regex-pattern source of a `/.../ ` literal value node — the text

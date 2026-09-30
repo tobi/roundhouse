@@ -305,6 +305,9 @@ impl<'a> BodyTyper<'a> {
                 "transform_keys" => Some(vec![(**key).clone()]),
                 _ => None,
             },
+            Ty::Class { id, .. } if id.0.as_str() == "CSV" && method.as_str() == "generate" => {
+                Some(vec![recv_ty.clone()])
+            }
             // ActiveModel::Errors iteration yields an Error to the block.
             Ty::Class { id, .. } if id.0.as_str() == "ActiveModel::Errors" => {
                 match method.as_str() {
@@ -2387,9 +2390,11 @@ fn jbuilder_value(arg: Option<&crate::expr::Expr>) -> Ty {
 /// `lower::inquiry` asks before folding an unknown `foo?` into an
 /// equality against the label; consulting the class registry instead
 /// answered "String has no methods at all", and the pass rewrote
-/// `notice.present?` to `notice == "present"`.
+/// `notice.present?` to `notice == "present"`. A String also answers
+/// every `universal_method`: without that, a String-typed `value.nil?`
+/// became `value == "nil"`.
 pub(crate) fn string_answers(method: &Symbol) -> bool {
-    !matches!(str_method(method), Ty::Var { .. })
+    universal_method(method).is_some() || !matches!(str_method(method), Ty::Var { .. })
 }
 
 pub(super) fn str_method(method: &Symbol) -> Ty {

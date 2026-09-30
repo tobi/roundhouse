@@ -1484,6 +1484,30 @@ impl<'a> BodyTyper<'a> {
                             }
                         }
                     }
+                    // A `begin … rescue … end` STATEMENT exports the
+                    // locals its body and rescue arms assign at their own
+                    // top level — Ruby's `begin` opens no scope — typed
+                    // as the assigned value OR what the name held before
+                    // (nil when it was unbound): the exception may come
+                    // before the assignment runs. Without this a local
+                    // assigned in one `begin` and read after it (`user =
+                    // User.find(id)` in a begin, `user.messages.create!`
+                    // below) read as unresolved, and everything keyed on
+                    // its type — the association constructor rewrite —
+                    // silently declined. Found by the model scenario
+                    // scripts/campfire-db-differential runs statement by
+                    // statement.
+                    if let ExprNode::BeginRescue { body, rescues, .. } = &*e.node {
+                        let mut exported: Vec<(Symbol, Ty)> = Vec::new();
+                        top_level_local_assigns(body, &mut exported);
+                        for rc in rescues.iter() {
+                            top_level_local_assigns(&rc.body, &mut exported);
+                        }
+                        for (name, ty) in exported {
+                            let prior = local_ctx.local_bindings.get(&name).cloned().unwrap_or(Ty::Nil);
+                            local_ctx.local_bindings.insert(name, union_of(prior, ty));
+                        }
+                    }
                     // Short-circuit compound assignment (`@x ||= y`,
                     // `@x &&= y`) threads its binding forward too — the
                     // memoization idiom `@story ||= Story.find(...)` is
@@ -2138,6 +2162,27 @@ fn collect_local_assignment_tys(expr: &Expr, out: &mut Vec<(Symbol, Ty)>) {
         }
     }
     expr.node.for_each_child(&mut |child| collect_local_assignment_tys(child, out));
+}
+
+/// The local assignments a statement list makes at ITS OWN level — the
+/// statement itself, or each statement of a `Seq` — with the value's
+/// stamped type. Blocks and nested bodies are not entered: a local first
+/// assigned inside a block does not outlive it. Open types are skipped,
+/// as in [`collect_local_assignment_tys`].
+fn top_level_local_assigns(expr: &Expr, out: &mut Vec<(Symbol, Ty)>) {
+    let stmts: Vec<&Expr> = match &*expr.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![expr],
+    };
+    for s in stmts {
+        if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*s.node {
+            if let Some(t) = value.ty.clone() {
+                if !t.is_open() {
+                    out.push((name.clone(), t));
+                }
+            }
+        }
+    }
 }
 
 fn collect_var_assignments_into(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {

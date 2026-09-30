@@ -460,6 +460,24 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     }
                 }
             }
+            // `binding.local_variable_get(:class)` is how Ruby reads a
+            // local named after a reserved word (a keyword param such as
+            // `class:`). It is a plain local read, so ingest it as one.
+            // The Ruby emitter writes that read back in this form.
+            if method == "local_variable_get" && block.is_none() && args.len() == 1 {
+                let from_binding = recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+                        if method.as_str() == "binding" && args.is_empty())
+                });
+                if let ExprNode::Lit { value: Literal::Sym { value } } = &*args[0].node {
+                    if from_binding && crate::naming::is_reserved_local(value.as_str()) {
+                        return Ok(Expr::new(
+                            span,
+                            ExprNode::Var { id: crate::ident::VarId(0), name: value.clone() },
+                        ));
+                    }
+                }
+            }
             // ActiveSupport `recv.try(:sym[, args])` USED TO BE GROUNDED
             // HERE, to `recv && recv.sym(args)`. That is the `&.` shape,
             // and `try` is not `&.`: its definition is

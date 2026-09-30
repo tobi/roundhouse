@@ -629,12 +629,24 @@ pub fn renders_through_view_path(format: &str) -> bool {
     // EMITTED, and a format listed in only one of them is silently
     // dropped somewhere in between.
     // `rss` / `atom` / `xml`: feed templates (lobsters' `home/stories
-    // .rss.builder`), `<action>_rss` beside the html view.
+    // .rss.builder`), `<action>_rss` beside the html view. `xls` joins
+    // them: same Builder XML markup, an `.xls` extension so Excel opens
+    // the SpreadsheetML it produces.
     // `json` / `js`: TEXT templates in those formats — campfire's PWA
     // `manifest.json.erb` and its raw `service_worker.js` — as
     // `<action>_json` / `<action>_js`. A jbuilder template is json too,
     // but it is DSL, not text: `lowers_through_view_path` keeps it out.
-    matches!(format, "html" | "turbo_stream" | "svg" | "rss" | "atom" | "xml" | "json" | "js")
+    // `pdf` / `csv` / `txt`: also TEXT templates in those formats — a
+    // PDF-renderer's HTML input, a `CSV.generate` body, a mailer's
+    // plaintext part — as `<action>_pdf` / `<action>_csv` /
+    // `<action>_txt`. Paired with the ingest gate in `ingest::app`'s
+    // `walk_erb` the same way `svg`/`json` are: a format admitted only
+    // here or only there is silently dropped in between.
+    matches!(
+        format,
+        "html" | "turbo_stream" | "svg" | "rss" | "atom" | "xml" | "xls" | "json" | "js" | "pdf"
+            | "csv" | "txt"
+    )
 }
 
 /// Does this view lower to a view-path class? The one filter every

@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use roundhouse::analyze::{diagnose, Analyzer};
+use roundhouse::analyze::diagnose;
 use roundhouse::diagnostic::Severity;
 use roundhouse::ingest::ingest_app;
 use roundhouse::project::BuildTarget;
@@ -151,9 +151,10 @@ impl Overlay {
         }
 
         let mut app = ingest_app(&source).expect("ingest the overlaid fixture");
-        Analyzer::new(&app).analyze(&mut app);
+        let lower_diags = roundhouse::session::analyze_and_lower(&mut app);
         let errors = diagnose(&app)
             .into_iter()
+            .chain(lower_diags)
             .filter(|d| d.severity == Severity::Error)
             .map(|d| format!("{:?}: {}", d.span, d.message))
             .collect();

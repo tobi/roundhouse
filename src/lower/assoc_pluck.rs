@@ -172,9 +172,28 @@ fn rewrite(expr: &mut Expr, materialized: &std::collections::HashSet<Symbol>) {
     ) {
         return;
     }
-    let ExprNode::Send { method: reader, .. } = &*recv.node else { return };
-    if !materialized.contains(reader) {
-        return;
+    // A LOCAL or parameter that may hold an Array — typed `Array[…]`, or
+    // a union with an Array in it — is the other way a record Array
+    // reaches `pluck`: campfire's `Rooms::Direct.find_for(users)` does
+    // `users.pluck(:id)`, and its callers pass a Relation
+    // (`DirectsController`) or an Array (`find_or_create_for([jz,
+    // kevin])`, once-campfire-rust's model scenario). ActiveSupport's
+    // `Enumerable#pluck` answers the Array; our Array has none. `map` is
+    // right for both halves — only a stated Relation, returned above,
+    // keeps its single-column SELECT.
+    let var_array = matches!(&*recv.node, ExprNode::Var { .. })
+        && match &recv.ty {
+            Some(crate::ty::Ty::Array { .. }) => true,
+            Some(crate::ty::Ty::Union { variants }) => {
+                variants.iter().any(|v| matches!(v, crate::ty::Ty::Array { .. }))
+            }
+            _ => false,
+        };
+    if !var_array {
+        let ExprNode::Send { method: reader, .. } = &*recv.node else { return };
+        if !materialized.contains(reader) {
+            return;
+        }
     }
     // A Const root is `Model.where(…).pluck(:id)`, arel's inlined
     // SELECT. Belt and braces: a model constant does not answer an

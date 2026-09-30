@@ -552,20 +552,27 @@ module ActiveStorage
     end
 
     # Rails' `ActiveStorage.verifier` signs the blob id with purpose
-    # `blob_id`; the same envelope `record.signed_id` uses, under
-    # Active Storage's own salt so a blob token and a record token can
-    # never stand in for each other.
+    # `blob_id`, under Active Storage's own salt so a blob token and a
+    # record token can never stand in for each other.
+    #
+    # THE ENVELOPE IS NOT `record.signed_id`'s, though it was here: the
+    # app's `message_verifier("ActiveStorage")` signs HMAC-SHA1 over
+    # URL-safe, PADDED base64 — `gid_envelope`'s shape — where a signed
+    # id is SHA256 and unpadded. Held to Rails' bytes by
+    # tests/rails_compat_vectors.rb (`app_verifiers`); before, every blob
+    # URL minted here failed on Rails and every one Rails minted (a
+    # cached page, an email) failed here.
     def self.find_signed(signed_id)
       json = ActionController::MessageVerifier.verified_data_json(
-        Rails.application.secret_key_base, "ActiveStorage", signed_id, "blob_id", false
+        Rails.application.secret_key_base, "ActiveStorage", signed_id, "blob_id", true
       )
       return nil if json == ""
       find(json.to_i)
     end
 
     def signed_id
-      ActionController::MessageVerifier.data_envelope(
-        Rails.application.secret_key_base, "ActiveStorage", @id.to_s, "blob_id", "", false
+      ActionController::MessageVerifier.gid_envelope(
+        Rails.application.secret_key_base, "ActiveStorage", @id.to_s, "blob_id", ""
       )
     end
 

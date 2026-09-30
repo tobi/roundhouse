@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# scripts/campfire-db-differential — what campfire's MODELS write, Rails
+# vs the emit, table by table; then Rails booted on the emit's database.
+#
+# BORROWED, NOT INVENTED: once-campfire-rust's model differential
+# (reference-tools/db/differential.sh, crates/db/ruby/scenario.rb): one
+# scenario of 30-odd model operations — messages, boosts and their
+# destruction, an STI `becomes!`, closed/direct room creation, a
+# membership's connection counter, ban/unban, deactivation, search
+# history, a bot and its webhook, account settings — run from the same
+# fixtures on both sides, every table compared with the random and
+# clock-dependent values reduced to their shape. They re-express the
+# scenario in Rust by hand; we do not have to. The emit half is the SAME
+# Ruby, generated into an overlay controller of a copy of campfire
+# (tests/db_differential/overlay.rb) and transpiled with the app, so a
+# difference is the transpiler's.
+#
+#   1. Rails loads campfire's fixtures into a scratch database.
+#   2. Rails runs tests/db_differential/scenario.rb on a copy (`rails runner`).
+#   3. The emit — a copy of campfire plus the overlay — serves a copy of
+#      the fixtures; one GET runs the scenario through the transpiled
+#      models. Jobs are held on both sides (Rails' :test adapter; the
+#      lane's own hold), so nothing reaches a push or webhook endpoint.
+#   4. tests/db_differential/compare.rb diffs every table.
+#   5. ROLLBACK: Rails boots on the emit's database and reads,
+#      authenticates, searches, edits and deletes through Active Record
+#      (tests/db_differential/rollback.rb) — can someone go back to Rails?
+#
+# Usage:  scripts/campfire-db-differential [--spinel] [--keep] [--reuse DIR]
+#
+# Requires the Rails oracle at build/campfire-oracle (scripts/campfire-oracle
+# prepare) and sqlite3. Exit status: nonzero when a table differs, the
+# scenario request fails, or a rollback check fails.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/spinel-link-path.sh"
+APP="$HOME/git/once-campfire"
+ORACLE="$REPO_ROOT/build/campfire-oracle"
+LANE=ruby
+KEEP=0
+REUSE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --spinel) LANE=spinel; shift ;;
+        --keep)   KEEP=1; shift ;;
+        --reuse)  REUSE="$2"; shift 2 ;;
+        -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
+        *) APP="$1"; shift ;;
+    esac
+done
+
+step() { printf '\n\033[1;34m==>\033[0m %s\n' "$1"; }
+fail() { printf '\033[1;31m%s\033[0m\n' "$1"; }
+die()  { fail "$1"; exit 1; }
+
+[[ -f "$ORACLE/oracle.json" ]] || die "no oracle at $ORACLE — run scripts/campfire-oracle prepare first"
+command -v sqlite3 >/dev/null || die "sqlite3 not on PATH"
+
+WORK="$(mktemp -d -t roundhouse-campfire-db-differential.XXXXXX)"
+EMIT_PID=""
+cleanup() {
+    [[ -n "$EMIT_PID" ]] && kill "$EMIT_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+    if [[ $KEEP -eq 0 ]]; then rm -rf "$WORK"; else echo "  kept $WORK"; fi
+}
+trap cleanup EXIT INT TERM
+
+rails() {   # rails DB <args...>: the oracle, in production, on DB
+    local db="$1"; shift
+    (cd "$ORACLE" && RAILS_ENV=production RAILS_LOG_LEVEL=fatal DISABLE_SSL=1 SKIP_TELEMETRY=true \
+        SECRET_KEY_BASE="${SECRET_KEY_BASE:-campfire-db-differential}" DATABASE_URL="sqlite3:$db" \
+        bin/rails "$@") 2> >(grep -v VIPS >&2)
+}
+checkpoint() { sqlite3 "$1" "PRAGMA wal_checkpoint(TRUNCATE)" >/dev/null; }
+
+# ── 1–2. Rails: fixtures, then the scenario ──────────────────────────
+step "Rails: fixtures, then the scenario"
+rails "$WORK/fixtures.sqlite3" db:prepare >/dev/null
+rails "$WORK/fixtures.sqlite3" db:fixtures:load
+checkpoint "$WORK/fixtures.sqlite3"
+cp "$WORK/fixtures.sqlite3" "$WORK/rails.sqlite3"
+rails "$WORK/rails.sqlite3" runner "$REPO_ROOT/tests/db_differential/scenario.rb" | tail -1
+checkpoint "$WORK/rails.sqlite3"
+
+# ── 3. the emit: campfire + the overlay, transpiled ───────────────────
+if [[ -n "$REUSE" ]]; then
+    OUT="$REUSE"
+    step "reusing emit at $OUT"
+else
+    step "transpiling campfire + the scenario overlay (target: $LANE)"
+    rsync -a --exclude=.git --exclude=/storage --exclude=/tmp --exclude=/log --exclude=node_modules \
+        "$APP/" "$WORK/app/"
+    ruby "$REPO_ROOT/tests/db_differential/overlay.rb" "$WORK/app"
+    OUT="$WORK/emit"
+    (cd "$REPO_ROOT" && cargo run --quiet --bin roundhouse -- \
+        --target "$LANE" "$WORK/app" -o "$OUT" --allow-unsupported) 2>"$WORK/transpile.log" | tail -1
+    if grep -q "differential_scenarios_controller.*error\[" "$WORK/transpile.log"; then
+        grep "differential_scenarios_controller.*error\[" "$WORK/transpile.log"
+        die "the scenario itself does not transpile"
+    fi
+fi
+
+# Hold jobs: nothing in the scenario may run a push or webhook delivery.
+if [[ "$LANE" == ruby ]]; then
+    grep -q enqueue_without_running "$OUT/config.ru" || python3 - "$OUT/config.ru" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read(); m = "Main.configure_default_adapter!"
+assert m in s, "no adapter marker"
+open(p, "w").write(s.replace(m, m + "\nActiveJob.enqueue_without_running", 1))
+PY
+else
+    # The drain is a thread main.rb spawns after `register_drain`; with no
+    # thread, `perform_later` only enqueues.
+    python3 - "$OUT/main.rb" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "Thread.new do\n  Main.job_loop\nend\n"
+if old in s:
+    open(p, "w").write(s.replace(old, "# job drain held by campfire-db-differential\n", 1))
+else:
+    assert "held by campfire-db-differential" in s, "no job_loop thread to hold"
+PY
+    spinel_link_path
+    step "building the binary"
+    (cd "$OUT" && make build) >"$WORK/build.log" 2>&1 || { tail -20 "$WORK/build.log"; die "spinel build failed"; }
+fi
+
+mkdir -p "$OUT/storage"
+cp "$WORK/fixtures.sqlite3" "$OUT/storage/development.sqlite3"
+rm -f "$OUT/storage/development.sqlite3-wal" "$OUT/storage/development.sqlite3-shm"
+
+PORT="${DB_DIFFERENTIAL_PORT:-4291}"
+# A stale server on the port answers in its place — a 404 from someone
+# else's binary reads exactly like the emit missing its route.
+if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    die "port $PORT is taken (set DB_DIFFERENTIAL_PORT): $(lsof -tiTCP:$PORT -sTCP:LISTEN | head -1)"
+fi
+step "the emit ($LANE) on :$PORT, one GET of the scenario"
+if [[ "$LANE" == spinel ]]; then
+    ( cd "$OUT" && BLOG_DB="$OUT/storage/development.sqlite3" PORT="$PORT" SECRET_KEY_BASE=x \
+        exec ./build/blog ) >"$WORK/emit-server.log" 2>&1 &
+else
+    cp "$REPO_ROOT/tests/db_differential/trace.ru" "$OUT/trace.ru"
+    ( cd "$OUT" && RAILS_ENV=development SECRET_KEY_BASE=x exec ruby -S puma -p "$PORT" trace.ru ) \
+        >"$WORK/emit-server.log" 2>&1 &
+fi
+EMIT_PID=$!
+for _ in $(seq 1 60); do
+    curl -so /dev/null "http://127.0.0.1:$PORT/up" 2>/dev/null && break
+    kill -0 "$EMIT_PID" 2>/dev/null || { tail -20 "$WORK/emit-server.log"; die "the emit never came up"; }
+    sleep 1
+done
+CODE=$(curl -s -o "$WORK/scenario.out" -w '%{http_code}' \
+    -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
+    "http://127.0.0.1:$PORT/_differential/scenario")
+kill "$EMIT_PID" 2>/dev/null || true
+wait "$EMIT_PID" 2>/dev/null || true
+EMIT_PID=""
+checkpoint "$OUT/storage/development.sqlite3"
+STATUS=0
+# The overlay answers "ok", or one line per scenario statement that
+# raised on the emit (each is guarded, so the rest still ran).
+if [[ "$CODE" == 200 && "$(cat "$WORK/scenario.out")" != ok ]]; then
+    fail "scenario statements that raised on the emit:"
+    sed 's/^/  /' "$WORK/scenario.out"
+    STATUS=1
+fi
+if [[ "$CODE" != 200 ]]; then
+    fail "the scenario answered $CODE on the emit — the tables below show how far it got"
+    { grep -A8 "^TRACE" "$WORK/emit-server.log" || grep -iE "error|exception|\[campfire\] 500" "$WORK/emit-server.log"; } \
+        | sed "s|$OUT/||" | head -10 || true
+    STATUS=1
+fi
+
+# ── 4. every table ────────────────────────────────────────────────────
+step "Rails vs emit, table by table"
+ruby "$REPO_ROOT/tests/db_differential/compare.rb" "$WORK/rails.sqlite3" "$OUT/storage/development.sqlite3" \
+    || STATUS=1
+
+# ── 5. rollback: Rails on the emit's database ─────────────────────────
+step "rollback: Rails on the database the emit wrote"
+cp "$OUT/storage/development.sqlite3" "$WORK/rollback.sqlite3"
+rails "$WORK/rollback.sqlite3" runner "$REPO_ROOT/tests/db_differential/rollback.rb" || STATUS=1
+
+exit $STATUS

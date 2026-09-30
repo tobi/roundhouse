@@ -79,7 +79,7 @@ fn contains_assign(e: &Expr) -> bool {
 fn emit_node(n: &ExprNode) -> String {
     match n {
         ExprNode::Lit { value } => emit_literal(value),
-        ExprNode::Var { name, .. } => name.to_string(),
+        ExprNode::Var { name, .. } => emit_local_read(name.as_str()),
         ExprNode::Ivar { name } => format!("@{name}"),
         ExprNode::SelfRef => "self".to_string(),
         ExprNode::Const { path } => {
@@ -1039,6 +1039,17 @@ pub(super) fn emit_send_base(
                 format!("{recv_s}.{method} {}", args_s.join(", "))
             }
         }
+    }
+}
+
+/// A read of the local `name`. A reserved-word local (a keyword param
+/// such as `class:`) has no bare spelling, so the read goes through
+/// `binding`. Ingest turns that form back into the same local read.
+fn emit_local_read(name: &str) -> String {
+    if crate::naming::is_reserved_local(name) {
+        format!("binding.local_variable_get(:{name})")
+    } else {
+        name.to_string()
     }
 }
 

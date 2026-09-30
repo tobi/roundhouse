@@ -9,6 +9,12 @@ module Tep
     # plain `@params` here would be widened to that poly hash and break
     # this class's String->String reads. Same fix as req_headers.
     attr_accessor :req_params, :query, :req_headers, :raw_body, :cookies
+    # The query string as it arrived, and a multipart body's text fields
+    # by name: what `Main.request_params` builds the controller's params
+    # from with Rails' own rules (runtime/param_builder.rb). The flat
+    # hashes above keep only a repeated key's last value, and cannot say
+    # `ids[]=1&ids[]=2`.
+    attr_accessor :raw_query, :body_fields
     attr_accessor :remote_host
     attr_accessor :ivars
 
@@ -19,6 +25,8 @@ module Tep
       @http_version = "HTTP/1.0"
       @req_params       = Tep.str_hash   # path captures + query + form merged
       @query        = Tep.str_hash   # raw query string only
+      @raw_query    = +""
+      @body_fields  = Tep.str_hash
       @req_headers  = Tep.str_hash   # downcased header names; renamed
                                      # from `headers` to avoid sharing
                                      # an ivar slot with Response (spinel
@@ -41,7 +49,8 @@ module Tep
       # File parts of a multipart body, by full field name
       # (`message[attachment]`); the text parts join @req_params. The
       # typed String hash cannot hold a file, so the two travel apart
-      # and `Main.nest_params` folds both into the controller's params.
+      # and `Main.request_params` / `Main.nest_uploads` fold both into the
+      # controller's params.
       @uploads      = {}
     end
 
@@ -148,6 +157,7 @@ module Tep
         form = ActionDispatch::Http::Multipart.parse(@raw_body, @req_headers["content-type"])
         form.fields.each do |k, v|
           @req_params[k] = v
+          @body_fields[k] = v
         end
         form.files.each do |k, v|
           @uploads[k] = v

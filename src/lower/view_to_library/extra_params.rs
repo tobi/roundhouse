@@ -57,7 +57,11 @@ fn walk_for_extra(e: &Expr, bound: &[String], out: &mut Vec<String>) {
     match &*e.node {
         ExprNode::Var { name, .. } => {
             let n = name.as_str();
-            if !bound.iter().any(|b| b == n) && !out.iter().any(|x| x == n) && is_flash_name(n) {
+            // A reserved-word local (`binding.local_variable_get(:class)`
+            // in the template) has no other source than a caller's
+            // locals, so it is a partial local like `local_assigns[:x]`.
+            let partial_local = is_flash_name(n) || crate::naming::is_reserved_local(n);
+            if !bound.iter().any(|b| b == n) && !out.iter().any(|x| x == n) && partial_local {
                 out.push(n.to_string());
             }
         }

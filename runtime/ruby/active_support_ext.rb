@@ -223,6 +223,20 @@ module ActiveSupport
     out
   end
 
+  def self.stringify_keys(hash)
+    out = {}
+    hash.each { |k, v| out[k.to_s] = v }
+    out
+  end
+
+  # Not `value == false || value == 0`: ActiveModel compares its FALSE_VALUES by string too, so :off and "0" answer false.
+  def self.cast_boolean(value)
+    return nil if value.nil?
+    text = value.to_s
+    return nil if text == ""
+    !%w[0 f F false FALSE off OFF].include?(text)
+  end
+
   # AS `Array#to_sentence`: "", "a", "a and b", "a, b, and c" with the
   # :en connectors, which `lower::enumerable_ext` passes when the call
   # site names none. Another core_ext reopen (`Array`) the transpiled

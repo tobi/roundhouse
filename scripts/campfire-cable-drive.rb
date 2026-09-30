@@ -271,9 +271,9 @@ check("GET /users/me/sidebar with a group direct room", sidebar.code, "200")
 # survived its parser), creating every direct room with its creator
 # alone — and these probes stayed green. On a tree where the others
 # exist, the group room must render the partial's many-members branch.
+# (A milestone since runtime/spinel/param_builder.rb.)
 if req("GET", "/users/4").code == "200"
-  check("the group direct room has its members", sidebar.body.to_s.include?("avatar__group"), true,
-        ledger: "runtime.md: Array form params (`ids[]`) keep only the last value (spinel)")
+  check("the group direct room has its members", sidebar.body.to_s.include?("avatar__group"), true)
 end
 
 # ── two connections ───────────────────────────────────────────────────

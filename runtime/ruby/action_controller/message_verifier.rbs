@@ -17,6 +17,7 @@ module ActionController
     def self.data_envelope_json: (String data_json, String purpose, String exp) -> String
     def self.verified_data_json: (String secret, String salt, String signed, String purpose, bool sha1) -> String
     def self.extract_raw: (String envelope, String prefix) -> String
+    def self.value_end: (String s, Integer start) -> Integer
     # `::Time`, not `Time` — this sig sits inside `module
     # ActionController`, where a bare `Time` resolves to
     # `ActionController::Time` and the body's `t.utc` finds no
@@ -30,5 +31,8 @@ module ActionController
     def self.extract: (String envelope, String prefix) -> String
     def self.json_string: (String value) -> String
     def self.json_value: (String json) -> String
+    def self.unescape_char: (Integer e) -> Integer
+    def self.hex4: (String s, Integer at) -> Integer
+    def self.append_utf8: (String out, Integer cp) -> nil
   end
 end

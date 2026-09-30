@@ -1454,7 +1454,16 @@ fn every_runtime_method_body_concretely_typed() {
     // swapping `ENV["TZ"]` for the block would have changed every
     // thread's clock. Taking the zone as `untyped` cost 8; `String?` is
     // what the corpus passes (`company.timezone_name`).
-    const CEILING: usize = 504;
+    //
+    // 504 -> 507: `ActiveSupport.cast_boolean(value)` reads its untyped
+    // parameter twice (`nil?`, `to_s`) and `stringify_keys` passes each
+    // untyped value through once (active_support_ext.rb, MEASURED). The
+    // parameter is untyped because `ActiveModel::Type::Boolean#cast`
+    // takes whatever a param or a setting holds, the same trade as
+    // `blank?`. What it bought: `ActiveModel::Type::Boolean.new.cast(…)`
+    // in five corpus apps (discourse, chatwoot, mastodon, lobsters,
+    // forem), which had no method to reach on spinel.
+    const CEILING: usize = 507;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

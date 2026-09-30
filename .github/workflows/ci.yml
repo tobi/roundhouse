@@ -771,6 +771,18 @@ jobs:
       - name: cargo test --test spinel_db_lease -- --ignored
         if: always()
         run: cargo test --test spinel_db_lease -- --ignored --nocapture
+      # Rails' request-params builder, ported for the spinel dispatcher
+      # (runtime/spinel/param_builder.rb), held to Rails' answers for
+      # 2,755 query strings. The CRuby half runs in the core job.
+      - name: cargo test --test spinel_param_builder -- --ignored
+        if: always()
+        run: cargo test --test spinel_param_builder -- --ignored --nocapture
+      # Rails' signed-value vectors on the spinel-compiled verifier (the
+      # CRuby half runs in the core job), plus secrets whose derived keys
+      # hold a zero byte — the binary used to cut those keys short.
+      - name: cargo test --test rails_compat_vectors_spinel -- --ignored
+        if: always()
+        run: cargo test --test rails_compat_vectors_spinel -- --ignored --nocapture
 
   # Campfire conformance — ONCE Campfire's OWN test suite, run against a
   # roundhouse emit of it. The C4 rung of the coverage ladder, and the
@@ -841,7 +853,7 @@ jobs:
       # image's copy is older, so `bin/rails db:prepare` died on the
       # app's own hardening line.
       - name: System libvips
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev sqlite3
       - name: Cache the prepared oracle
         id: oracle
         uses: actions/cache@v4
@@ -886,6 +898,13 @@ jobs:
         run: gem install puma nio4r websocket-driver rack sqlite3 bcrypt ruby-vips concurrent-ruby net-http-persistent web-push rails-html-sanitizer --no-document
       - name: scripts/campfire-compare
         run: scripts/campfire-compare /tmp/campfire
+      # What the MODELS write: once-campfire-rust's model scenario run by
+      # Rails and by the emit from the same fixtures, every table diffed,
+      # then Rails booted on the emit's database (the rollback). Green on
+      # both lanes since it landed; see runtime.md "Campfire's models
+      # write what Rails writes".
+      - name: scripts/campfire-db-differential
+        run: scripts/campfire-db-differential /tmp/campfire
 
   # campfire-compare-spinel: the same equivalence, with the compiled
   # BINARY as the emit lane — Rails' broadcast frames vs the binary's.
@@ -970,7 +989,7 @@ jobs:
         # this program's allocator and `spin build` links `-ljemalloc`.
         # The DEV package, not libjemalloc2: the runtime library LD_PRELOAD
         # uses cannot be linked against.
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev libsqlite3-dev libjemalloc-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
         run: |
           curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
@@ -988,6 +1007,9 @@ jobs:
         run: gem install websocket-driver --no-document
       - name: scripts/campfire-compare --spinel ${{ matrix.flag }}
         run: scripts/campfire-compare --spinel ${{ matrix.flag }} /tmp/campfire
+      - name: scripts/campfire-db-differential --spinel
+        if: matrix.gc == 'default'
+        run: scripts/campfire-db-differential --spinel /tmp/campfire
 
   campfire-conformance:
     runs-on: ubuntu-latest

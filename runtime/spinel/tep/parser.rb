@@ -35,6 +35,7 @@ module Tep
         req.path  = req.raw_path[0, qmark]
         qstring   = req.raw_path[qmark + 1, req.raw_path.length - qmark - 1]
         req.query = Url.parse_query(qstring)
+        req.raw_query = qstring
       end
 
       i = 1

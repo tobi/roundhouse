@@ -168,6 +168,10 @@ require_relative "runtime/erb_spinel"
 # ViewHelpers' scalar `to_query_value`, for the two lanes whose router
 # parses it back. The CRuby overlay's boot requires the same file.
 require_relative "runtime/hash_to_query"
+# Rails' request-params builder — nests the query string and the body
+# the way ActionDispatch does, for `Main.request_params`. Spinel only:
+# the CRuby overlay's dispatcher gets its params from Rack.
+require_relative "runtime/param_builder"
 # `redirect_back_or_to` — a reopen of ActionController::Base reading the
 # parked request; ruby-family only (see the file).
 require_relative "runtime/redirect_back"
@@ -177,6 +181,15 @@ require_relative "runtime/request_forgery_protection"
 # The signatures on the session and flash cookies — the helpers the two
 # dispatchers restore and persist those cookies through (see the file).
 require_relative "runtime/signed_cookies"
+# The mocha slot `lower::mocha` prepends to an app method a test stubs
+# (`User#reset_remote_connections`): the guard is in the APP's code, so it
+# runs in production too, where it asks the registry, finds nothing and
+# falls through to the real body. It used to be required by the test
+# helper alone, and every production call reached an undefined constant
+# — destroying a membership (its after_destroy_commit resets the user's
+# connections) 500'd on both lanes. Found by once-campfire-rust's model
+# scenario (scripts/campfire-db-differential).
+require_relative "runtime/mocha_stub"
 # An Array attribute value — Rails' space-joined form and the `class:`
 # conditional list — a reopen of the shared scalar `attr_value_text`,
 # for the same reason and at the same point as the line above.

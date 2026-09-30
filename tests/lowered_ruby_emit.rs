@@ -2491,6 +2491,38 @@ fn block_tag_helper_appends_through_an_open_half_and_an_inline_close() {
     assert!(open < body && body < close && close < after, "{view_src}");
 }
 
+/// A tag helper that takes only the block (`def search_results_tag(&)`)
+/// has no signature when the variant is built; its `_open_into` still
+/// declares `io` a `String`. Left unsigned, the sidecar said `untyped io`,
+/// spinel typed the buffer POLY, and the shared handle that forces
+/// spread to campfire's page wrappers as a copy: /rooms/1 served an
+/// empty body (matz/spinel#6065).
+#[test]
+fn block_only_tag_helper_open_half_declares_a_string_buffer() {
+    let mut app = ingest_tree(&[
+        ("db/schema.rb", "ActiveRecord::Schema.define(version: 1) do\nend\n"),
+        (
+            "app/helpers/results_helper.rb",
+            "module ResultsHelper\n  def results_tag(&)\n    tag.div id: \"results\", class: \"results\", data: { controller: \"results\" }, &\n  end\nend\n",
+        ),
+        (
+            "app/views/articles/index.html.erb",
+            "<%= results_tag do %>\n  <p>inside</p>\n<% end %>\n",
+        ),
+    ]);
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    roundhouse::lower::apply_post_analyze_lowerings(&mut app, analyzer.class_registry());
+    let files = ruby::emit_library(&app);
+    let rb = find(&files, "results_helper.rb");
+    assert!(rb.contains("def self.results_tag_open_into(io)"), "open half added:\n{rb}");
+    let rbs = find(&files, "results_helper.rbs");
+    assert!(
+        rbs.contains("def self.results_tag_open_into: (String io) -> nil"),
+        "io must be String, not untyped:\n{rbs}"
+    );
+}
+
 /// The layout's header is a per-process constant: every stylesheet link
 /// and the importmap script are hoisted (`HOISTABLE_TAG_HELPERS`,
 /// `HOISTABLE_CONST_READERS`), and the `+ "\n" +` chain joining the

@@ -15,9 +15,11 @@
 # runs the slot every other target runs, the parity `lower::mocha` is
 # for.
 #
-# Test-only, ruby-family: required by the test helper, which clears the
-# registry in setup and verifies every filed expectation in teardown —
-# the same moment, and the same failure, as `mocha_verify`.
+# Required by both production boots, because the guards it serves are in
+# app code (with nothing filed, a guard finds nil and runs the real body);
+# the test helper also clears the registry in setup and verifies every
+# filed expectation in teardown — the same moment, and the same failure,
+# as `mocha_verify`.
 class MochaStub
   def initialize(name, expected)
     @name = name

@@ -1496,6 +1496,16 @@ impl Analyzer {
             /// `App::controller_resolutions` chain keeps After/Skip.
             sourced_filters: Vec<(Filter, ClassId)>,
             action_bindings: HashMap<Symbol, HashMap<Symbol, Ty>>,
+            /// Typed body per method name — own actions/private helpers,
+            /// block-filter bodies, and directly mixed-in concern
+            /// methods. The body-carrying twin of `action_bindings`
+            /// (same keys, unconditionally populated even when a
+            /// method's OWN direct writes are empty, since a method
+            /// like `authorize` — no direct `@x = ...` of its own —
+            /// still needs its body on hand as a resolution target for
+            /// [`collect_transitive_filter_ivars`] to walk *into*).
+            /// Consumed only by Phase B's `chained_bodies` table.
+            action_bodies: HashMap<Symbol, Expr>,
             /// Per-method effect sets (own actions + concern methods
             /// typed against this controller's self), for the persisted
             /// chain's per-hop effects.
@@ -1641,11 +1651,41 @@ impl Analyzer {
                     (a.name.clone(), ivars)
                 })
                 .collect();
+            // Body-carrying twin of `action_bindings` — see the field
+            // doc on `ControllerMeta::action_bodies`. Seeded
+            // unconditionally (every own action/private helper, not
+            // just the ones with a nonempty direct binding) because a
+            // filter target like `authorize` writes nothing itself but
+            // still needs to be a resolvable call target for
+            // `collect_transitive_filter_ivars`.
+            let mut action_bodies: HashMap<Symbol, Expr> =
+                controller.actions().map(|a| (a.name.clone(), a.body.clone())).collect();
 
             // Register each block filter's synthetic target so the seeding
             // lookups (`merged_before_seed`, the view-ivar build) resolve it.
             for (target, ivars) in block_filter_bindings {
                 action_bindings.insert(target, ivars);
+            }
+            // Same registration for `action_bodies`: a block-form
+            // filter's target resolves through `sourced_filters`'
+            // `Filter::block` (the full call expr the block-form filter
+            // synthesized in `build_sourced_filter_chain`) rather than
+            // through `block_filter_bindings` above, which only carries
+            // the already-extracted direct ivars, not the body itself.
+            // Re-deriving the block body here (instead of threading it
+            // out of `build_sourced_filter_chain`'s return) keeps this
+            // change out of that function, which a sibling branch also
+            // edits.
+            for (filter, _source) in &sourced_filters {
+                let Some(call_expr) = &filter.block else { continue };
+                let ExprNode::Send { block: Some(block), .. } = &*call_expr.node else {
+                    continue;
+                };
+                let body: &Expr = match &*block.node {
+                    ExprNode::Lambda { body, .. } => body,
+                    _ => block,
+                };
+                action_bodies.entry(filter.target.clone()).or_insert_with(|| body.clone());
             }
 
             // Mixed-in concerns: Rails evaluates a module's `included do`
@@ -1687,6 +1727,12 @@ impl Analyzer {
                     if !ivars.is_empty() {
                         action_bindings.insert(method.name.clone(), ivars);
                     }
+                    // Unconditional, unlike `action_bindings` above: a
+                    // concern method with no DIRECT write of its own
+                    // (`authorize`) still needs its typed body on hand
+                    // as a resolution target for
+                    // `collect_transitive_filter_ivars`.
+                    action_bodies.entry(method.name.clone()).or_insert_with(|| body.clone());
                     let effects = self.collect_effects(&mut body, &ctx);
                     if !effects.is_pure() {
                         concern_effects.entry(method.name.clone()).or_insert(effects);
@@ -1709,6 +1755,7 @@ impl Analyzer {
                     self_ty,
                     sourced_filters,
                     action_bindings,
+                    action_bodies,
                     action_effects,
                     class_constants,
                     layout,
@@ -1866,6 +1913,64 @@ impl Analyzer {
             }
             for (name, ivars) in &meta.action_bindings {
                 layer(&mut chained_bindings, &ctrl_name, name, ivars);
+            }
+
+            // Body-carrying twin of `chained_bindings`, same flat
+            // method-name → resolution table and the same
+            // nearest-definition-wins ordering (ancestors oldest-first,
+            // then self last). Unlike `chained_bindings` it carries no
+            // Phase-B refinement layer — it exists only to give
+            // `collect_transitive_filter_ivars` a body to resolve a
+            // filter target's own receiverless calls into, immediately
+            // below.
+            let mut chained_bodies: HashMap<Symbol, Expr> = HashMap::new();
+            for (_, ancestor) in ancestors.iter().rev() {
+                for (name, body) in &ancestor.action_bodies {
+                    chained_bodies.insert(name.clone(), body.clone());
+                }
+            }
+            for (name, body) in &meta.action_bodies {
+                chained_bodies.insert(name.clone(), body.clone());
+            }
+
+            // Transitive filter-target ivar writes: a Before/Around
+            // filter target whose own body writes no ivar directly, but
+            // reaches one through its own receiverless calls (Procore's
+            // `authorize` → `set_variables_in_authorize!` →
+            // `set_project_variables!` → `@project = ...`, three
+            // methods away), gets that write folded into its
+            // `chained_bindings` entry here. This runs once per
+            // controller, before either seeding sweep below, so both
+            // the per-action `merged_before_seed` overlay and the
+            // controller-wide union just below read the augmented
+            // entry for free — no other change needed to either.
+            // See `collect_transitive_filter_ivars` for the depth cap
+            // and may-write/nilability rules.
+            for (filter, _, _) in &chained_filters {
+                if !matches!(filter.kind, FilterKind::Before | FilterKind::Around) {
+                    continue;
+                }
+                let Some(target_body) = chained_bodies.get(&filter.target) else { continue };
+                let mut visited: BTreeSet<Symbol> = BTreeSet::new();
+                visited.insert(filter.target.clone());
+                let transitive = collect_transitive_filter_ivars(
+                    target_body,
+                    &chained_bodies,
+                    MAX_FILTER_CALL_DEPTH,
+                    &mut visited,
+                    true,
+                );
+                if transitive.is_empty() {
+                    continue;
+                }
+                let entry = chained_bindings.entry(filter.target.clone()).or_default();
+                for (k, v) in transitive {
+                    let merged = match entry.remove(&k) {
+                        Some(prev) => crate::analyze::body::union_of(prev, v),
+                        None => v,
+                    };
+                    entry.insert(k, merged);
+                }
             }
 
             // Controller-wide ivar environment: in Ruby, instance
@@ -4773,6 +4878,317 @@ pub(crate) fn before_filter_applies(filter: &Filter, action_name: &Symbol) -> bo
 /// same ivar is set by multiple callbacks. The chain carries all filter
 /// kinds (for `App::controller_resolutions`); only Before/Around run
 /// ahead of the action and contribute ivars here.
+/// Cap on the number of call-chain hops [`collect_transitive_filter_ivars`]
+/// will follow from a filter's target method. Four hops covers every
+/// filter → helper → helper → helper chain seen in practice — Procore's
+/// `authorize` → `set_variables_in_authorize!` → `set_project_variables!`
+/// → `@project = ...` is two hops from the filter target, and
+/// `set_project_variables!` → `set_provider_variables!` → `@domain =
+/// ...` a third — while still bounding the walk against a runaway or
+/// accidentally-cyclic call graph. A chain longer than the cap simply
+/// stays unresolved past the cut, same as today's zero-hop behavior.
+const MAX_FILTER_CALL_DEPTH: usize = 4;
+
+/// Ivar writes reachable from `expr` (a filter target's own body, or a
+/// method it transitively calls) by following every receiverless
+/// self-call (`foo`, `self.foo`, `foo(args)`) into its resolved body,
+/// recursively, up to `depth` hops. `bodies` is the flat method-name →
+/// typed-body table built in `run_typing_passes` as `chained_bodies` —
+/// the same resolution order dispatch itself uses: the controller's own
+/// methods, its ancestors (nearest first), and every directly or
+/// transitively mixed-in concern.
+///
+/// This is may-write semantics — the same kind the direct (non-
+/// transitive) filter-body seeding in [`extract_ivar_assignments`]
+/// already performs within ONE method body (union whatever every
+/// branch writes; never evaluate which branch actually runs) — carried
+/// across call boundaries instead of stopping at them:
+///
+///   - A call reached unconditionally (the top level of a `Seq`, or
+///     every alternative of a branching construct) contributes its
+///     callee's writes as-is, unioned with whatever else is reachable.
+///   - A call reached on only SOME alternative of an `If`/`Case`/
+///     `BoolOp`/loop/rescue (the other alternative(s) don't reach an
+///     equivalent write) contributes its writes with a `Ty::Nil` arm
+///     unioned in for the alternatives that don't write it — see
+///     [`merge_alternative_branches`]. This is what turns Procore's
+///     `@project` (written only on the `if self.class.project_area?`
+///     arm of `set_variables_in_authorize!`, with `company_area?` /
+///     `super_area?` / an `else` that logs and returns) into
+///     `Project?` rather than a false unconditional `Project`: the
+///     union of "`Project` on one arm" and "nothing on the other
+///     three" is nilable, not `Project`. That is strictly better than
+///     today's `ivar_unresolved` on `@project` and does not misreport
+///     the one case that matters (a caller that reads `@project`
+///     without a nil check on a path where it truly is always set
+///     still gets `Project?`, a conservative widening, never a false
+///     `Project` that would hide a real nil).
+///   - Class-side predicates on the controller's own class
+///     (`self.class.project_area?`, `self.class.company_area?`, ...)
+///     and conditions behind feature flags or other calls this
+///     analyzer can't evaluate (`unless feature_active?(...)`) are
+///     NEVER evaluated for their value — this function only ever reads
+///     a branching node's *branches*, not its condition's truthiness,
+///     so "both/every arm may run" falls out automatically rather than
+///     needing a special case per condition shape.
+///
+/// `visited` is the current call STACK (pushed on entry to a callee,
+/// popped on return), not a global "ever seen" set: a diamond-shaped
+/// call graph (two different callees that both reach a common helper)
+/// still gets that helper's contribution on both paths; only a genuine
+/// cycle (mutual or self-recursion) is cut off, with the depth cap as
+/// the backstop for a long-but-non-cyclic chain.
+fn collect_transitive_filter_ivars(
+    expr: &Expr,
+    bodies: &HashMap<Symbol, Expr>,
+    depth: usize,
+    visited: &mut BTreeSet<Symbol>,
+    own: bool,
+) -> HashMap<Symbol, Ty> {
+    if depth == 0 {
+        return HashMap::new();
+    }
+    match &*expr.node {
+        ExprNode::Seq { exprs } => {
+            let mut out = HashMap::new();
+            for e in exprs {
+                union_ivar_maps(&mut out, collect_transitive_filter_ivars(e, bodies, depth, visited, own));
+            }
+            out
+        }
+        // The condition is never evaluated (see doc above) — only
+        // walked for calls of its own (`unless feature_active?(...)`
+        // is itself a receiverless call, followed like any other).
+        // `then_branch`/`else_branch` are alternatives: Ruby's `if`
+        // with no `else` types the missing branch as a Nil-producing
+        // no-op, which `merge_alternative_branches` needs as an
+        // explicit empty contribution to make an only-one-arm write
+        // nilable — it's already exactly that shape here because
+        // `else_branch` is a literal `nil` expression when the source
+        // omitted one, and walking it yields `{}`.
+        ExprNode::If { cond, then_branch, else_branch } => {
+            let mut out = collect_transitive_filter_ivars(cond, bodies, depth, visited, own);
+            let branches = vec![
+                collect_transitive_filter_ivars(then_branch, bodies, depth, visited, own),
+                collect_transitive_filter_ivars(else_branch, bodies, depth, visited, own),
+            ];
+            union_ivar_maps(&mut out, merge_alternative_branches(branches));
+            out
+        }
+        ExprNode::Case { scrutinee, arms } => {
+            let mut out = collect_transitive_filter_ivars(scrutinee, bodies, depth, visited, own);
+            let mut branches: Vec<HashMap<Symbol, Ty>> = arms
+                .iter()
+                .map(|arm| collect_transitive_filter_ivars(&arm.body, bodies, depth, visited, own))
+                .collect();
+            // No `when`/pattern may match — Ruby's `case` with nothing
+            // matching (and no `else`) evaluates to nil — so an
+            // implicit empty alternative is added even when every
+            // explicit arm agrees, otherwise an exhaustive-looking
+            // `case` would wrongly type as non-nilable.
+            branches.push(HashMap::new());
+            union_ivar_maps(&mut out, merge_alternative_branches(branches));
+            out
+        }
+        ExprNode::BoolOp { left, right, .. } => {
+            let mut out = collect_transitive_filter_ivars(left, bodies, depth, visited, own);
+            let right_out = collect_transitive_filter_ivars(right, bodies, depth, visited, own);
+            // `right` only evaluates if `left` doesn't short-circuit
+            // the operator — may-not-run, same treatment as an `If`
+            // with no `else`.
+            union_ivar_maps(&mut out, merge_alternative_branches(vec![right_out, HashMap::new()]));
+            out
+        }
+        ExprNode::While { cond, body, .. } => {
+            let mut out = collect_transitive_filter_ivars(cond, bodies, depth, visited, own);
+            let body_out = collect_transitive_filter_ivars(body, bodies, depth, visited, own);
+            // The body may run zero times.
+            union_ivar_maps(&mut out, merge_alternative_branches(vec![body_out, HashMap::new()]));
+            out
+        }
+        ExprNode::RescueModifier { expr: e, fallback } => {
+            let mut out = collect_transitive_filter_ivars(e, bodies, depth, visited, own);
+            let fb = collect_transitive_filter_ivars(fallback, bodies, depth, visited, own);
+            union_ivar_maps(&mut out, merge_alternative_branches(vec![fb, HashMap::new()]));
+            out
+        }
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            let mut out = collect_transitive_filter_ivars(body, bodies, depth, visited, own);
+            let mut alt: Vec<HashMap<Symbol, Ty>> = rescues
+                .iter()
+                .map(|r| collect_transitive_filter_ivars(&r.body, bodies, depth, visited, own))
+                .collect();
+            alt.push(HashMap::new()); // no rescue triggers
+            union_ivar_maps(&mut out, merge_alternative_branches(alt));
+            if let Some(e) = else_branch {
+                union_ivar_maps(&mut out, collect_transitive_filter_ivars(e, bodies, depth, visited, own));
+            }
+            if let Some(e) = ensure {
+                union_ivar_maps(&mut out, collect_transitive_filter_ivars(e, bodies, depth, visited, own));
+            }
+            out
+        }
+        // The call-following core: a receiverless send (`foo`,
+        // `foo(args)`) or an explicit-self send (`self.foo`) resolves
+        // against `bodies` exactly like `authorize` → `set_variables_
+        // in_authorize!` in the doc comment above. Any other receiver
+        // (`@provider.tools`, `Project.find(...)`) is not followed —
+        // only OWN-class dispatch is in scope here — but is still
+        // walked structurally so a self-call buried in its receiver,
+        // args, or block is still found.
+        ExprNode::Send { recv, method, args, block, .. } => {
+            let mut out = HashMap::new();
+            let is_self_call = match recv {
+                None => true,
+                Some(r) => matches!(&*r.node, ExprNode::SelfRef),
+            };
+            if is_self_call {
+                if let Some(callee_body) = bodies.get(method) {
+                    if visited.insert(method.clone()) {
+                        // One recursive call finds BOTH the callee's own
+                        // direct writes and whatever it further calls —
+                        // the Assign/OpAssign/MultiAssign arms below
+                        // record a direct write with the same
+                        // branch-aware nilability as everything else in
+                        // this function. Do not swap this for a plain
+                        // `extract_ivar_assignments(callee_body, ..)`:
+                        // that function's own `If`/`Case` arms union
+                        // every branch's writes WITHOUT a Nil arm for
+                        // "this branch didn't write it" (correct for
+                        // its existing direct, single-body callers,
+                        // which never needed that distinction) — using
+                        // it here silently discarded the nilability
+                        // this function exists to add, which is exactly
+                        // how `set_variables_in_authorize!`'s `@project`
+                        // (real one arm of an if/elsif/elsif/else) was
+                        // first observed coming out as non-nilable
+                        // `Project` instead of `Project?`.
+                        union_ivar_maps(
+                            &mut out,
+                            collect_transitive_filter_ivars(
+                                callee_body,
+                                bodies,
+                                depth - 1,
+                                visited,
+                                false,
+                            ),
+                        );
+                        visited.remove(method);
+                    }
+                }
+            }
+            if let Some(r) = recv {
+                union_ivar_maps(&mut out, collect_transitive_filter_ivars(r, bodies, depth, visited, own));
+            }
+            for a in args {
+                union_ivar_maps(&mut out, collect_transitive_filter_ivars(a, bodies, depth, visited, own));
+            }
+            if let Some(b) = block {
+                union_ivar_maps(&mut out, collect_transitive_filter_ivars(b, bodies, depth, visited, own));
+            }
+            out
+        }
+        ExprNode::Lambda { body, .. } => collect_transitive_filter_ivars(body, bodies, depth, visited, own),
+        ExprNode::Let { value, body, .. } => {
+            let mut out = collect_transitive_filter_ivars(value, bodies, depth, visited, own);
+            union_ivar_maps(&mut out, collect_transitive_filter_ivars(body, bodies, depth, visited, own));
+            out
+        }
+        ExprNode::Return { value } | ExprNode::Raise { value } => {
+            collect_transitive_filter_ivars(value, bodies, depth, visited, own)
+        }
+        // A direct ivar write, recorded the same way
+        // `extract_ivar_assignments` records one — from `value.ty`,
+        // unioned with anything already known for that name — except
+        // this arm sits inside the branch-aware walk above, so a write
+        // that only some `If`/`Case` alternatives reach still gets its
+        // Nil arm from `merge_alternative_branches` at the enclosing
+        // branch node, not lost the way going through
+        // `extract_ivar_assignments` on the whole callee body would.
+        ExprNode::Assign { target: LValue::Ivar { name }, value }
+        | ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. } => {
+            let mut out = collect_transitive_filter_ivars(value, bodies, depth, visited, own);
+            if !own {
+                if let Some(ty) = value.ty.clone() {
+                    union_ivar_maps(&mut out, HashMap::from([(name.clone(), ty)]));
+                }
+            }
+            out
+        }
+        // `@a, @b = expr` — same per-position typing
+        // `extract_ivar_assignments` uses for the non-transitive case.
+        ExprNode::MultiAssign { targets, value } => {
+            let mut out = collect_transitive_filter_ivars(value, bodies, depth, visited, own);
+            for (i, target) in targets.iter().enumerate() {
+                if let (LValue::Ivar { name }, false) = (target, own) {
+                    if let Some(ty) = body::multiassign_target_ty(&value.ty, i) {
+                        union_ivar_maps(&mut out, HashMap::from([(name.clone(), ty)]));
+                    }
+                }
+            }
+            out
+        }
+        // Any other assignment target (local var, constant, attribute,
+        // `@hash[k] = v` index write). Only the RHS/index can hide a
+        // further call or a nested ivar write; the target itself
+        // contributes nothing here (the Hash-value-widening
+        // `extract_ivar_assignments` does for `@hash[k] = v` is a
+        // refinement this transitive walk doesn't attempt — out of
+        // scope for the filter-chain gap this function targets).
+        ExprNode::Assign { target, value } | ExprNode::OpAssign { target, value, .. } => {
+            let mut out = collect_transitive_filter_ivars(value, bodies, depth, visited, own);
+            if let LValue::Index { recv, index } = target {
+                union_ivar_maps(&mut out, collect_transitive_filter_ivars(recv, bodies, depth, visited, own));
+                union_ivar_maps(&mut out, collect_transitive_filter_ivars(index, bodies, depth, visited, own));
+            }
+            out
+        }
+        _ => HashMap::new(),
+    }
+}
+
+/// Union `incoming` into `out`, joining any overlapping key with
+/// [`union_of`] (accumulate, matching `extract_ivar_assignments`'s
+/// treatment of repeated writes — never last-write-wins).
+fn union_ivar_maps(out: &mut HashMap<Symbol, Ty>, incoming: HashMap<Symbol, Ty>) {
+    for (k, v) in incoming {
+        let merged = match out.remove(&k) {
+            Some(prev) => crate::analyze::body::union_of(prev, v),
+            None => v,
+        };
+        out.insert(k, merged);
+    }
+}
+
+/// Merge mutually-exclusive branch contributions (the arms of an `if`/
+/// `case`/loop/rescue): a key written on every branch keeps the union
+/// of its per-branch types; a key written on only SOME branches gets
+/// `Ty::Nil` unioned in for the branches that don't write it, because
+/// only one alternative actually runs at request time and it might be
+/// one of the ones that doesn't. `union_of(_, Ty::Nil)` widens whatever
+/// the other branches contributed into a nilable union.
+fn merge_alternative_branches(branches: Vec<HashMap<Symbol, Ty>>) -> HashMap<Symbol, Ty> {
+    let mut keys: BTreeSet<Symbol> = BTreeSet::new();
+    for b in &branches {
+        keys.extend(b.keys().cloned());
+    }
+    let mut out = HashMap::new();
+    for k in keys {
+        let mut ty: Option<Ty> = None;
+        for b in &branches {
+            let contribution = b.get(&k).cloned().unwrap_or(Ty::Nil);
+            ty = Some(match ty {
+                Some(prev) => crate::analyze::body::union_of(prev, contribution),
+                None => contribution,
+            });
+        }
+        if let Some(t) = ty {
+            out.insert(k, t);
+        }
+    }
+    out
+}
+
 fn merged_before_seed(
     chained_filters: &[(Filter, ClassId, ClassId)],
     action_name: &Symbol,

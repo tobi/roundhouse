@@ -260,19 +260,49 @@ module ActionController
       extract_raw(env, "\"data\":")
     end
 
-    # `extract` reads a QUOTED field; `data` is a bare JSON value, so it
-    # ends at the next `,` or `}` instead of at the next quote. An id is
-    # an Integer or a String id; either way it stops at the same place,
-    # because a String id's own quotes are inside the run.
+    # `data` is a bare JSON value — an Integer id, a quoted String, or an
+    # object (Active Storage's blob keys) — so it runs to the end of that
+    # VALUE: past a string's escaped quotes, and over the commas and
+    # braces inside an object, which the first-`,`-or-`}` scan this used
+    # to be cut short (tests/rails_compat_vectors.rb, `blob_key`).
     def self.extract_raw(envelope, prefix)
       at = envelope.index(prefix)
       return "" if at.nil?
-      rest = at + prefix.length
-      comma = envelope.index(",", rest)
-      brace = envelope.index("}", rest)
-      close = comma.nil? ? brace : (brace.nil? ? comma : (comma < brace ? comma : brace))
-      return "" if close.nil?
-      envelope[rest, close - rest]
+      start = at + prefix.length
+      close = value_end(envelope, start)
+      return "" if close < 0
+      envelope[start, close - start]
+    end
+
+    # Where the JSON value starting at `start` ends (exclusive), or -1.
+    def self.value_end(s, start)
+      depth = 0
+      in_string = false
+      i = start
+      n = s.length
+      while i < n
+        c = s[i]
+        if in_string
+          if c == "\\"
+            i += 1
+          elsif c == "\""
+            in_string = false
+            return i + 1 if depth == 0
+          end
+        elsif c == "\""
+          in_string = true
+        elsif c == "{" || c == "["
+          depth += 1
+        elsif c == "}" || c == "]"
+          return i if depth == 0
+          depth -= 1
+          return i + 1 if depth == 0
+        elsif c == ","
+          return i if depth == 0
+        end
+        i += 1
+      end
+      -1
     end
 
     # `ActiveSupport::SecurityUtils.secure_compare`, which is what Rails'
@@ -311,18 +341,142 @@ module ActionController
       envelope[rest, close - rest]
     end
 
-    # The message is JSON, and every value the cookie jar signs is a
-    # String, so the serializer round-trip is quote-wrapping. A
-    # non-string message (Rails would allow one) is handed back verbatim
-    # rather than guessed at.
+    # A String as ActiveSupport's JSON writes it — what Rails' cookie jar
+    # and its message serializer put inside every signed value:
+    # `"` and `\` escaped, control characters as `\n`/`\t`/… or `\u00XX`,
+    # and `<`, `>`, `&` as `\u003c`/`\u003e`/`\u0026`
+    # (`escape_html_entities_in_json`). Everything else goes through as
+    # its UTF-8 bytes, U+2028/U+2029 included under 8.x defaults. Held to
+    # the JSON inside Rails' own signed cookies by
+    # tests/rails_compat_vectors.rb (`json_string`).
+    #
+    # It was quote-wrapping, which wrote a quote or a backslash into the
+    # envelope bare. BYTE-WISE, like the rest of this file, so CRuby never
+    # meets an encoding clash and spinel sees the same bytes.
     def self.json_string(value)
-      "\"" + value.to_s + "\""
+      s = value.to_s
+      out = +"\""
+      i = 0
+      n = s.bytesize
+      while i < n
+        b = s.getbyte(i)
+        if b == 34
+          out << "\\\""
+        elsif b == 92
+          out << "\\\\"
+        elsif b == 60
+          out << "\\u003c"
+        elsif b == 62
+          out << "\\u003e"
+        elsif b == 38
+          out << "\\u0026"
+        elsif b == 10
+          out << "\\n"
+        elsif b == 13
+          out << "\\r"
+        elsif b == 9
+          out << "\\t"
+        elsif b == 8
+          out << "\\b"
+        elsif b == 12
+          out << "\\f"
+        elsif b < 32
+          out << "\\u" + format("%04x", b)
+        else
+          out << b.chr
+        end
+        i += 1
+      end
+      out << "\""
+      out.force_encoding("UTF-8")
     end
 
+    # The inverse, for a JSON String; anything else (an Integer id, an
+    # object) is handed back verbatim for the caller to read. Every JSON
+    # string escape is undone — `\uXXXX` (surrogate pairs joined) to its
+    # UTF-8 bytes — where this used to strip the quotes and keep the
+    # escapes, so a value Rails signed with a `<` or a newline in it read
+    # back as `\u003c` / `\n`.
     def self.json_value(json)
       return json if json.length < 2
       return json if json[0, 1] != "\""
-      json[1, json.length - 2]
+      out = +""
+      i = 1
+      n = json.bytesize - 1
+      while i < n
+        b = json.getbyte(i)
+        if b == 92 && i + 1 < n
+          e = json.getbyte(i + 1)
+          if e == 117 && i + 5 < n + 1
+            cp = hex4(json, i + 2)
+            i += 6
+            if cp >= 0xD800 && cp <= 0xDBFF && i + 5 < n + 1 &&
+               json.getbyte(i) == 92 && json.getbyte(i + 1) == 117
+              low = hex4(json, i + 2)
+              if low >= 0xDC00 && low <= 0xDFFF
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                i += 6
+              end
+            end
+            append_utf8(out, cp)
+          else
+            out << unescape_char(e).chr
+            i += 2
+          end
+        else
+          out << b.chr
+          i += 1
+        end
+      end
+      out.force_encoding("UTF-8")
+    end
+
+    # `\n` and friends: the byte a one-letter escape stands for (`\"`,
+    # `\\` and `\/` stand for themselves).
+    def self.unescape_char(e)
+      return 10 if e == 110
+      return 13 if e == 114
+      return 9 if e == 116
+      return 8 if e == 98
+      return 12 if e == 102
+      e
+    end
+
+    # Four hex digits at byte `at` as an Integer, or -1.
+    def self.hex4(s, at)
+      v = 0
+      k = 0
+      while k < 4
+        d = s.getbyte(at + k)
+        digit = -1
+        digit = d - 48 if d >= 48 && d <= 57
+        digit = d - 87 if d >= 97 && d <= 102
+        digit = d - 55 if d >= 65 && d <= 70
+        return -1 if digit < 0
+        v = v * 16 + digit
+        k += 1
+      end
+      v
+    end
+
+    # A code point's UTF-8 bytes, onto `out`.
+    def self.append_utf8(out, cp)
+      if cp < 0x80
+        out << cp.chr
+      elsif cp < 0x800
+        out << (0xC0 | (cp >> 6)).chr
+        out << (0x80 | (cp & 0x3F)).chr
+      elsif cp < 0x10000
+        out << (0xE0 | (cp >> 12)).chr
+        out << (0x80 | ((cp >> 6) & 0x3F)).chr
+        out << (0x80 | (cp & 0x3F)).chr
+      else
+        out << (0xF0 | (cp >> 18)).chr
+        out << (0x80 | ((cp >> 12) & 0x3F)).chr
+        out << (0x80 | ((cp >> 6) & 0x3F)).chr
+        out << (0x80 | (cp & 0x3F)).chr
+      end
+      nil
     end
   end
 end

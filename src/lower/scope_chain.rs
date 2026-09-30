@@ -3106,6 +3106,19 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         ExprNode::Send { .. } if owner_reads_once(ir) => {
                             assoc_owner_seed(ctx, aname, ir, span)
                         }
+                        // Any other owner EXPRESSION, for a constructor
+                        // only: `Room.find(id).messages.create!(…)`.
+                        // `owner_reads_once` guards the chain seeding,
+                        // but a constructor's rewrite drops the original
+                        // receiver and names the owner exactly once (as
+                        // `<fk>: <owner>.id`), so the owner is evaluated
+                        // once either way. Declined, the call stayed on
+                        // the plain reader's Array — `create!` for an
+                        // instance of Array, found by once-campfire-rust's
+                        // model scenario (scripts/campfire-db-differential).
+                        _ if matches!(method.as_str(), "build" | "create" | "create!") => {
+                            assoc_owner_seed(ctx, aname, ir, span)
+                        }
                         _ => None,
                     };
                     if let Some((target, fk, owner_id)) = resolved {

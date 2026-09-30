@@ -1071,6 +1071,63 @@ const POSITION_SENSITIVE_MARKERS: &[&str] = &[
     "require_relative",
 ];
 
+/// `def self.included(klass); class << klass; def foo; …; end; end; end`
+/// — the vanilla-Ruby spelling of ActiveSupport::Concern's `class_methods
+/// do … end` / `module ClassMethods` sugar (handled below in
+/// [`walk_decl_body`] and mirrored in [`ingest_concern_class_method_names`]).
+/// Procore's shared search concerns (`app/concerns/search_engine/
+/// {indexed,procore_search,tool_search,incrementally_backfillable}.rb`
+/// and more) skip `ActiveSupport::Concern` entirely and open the
+/// includer's singleton directly from the `Module#included` callback.
+/// Semantically identical to Concern's `base.extend ClassMethods`: the
+/// hook's own parameter IS the including class, so `class << klass`
+/// reaches the same object. Without recognizing this shape, the
+/// `SingletonClassNode` lands in the general expression walker (via
+/// `ingest_library_method`'s body), which has no arm for a singleton
+/// class opened on a local variable and hits the "unsupported
+/// expression node" catch-all — failing the WHOLE file's ingest and
+/// fanning out into thousands of downstream unresolved-type notes for
+/// every reference into these widely-included concerns.
+///
+/// Deliberately narrow — only the `included` hook, only a single
+/// required parameter and nothing else in the signature, and the
+/// singleton must open exactly that parameter (not a differently-named
+/// local or an ivar) — so this never mis-attributes unrelated method-
+/// body metaprogramming as includer class methods (invariant 6).
+fn included_hook_class_methods_body<'pr>(
+    def: &ruby_prism::DefNode<'pr>,
+) -> Option<ruby_prism::Node<'pr>> {
+    let receiver = def.receiver()?;
+    receiver.as_self_node()?;
+    if constant_id_str(&def.name()) != "included" {
+        return None;
+    }
+    let params = def.parameters()?;
+    if params.optionals().iter().next().is_some()
+        || params.keywords().iter().next().is_some()
+        || params.rest().is_some()
+        || params.posts().iter().next().is_some()
+        || params.block().is_some()
+    {
+        return None;
+    }
+    let mut requireds = params.requireds().iter();
+    let only_param = requireds.next()?.as_required_parameter_node()?;
+    if requireds.next().is_some() {
+        return None;
+    }
+    let param_name = constant_id_str(&only_param.name());
+
+    let stmts = flatten_statements(def.body()?);
+    let [stmt] = &stmts[..] else { return None };
+    let sc = stmt.as_singleton_class_node()?;
+    let lv = sc.expression().as_local_variable_read_node()?;
+    if constant_id_str(&lv.name()) != param_name {
+        return None;
+    }
+    sc.body()
+}
+
 fn walk_decl_body<'pr>(
     body: Option<ruby_prism::Node<'pr>>,
     owner: &ClassId,
@@ -1177,6 +1234,20 @@ fn walk_decl_body<'pr>(
             continue;
         }
         if let Some(def) = stmt.as_def_node() {
+            // `def self.included(klass); class << klass ... end; end` —
+            // see `included_hook_class_methods_body`. Folds into the
+            // same class-receiver-methods bucket as `class_methods do`
+            // / `module ClassMethods`, and (like those) contributes no
+            // `included` method of its own.
+            if let Some(singleton_body) = included_hook_class_methods_body(&def) {
+                let (inner_includes, inner_methods, inner_constants, inner_unknown) =
+                    walk_decl_body(Some(singleton_body), owner, file, true)?;
+                includes.extend(inner_includes);
+                methods.extend(inner_methods);
+                constants.extend(inner_constants);
+                unknown_calls.extend(inner_unknown);
+                continue;
+            }
             let mut m = ingest_library_method(&def, owner, file)?;
             if force_class_receiver || module_function_active {
                 m.receiver = MethodReceiver::Class;
@@ -2162,6 +2233,19 @@ pub fn ingest_concern_class_method_names(source: &[u8]) -> Vec<(ClassId, Vec<Sym
                     if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
                         defs_in(block.body(), &mut names);
                     }
+                }
+            }
+            // `def self.included(klass); class << klass ... end; end` —
+            // see `included_hook_class_methods_body`'s doc comment. The
+            // third spelling of Concern's class-side carrier; needs its
+            // own arm here (this is a from-scratch parse, deliberately
+            // not sharing `walk_decl_body`'s tuple — see the doc comment
+            // above this function) so the concern fold copies these
+            // names onto includers exactly as it does for `class_methods
+            // do` / `module ClassMethods`.
+            if let Some(def) = stmt.as_def_node() {
+                if let Some(singleton_body) = included_hook_class_methods_body(&def) {
+                    defs_in(Some(singleton_body), &mut names);
                 }
             }
         }

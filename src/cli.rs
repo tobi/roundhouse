@@ -224,6 +224,21 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     if had_output {
         eprintln!();
     }
+    // Which app-layer roots ingest actually walked — silent for the
+    // common one-root case (so the fixtures' expected output stays
+    // unchanged), printed for a Packwerk app so a run proves
+    // `packs/*/app` (or `components/*`, `engines/*`) was in scope
+    // rather than silently limited to the root `app/`.
+    if app.app_roots.len() > 1 {
+        const MAX_SHOWN: usize = 8;
+        let shown: Vec<&str> = app.app_roots.iter().take(MAX_SHOWN).map(String::as_str).collect();
+        let mut line =
+            format!("roundhouse-check: {} app root(s): {}", app.app_roots.len(), shown.join(", "));
+        if app.app_roots.len() > MAX_SHOWN {
+            line.push_str(&format!(", … and {} more", app.app_roots.len() - MAX_SHOWN));
+        }
+        eprintln!("{line}");
+    }
     // The gem census: which of the app's declared gems the analyzer
     // models, which never enter the analysis, and which it does not
     // know — read beside the errors, the unknown list is the

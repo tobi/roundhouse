@@ -30,10 +30,39 @@ use super::library_class::{
 use super::model::ingest_model;
 use super::routes::ingest_routes_with_dsl;
 use super::schema::{ingest_migration, ingest_schema};
+use super::structure_sql::ingest_structure_sql;
 use super::test::ingest_test_files;
 use super::view::{ViewEngine, ingest_template};
 use super::survey::{self, unwrap_or_record};
 use super::{IngestError, IngestResult};
+
+/// Read a file's bytes for one of the per-file walks below (ERB,
+/// jbuilder, models, controllers, migrations, `structure.sql`, routes
+/// split files, …). An unreadable file — the shape that matters in
+/// practice is a symlink whose target is absent (Procore's
+/// `app/views/shared/_princess_footer.pdf.erb` points into a
+/// `components/` package that can be missing from a given checkout) —
+/// used to propagate through the walk's `?` and abort the ENTIRE app
+/// ingest over one bad file. In survey mode this records a `file not
+/// readable` gap and returns `None` so the caller skips just that
+/// file, the same as any other per-file gap; in strict mode it still
+/// propagates — that is what strict mode is for.
+fn read_or_ledger<V: Vfs + ?Sized>(vfs: &V, path: &Path) -> IngestResult<Option<Vec<u8>>> {
+    unwrap_or_record(vfs.read(path).map_err(|e| IngestError::Unsupported {
+        file: path.display().to_string(),
+        message: format!("file not readable: {e} ({})", path.display()),
+    }))
+}
+
+/// String-reading twin of [`read_or_ledger`] — same ledger-or-propagate
+/// behavior, for the ERB/jbuilder/rbs walks that read UTF-8 text
+/// directly rather than raw bytes.
+fn read_to_string_or_ledger<V: Vfs + ?Sized>(vfs: &V, path: &Path) -> IngestResult<Option<String>> {
+    unwrap_or_record(vfs.read_to_string(path).map_err(|e| IngestError::Unsupported {
+        file: path.display().to_string(),
+        message: format!("file not readable: {e} ({})", path.display()),
+    }))
+}
 
 /// Ingest an entire Rails app directory from disk.
 ///
@@ -230,24 +259,68 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     }
 
     let schema_path = dir.join("db/schema.rb");
+    let structure_path = dir.join("db/structure.sql");
     if vfs.exists(&schema_path) {
-        let source = vfs.read(&schema_path)?;
-        if let Some(schema) =
-            unwrap_or_record(ingest_schema(&source, &schema_path.display().to_string()))?
-        {
-            app.schema = schema;
+        if let Some(source) = read_or_ledger(vfs, &schema_path)? {
+            if let Some(schema) =
+                unwrap_or_record(ingest_schema(&source, &schema_path.display().to_string()))?
+            {
+                app.schema = schema;
+            }
+        }
+    } else if vfs.exists(&structure_path) {
+        // `config.active_record.schema_format = :sql` apps (Postgres,
+        // typically) never write schema.rb — `rails db:schema:dump`
+        // writes a raw `pg_dump` DDL dump instead. Same canonical-
+        // snapshot role, just SQL instead of the Rails DSL.
+        if let Some(source) = read_or_ledger(vfs, &structure_path)? {
+            if let Some(schema) = unwrap_or_record(ingest_structure_sql(
+                &source,
+                &structure_path.display().to_string(),
+            ))? {
+                app.schema = schema;
+            }
         }
     } else {
-        // No schema.rb (never migrated locally, gitignored, or a
-        // migrations-only app) — recover the same column facts by
-        // folding db/migrate/*.rb in filename order (timestamp
-        // prefixes sort chronologically). schema.rb stays canonical
-        // when both exist: it's the already-folded form.
-        let migrate_dir = dir.join("db/migrate");
-        if vfs.is_dir(&migrate_dir) {
+        // No schema.rb or structure.sql (never migrated locally,
+        // gitignored, or a migrations-only app) — recover the same
+        // column facts by folding every `db/migrate*/*.rb` in
+        // filename order across every migrate directory. A long-lived
+        // app sometimes splits old migrations into `db/migrate-YYYY`
+        // siblings of `db/migrate` (Procore's `db/migrate-2010` …
+        // `db/migrate-2023`); folding only `db/migrate` would silently
+        // miss every table those older migrations created. Sorted by
+        // filename alone (not full path) since Rails' timestamp prefix
+        // is what makes the order chronological — the directory a file
+        // happens to live in isn't. schema.rb / structure.sql stay
+        // canonical when either exists: they're the already-folded form.
+        let mut migrate_dirs: Vec<PathBuf> = Vec::new();
+        let default_migrate_dir = dir.join("db/migrate");
+        if vfs.is_dir(&default_migrate_dir) {
+            migrate_dirs.push(default_migrate_dir);
+        }
+        let db_dir = dir.join("db");
+        if vfs.is_dir(&db_dir) {
+            for entry in vfs.read_dir(&db_dir)? {
+                let is_sibling_migrate_dir = vfs.is_dir(&entry)
+                    && entry
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("migrate-"));
+                if is_sibling_migrate_dir {
+                    migrate_dirs.push(entry);
+                }
+            }
+        }
+        if !migrate_dirs.is_empty() {
+            let mut files: Vec<PathBuf> = Vec::new();
+            for migrate_dir in &migrate_dirs {
+                files.extend(read_rb_files(vfs, migrate_dir)?);
+            }
+            files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
             let mut schema = crate::schema::Schema::default();
-            for entry in read_rb_files(vfs, &migrate_dir)? {
-                let source = vfs.read(&entry)?;
+            for entry in files {
+                let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
                 unwrap_or_record(ingest_migration(
                     &source,
                     &entry.display().to_string(),
@@ -258,7 +331,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         }
     }
 
-    let models_dir = dir.join("app/models");
+    // App-layer roots: `app`, plus `<pkg>/app` for every Packwerk
+    // package that has one. Every layer walk below loops over these
+    // instead of a single hardwired `app/…` — see `app_roots`'s doc
+    // comment for why a Packwerk app needs more than one.
+    let roots = app_roots(vfs, dir);
+    app.app_roots = roots.iter().map(|r| r.display().to_string()).collect();
     // A namespace's `table_name_prefix` has to be known BEFORE the model
     // it prefixes is ingested, and file order does not guarantee that
     // (`push/subscription.rb` may be read before `push.rb`). One cheap
@@ -284,9 +362,13 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // another file, possibly later.
     let mut model_bases = super::library_class::ModelBases::new();
     let mut base_pairs: Vec<(String, String)> = Vec::new();
-    if vfs.is_dir(&models_dir) {
+    for root in &roots {
+        let models_dir = dir.join(root).join("models");
+        if !vfs.is_dir(&models_dir) {
+            continue;
+        }
         for entry in read_rb_files(vfs, &models_dir)? {
-            let source = vfs.read(&entry)?;
+            let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             table_prefixes
                 .extend(super::model::ingest_table_name_prefixes(&source, &entry.display().to_string()));
             model_bases.record(&source, &mut base_pairs);
@@ -296,7 +378,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // package under `lib/`, or in whatever the app adds to its
     // autoload paths. Collected before anything is classified, so a
     // model in either tree resolves against a base in either tree.
-    for sub in support_roots(vfs, dir, &lib_ignores) {
+    for sub in support_roots(vfs, dir, &roots, &lib_ignores) {
         let support_dir = dir.join(sub.as_str());
         if !vfs.is_dir(&support_dir) {
             continue;
@@ -312,9 +394,13 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         }
     }
     model_bases.close_over(&base_pairs);
-    if vfs.is_dir(&models_dir) {
+    for root in &roots {
+        let models_dir = dir.join(root).join("models");
+        if !vfs.is_dir(&models_dir) {
+            continue;
+        }
         for entry in read_rb_files(vfs, &models_dir)? {
-            let source = vfs.read(&entry)?;
+            let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             let path_str = entry.display().to_string();
             match classify_class_file(&source, &model_bases) {
                 Some(ClassKind::Model) | None => {
@@ -411,7 +497,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // files itself, from an initializer — and dropping them lost
     // `String#all_emoji?`, which every message row calls. A subdir some
     // initializer explicitly requires is app code after all.
-    for sub in support_roots(vfs, dir, &lib_ignores) {
+    for sub in support_roots(vfs, dir, &roots, &lib_ignores) {
         let sub = sub.as_str();
         let support_dir = dir.join(sub);
         if !vfs.is_dir(&support_dir) {
@@ -487,8 +573,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // Rails' include order would resolve). Empty-module helpers (the blog's
     // `module ApplicationHelper; end`) contribute nothing, keeping the
     // registry — and every downstream consumer — a no-op for them.
-    let helpers_dir = dir.join("app/helpers");
-    if vfs.is_dir(&helpers_dir) {
+    for root in &roots {
+        let helpers_dir = dir.join(root).join("helpers");
+        if !vfs.is_dir(&helpers_dir) {
+            continue;
+        }
         if let Ok(entries) = read_rb_files(vfs, &helpers_dir) {
             for entry in entries {
                 let Ok(source) = vfs.read(&entry) else { continue };
@@ -942,10 +1031,13 @@ end
         }
     }
 
-    let controllers_dir = dir.join("app/controllers");
-    if vfs.is_dir(&controllers_dir) {
+    for root in &roots {
+        let controllers_dir = dir.join(root).join("controllers");
+        if !vfs.is_dir(&controllers_dir) {
+            continue;
+        }
         for entry in read_rb_files(vfs, &controllers_dir)? {
-            let source = vfs.read(&entry)?;
+            let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             let path_str = entry.display().to_string();
             if let Some(maybe_controller) =
                 unwrap_or_record(ingest_controller(&source, &path_str))?
@@ -1007,57 +1099,71 @@ end
         }
     }
 
-    if vfs.is_dir(&models_dir) {
-        let files = read_rb_files(vfs, &models_dir)?;
-        app.generated_helper_methods =
-            super::generated_helpers::ingest_generated_helpers(&app, vfs, dir, &files);
+    let mut model_files = Vec::new();
+    for root in &roots {
+        let models_dir = dir.join(root).join("models");
+        if vfs.is_dir(&models_dir) {
+            model_files.extend(read_rb_files(vfs, &models_dir)?);
+        }
     }
+    app.generated_helper_methods =
+        super::generated_helpers::ingest_generated_helpers(&app, vfs, dir, &model_files);
 
     let routes_path = dir.join("config/routes.rb");
     if vfs.exists(&routes_path) {
-        let source = vfs.read(&routes_path)?;
-        // `draw(:name)` split files — Rails loads
-        // `config/routes/<name>.rb` into the same DSL context, and
-        // Mastodon-class apps keep most of their route table there.
-        let mut draw_files: HashMap<String, (Vec<u8>, String)> = HashMap::new();
-        let routes_dir = dir.join("config/routes");
-        if vfs.is_dir(&routes_dir) {
-            for entry in read_rb_files(vfs, &routes_dir)? {
-                // Keyed by the path below `config/routes/` without the
-                // extension: `draw(:admin)` names `admin`, and a `load`
-                // of `config/routes/services/internal.rb` names
-                // `services/internal` (a bare stem `internal` would
-                // collide with a sibling directory's file of that name).
-                let Ok(rel) = entry.strip_prefix(&routes_dir) else { continue };
-                let key = rel.with_extension("").display().to_string();
-                let split_source = vfs.read(&entry)?;
-                draw_files.insert(key, (split_source, entry.display().to_string()));
+        if let Some(source) = read_or_ledger(vfs, &routes_path)? {
+            // `draw(:name)` split files — Rails loads
+            // `config/routes/<name>.rb` into the same DSL context, and
+            // Mastodon-class apps keep most of their route table there.
+            // Keyed by the path RELATIVE TO `config/routes/`, without the
+            // `.rb` extension — `draw('financials/financials_erp_routes')`
+            // passes that whole relative path as the name, and keying by
+            // bare file stem alone (dropping the `financials/` prefix) left
+            // every subdirectory-nested draw unresolved (Procore has 34).
+            // `ingest_draw_route`'s `resolve_draw_name` still falls back to
+            // the bare stem when it is unambiguous, for `draw(:name)` calls
+            // written against a flat `config/routes/` layout.
+            let mut draw_files: HashMap<String, (Vec<u8>, String)> = HashMap::new();
+            let routes_dir = dir.join("config/routes");
+            if vfs.is_dir(&routes_dir) {
+                for entry in read_rb_files(vfs, &routes_dir)? {
+                    let Some(rel) = entry.strip_prefix(&routes_dir).ok().and_then(|p| p.to_str())
+                    else {
+                        continue;
+                    };
+                    let key = rel.trim_end_matches(".rb").replace('\\', "/");
+                    let Some(split_source) = read_or_ledger(vfs, &entry)? else { continue };
+                    draw_files.insert(key, (split_source, entry.display().to_string()));
+                }
             }
-        }
-        let block_wrappers = mapper_extension_block_methods(&app, vfs, dir);
-        if let Some(routes) = unwrap_or_record(ingest_routes_with_dsl(
-            &source,
-            &routes_path.display().to_string(),
-            &draw_files,
-            &block_wrappers,
-        ))? {
-            // `to: redirect("/x")` routes point at actions nobody
-            // wrote, so write them: one controller, one action per
-            // redirect, each a `redirect_to <literal>, status: …`. It
-            // is the shape an app uses by hand for the same thing, and
-            // it keeps the redirect out of every emitter's route kind.
-            if !routes.redirects.is_empty() {
-                app.controllers.push(synthesize_redirect_controller(&routes.redirects));
+            let block_wrappers = mapper_extension_block_methods(&app, vfs, dir);
+            if let Some(routes) = unwrap_or_record(ingest_routes_with_dsl(
+                &source,
+                &routes_path.display().to_string(),
+                &draw_files,
+                &block_wrappers,
+            ))? {
+                // `to: redirect("/x")` routes point at actions nobody
+                // wrote, so write them: one controller, one action per
+                // redirect, each a `redirect_to <literal>, status: …`. It
+                // is the shape an app uses by hand for the same thing, and
+                // it keeps the redirect out of every emitter's route kind.
+                if !routes.redirects.is_empty() {
+                    app.controllers.push(synthesize_redirect_controller(&routes.redirects));
+                }
+                app.routes = routes;
             }
-            app.routes = routes;
         }
     }
 
-    let views_dir = dir.join("app/views");
-    if vfs.is_dir(&views_dir) {
+    for root in &roots {
+        let views_dir = dir.join(root).join("views");
+        if !vfs.is_dir(&views_dir) {
+            continue;
+        }
         let erb_files = read_erb_files(vfs, &views_dir)?;
         for (erb_path, engine) in erb_files {
-            let source = vfs.read_to_string(&erb_path)?;
+            let Some(source) = read_to_string_or_ledger(vfs, &erb_path)? else { continue };
             let rel = erb_path
                 .strip_prefix(&views_dir)
                 .map_err(|_| IngestError::Unsupported {
@@ -1086,7 +1192,7 @@ end
 
         let jbuilder_files = read_jbuilder_files(vfs, &views_dir)?;
         for jb_path in jbuilder_files {
-            let source = vfs.read_to_string(&jb_path)?;
+            let Some(source) = read_to_string_or_ledger(vfs, &jb_path)? else { continue };
             let rel = jb_path
                 .strip_prefix(&views_dir)
                 .map_err(|_| IngestError::Unsupported {
@@ -1119,12 +1225,14 @@ end
     let test_case_setup: Option<crate::expr::Expr> = {
         let helper_rb = dir.join("test/test_helper.rb");
         if vfs.exists(&helper_rb) {
-            let source = vfs.read(&helper_rb)?;
-            unwrap_or_record(super::test::ingest_test_case_setup(
-                &source,
-                &helper_rb.display().to_string(),
-            ))?
-            .flatten()
+            match read_or_ledger(vfs, &helper_rb)? {
+                Some(source) => unwrap_or_record(super::test::ingest_test_case_setup(
+                    &source,
+                    &helper_rb.display().to_string(),
+                ))?
+                .flatten(),
+                None => None,
+            }
         } else {
             None
         }
@@ -1153,7 +1261,7 @@ end
         let tests_dir = dir.join(subdir);
         if vfs.is_dir(&tests_dir) {
             for entry in read_rb_files(vfs, &tests_dir)? {
-                let source = vfs.read(&entry)?;
+                let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
                 if let Some(tms) =
                     unwrap_or_record(ingest_test_files(&source, &entry.display().to_string()))?
                 {
@@ -1176,7 +1284,7 @@ end
     let fixtures_dir = dir.join("test/fixtures");
     if vfs.is_dir(&fixtures_dir) {
         for entry in read_yml_files(vfs, &fixtures_dir)? {
-            let source = vfs.read(&entry)?;
+            let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             // ERB tags are lifted out and carried as expressions rather
             // than dropped — see `ingest::fixture`. A file whose ERB we
             // genuinely can't ingest still records a ledger line and is
@@ -1197,11 +1305,12 @@ end
     // fresh.
     let seeds_path = dir.join("db/seeds.rb");
     if vfs.exists(&seeds_path) {
-        let source = vfs.read_to_string(&seeds_path)?;
-        if let Some(expr) =
-            unwrap_or_record(ingest_ruby_program(&source, &seeds_path.display().to_string()))?
-        {
-            app.seeds = Some(expr);
+        if let Some(source) = read_to_string_or_ledger(vfs, &seeds_path)? {
+            if let Some(expr) =
+                unwrap_or_record(ingest_ruby_program(&source, &seeds_path.display().to_string()))?
+            {
+                app.seeds = Some(expr);
+            }
         }
     }
 
@@ -1212,15 +1321,16 @@ end
     // `javascript_importmap_tags` helper.
     let importmap_path = dir.join("config/importmap.rb");
     if vfs.exists(&importmap_path) {
-        let source = vfs.read_to_string(&importmap_path)?;
-        if let Some(importmap) = unwrap_or_record(ingest_importmap(
-            vfs,
-            &source,
-            dir,
-            &importmap_path.display().to_string(),
-        ))? {
-            if !importmap.pins.is_empty() {
-                app.importmap = Some(importmap);
+        if let Some(source) = read_to_string_or_ledger(vfs, &importmap_path)? {
+            if let Some(importmap) = unwrap_or_record(ingest_importmap(
+                vfs,
+                &source,
+                dir,
+                &importmap_path.display().to_string(),
+            ))? {
+                if !importmap.pins.is_empty() {
+                    app.importmap = Some(importmap);
+                }
             }
         }
     }
@@ -1273,7 +1383,7 @@ end
         .iter()
         .flat_map(|m| &m.pins)
         .any(|p| p.name == "trix");
-    let links_all = layouts_link_all_stylesheets(vfs, dir);
+    let links_all = layouts_link_all_stylesheets(vfs, dir, &roots);
     for (gem, stems) in crate::gems::GEM_STYLESHEETS {
         if !links_all {
             continue;
@@ -1317,7 +1427,7 @@ end
                 if entry.extension().and_then(|s| s.to_str()) != Some("rbs") {
                     continue;
                 }
-                let source = vfs.read_to_string(&entry)?;
+                let Some(source) = read_to_string_or_ledger(vfs, &entry)? else { continue };
                 let path_str = entry.display().to_string();
                 let parsed = crate::rbs::parse_app_signatures(&source).map_err(|message| {
                     IngestError::Parse {
@@ -3277,14 +3387,29 @@ fn walk_erb<V: Vfs + ?Sized>(
                 // the last un-ingested templates in every `rails new`
                 // app, so an otherwise fully-covered app still showed
                 // four coverage gaps.
+                // `.pdf.erb` / `.csv.erb` / `.txt.erb` join the same way:
+                // ordinary ERB producing text (a PDF renderer's HTML
+                // input, a `CSV.generate` body, a mailer's plaintext
+                // part) whose format is a naming/dispatch label, not a
+                // different template shape. Lowered as `<action>_pdf` /
+                // `<action>_csv` / `<action>_txt`, beside the html
+                // template.
                 if stem.ends_with(".html")
                     || !stem.contains('.')
-                    || matches!(format, Some("turbo_stream" | "svg" | "text" | "json" | "js"))
+                    || matches!(
+                        format,
+                        Some("turbo_stream" | "svg" | "text" | "json" | "js" | "pdf" | "csv" | "txt")
+                    )
                     // Feeds: `.rss.builder` / `.atom.builder` (lobsters'
                     // `home/stories.rss.builder`), lowered as
                     // `<action>_rss` beside the html template, the same
-                    // naming answer `_json` and `_svg` use.
-                    || matches!(format, Some("rss" | "atom" | "xml"))
+                    // naming answer `_json` and `_svg` use. `.xls.builder`
+                    // joins them: it's Builder XML markup too (Microsoft's
+                    // SpreadsheetML — `xml.Workbook`/`xml.Worksheet` tags),
+                    // served with an `.xls` extension so Excel opens it;
+                    // the DSL and shape are identical to the feed formats,
+                    // not a different engine concern.
+                    || matches!(format, Some("rss" | "atom" | "xml" | "xls"))
                 {
                     out.push((path, engine));
                 } else {
@@ -3414,15 +3539,223 @@ fn nested_under(
 /// A LIST OF ROOTS on purpose: a Packwerk app puts the same layers under
 /// `packs/*/app/*`, which becomes one more source of roots here rather
 /// than a second walker.
-fn support_roots<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lib_ignores: &[String]) -> Vec<String> {
-    // Directories under `app/` that another pass already ingests
+fn support_roots<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    roots: &[PathBuf],
+    lib_ignores: &[String],
+) -> Vec<String> {
+    // Directories under an app root that another pass already ingests
     // (models, controllers, views, helpers) or that hold no Ruby at all
     // (assets, javascript).
     const OWN_PASS: &[&str] =
         &["models", "controllers", "views", "helpers", "assets", "javascript"];
 
-    let mut roots: Vec<String> = vec!["extras".to_string(), "lib".to_string()];
-    if let Ok(entries) = vfs.read_dir(&dir.join("app")) {
+    let mut out: Vec<String> = vec!["extras".to_string(), "lib".to_string()];
+    for root in roots {
+        if let Ok(entries) = vfs.read_dir(&dir.join(root)) {
+            for entry in entries {
+                if !vfs.is_dir(&entry) {
+                    continue;
+                }
+                let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if OWN_PASS.contains(&name) {
+                    continue;
+                }
+                out.push(format!("{}/{name}", root.display()));
+            }
+        }
+        // A package's `lib/` sits beside its `app/` (`packs/blog/lib`
+        // beside `packs/blog/app`) and is autoloaded the same way the
+        // root app's `lib/` is. `root.parent()` of the bare `app` root
+        // is the empty path, whose `lib` is the root `lib` already
+        // pushed above — deduped below, not special-cased here.
+        if let Some(parent) = root.parent() {
+            let lib = parent.join("lib");
+            if vfs.is_dir(&dir.join(&lib)) {
+                out.push(lib.display().to_string());
+            }
+        }
+    }
+    if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
+        out.extend(extract_autoload_path_roots(&source));
+    }
+    // `autoload_lib(ignore: %w[…])` names directories the app takes off
+    // the autoload paths; a root by that name is off the list for the
+    // same reason its `lib/` namesake is skipped below.
+    out.retain(|root| !lib_ignores.iter().any(|ignored| ignored == root));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// App-layer roots for one Rails app: `app` first, then one
+/// `<pkg>/app` per Packwerk package that has an `app/` directory —
+/// sorted (after `app`) and deduplicated. Every other layer walk in
+/// this file loops over these instead of hardwiring `app/…`, so a
+/// Packwerk app's `packs/*/app/*` (or `components/*/app/*`,
+/// `engines/*/app/*`) gets the same models/controllers/views/helpers
+/// passes the root `app/` does.
+///
+/// Non-Packwerk apps (no `packwerk.yml` or `packs.yml` at the root)
+/// get exactly `["app"]` — zero behavior change, which the fixtures'
+/// zero-diagnostic gates depend on.
+pub(super) fn app_roots<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("app")];
+    let has_packwerk = vfs.exists(&dir.join("packwerk.yml")) || vfs.exists(&dir.join("packs.yml"));
+    if !has_packwerk {
+        return roots;
+    }
+    let package_paths = vfs
+        .read(&dir.join("packwerk.yml"))
+        .ok()
+        .and_then(|bytes| parse_package_paths(&bytes));
+
+    let mut package_dirs: Vec<PathBuf> = Vec::new();
+    match package_paths {
+        Some(globs) => {
+            for glob in globs {
+                expand_package_glob(vfs, dir, &glob, &mut package_dirs);
+            }
+        }
+        // No `package_paths:` key (absent, or commented out — the
+        // common case): Packwerk's own default, `**/` — every
+        // directory, any depth, that carries a `package.yml`.
+        None => default_package_scan(vfs, dir, &mut package_dirs),
+    }
+    package_dirs.sort();
+    package_dirs.dedup();
+
+    for pkg in package_dirs {
+        let rel = pkg.strip_prefix(dir).unwrap_or(&pkg);
+        // The root's own `package.yml` names the root package, whose
+        // app root is already `app` above — not a second root.
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let app_dir = pkg.join("app");
+        if vfs.is_dir(&app_dir) {
+            roots.push(rel.join("app"));
+        }
+    }
+    roots[1..].sort();
+    roots.dedup();
+    roots
+}
+
+/// `package_paths:` from a `packwerk.yml`'s bytes, as the raw glob
+/// strings (Packwerk accepts either a single string or a list).
+/// `None` when the key is absent (including commented out — YAML
+/// never sees it) or the file doesn't parse as YAML; both cases fall
+/// back to Packwerk's own default in [`app_roots`].
+fn parse_package_paths(bytes: &[u8]) -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct PackwerkYml {
+        #[serde(default)]
+        package_paths: Option<PackagePathsValue>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum PackagePathsValue {
+        One(String),
+        Many(Vec<String>),
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let parsed: PackwerkYml = serde_yaml_ng::from_str(&text).ok()?;
+    match parsed.package_paths? {
+        PackagePathsValue::One(s) => Some(vec![s]),
+        PackagePathsValue::Many(v) => Some(v),
+    }
+}
+
+/// Directories under `dir` matching a `package_paths:` glob that
+/// actually carry a `package.yml` — the candidates for
+/// [`app_roots`]. Supports `*` (one directory level) and `**` (any
+/// depth, capped at 4 levels beyond the match point); a trailing `/`
+/// is insignificant. Not a general glob engine — Packwerk's own
+/// globs are this small.
+fn expand_package_glob<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    glob: &str,
+    out: &mut Vec<PathBuf>,
+) {
+    let segments: Vec<&str> = glob.split('/').filter(|s| !s.is_empty()).collect();
+    let mut candidates = Vec::new();
+    expand_glob_segments(vfs, dir, &segments, 4, &mut candidates);
+    for candidate in candidates {
+        if vfs.exists(&candidate.join("package.yml")) {
+            out.push(candidate);
+        }
+    }
+}
+
+fn expand_glob_segments<V: Vfs + ?Sized>(
+    vfs: &V,
+    base: &Path,
+    segments: &[&str],
+    depth_budget: usize,
+    out: &mut Vec<PathBuf>,
+) {
+    let Some((seg, rest)) = segments.split_first() else {
+        out.push(base.to_path_buf());
+        return;
+    };
+    match *seg {
+        "**" => {
+            // Zero levels consumed by `**`, then the rest of the
+            // pattern against `base` itself…
+            expand_glob_segments(vfs, base, rest, depth_budget, out);
+            // …or one more level consumed, `**` still pending against
+            // each subdirectory, capped so a pathological tree can't
+            // make this unbounded.
+            if depth_budget == 0 {
+                return;
+            }
+            if let Ok(entries) = vfs.read_dir(base) {
+                for entry in entries {
+                    if vfs.is_dir(&entry) {
+                        expand_glob_segments(vfs, &entry, segments, depth_budget - 1, out);
+                    }
+                }
+            }
+        }
+        "*" => {
+            if let Ok(entries) = vfs.read_dir(base) {
+                for entry in entries {
+                    if vfs.is_dir(&entry) {
+                        expand_glob_segments(vfs, &entry, rest, depth_budget, out);
+                    }
+                }
+            }
+        }
+        literal => {
+            let next = base.join(literal);
+            if vfs.is_dir(&next) {
+                expand_glob_segments(vfs, &next, rest, depth_budget, out);
+            }
+        }
+    }
+}
+
+/// Packwerk's own default `package_paths` (`**/`, any directory at any
+/// depth) when the app declares none: directories carrying a
+/// `package.yml`, found by walking down from `dir`, at most 3 levels
+/// deep, skipping directories that are never a Packwerk package tree
+/// (VCS/dependency/build noise, test trees, and `app` itself — a
+/// package never nests a `package.yml` under the layer this scan
+/// exists to find roots for).
+fn default_package_scan<V: Vfs + ?Sized>(vfs: &V, dir: &Path, out: &mut Vec<PathBuf>) {
+    const SKIP: &[&str] = &[
+        ".git", "node_modules", "vendor", "tmp", "log", "public", "storage", "spec", "test",
+        "db", "config", "app",
+    ];
+    const MAX_DEPTH: usize = 3;
+
+    fn scan<V: Vfs + ?Sized>(vfs: &V, current: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = vfs.read_dir(current) else { return };
         for entry in entries {
             if !vfs.is_dir(&entry) {
                 continue;
@@ -3430,22 +3763,18 @@ fn support_roots<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lib_ignores: &[String]) -
             let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if OWN_PASS.contains(&name) {
+            if SKIP.contains(&name) {
                 continue;
             }
-            roots.push(format!("app/{name}"));
+            if vfs.exists(&entry.join("package.yml")) {
+                out.push(entry.clone());
+            }
+            if depth < MAX_DEPTH {
+                scan(vfs, &entry, depth + 1, out);
+            }
         }
     }
-    if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
-        roots.extend(extract_autoload_path_roots(&source));
-    }
-    // `autoload_lib(ignore: %w[…])` names directories the app takes off
-    // the autoload paths; a root by that name is off the list for the
-    // same reason its `lib/` namesake is skipped below.
-    roots.retain(|root| !lib_ignores.iter().any(|ignored| ignored == root));
-    roots.sort();
-    roots.dedup();
-    roots
+    scan(vfs, dir, 1, out);
 }
 
 /// Roots an app adds to `config.autoload_paths` / `config.eager_load_paths`
@@ -4074,19 +4403,21 @@ fn content_helper_attribute_additions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app:
 /// walks the whole asset path, gems' stylesheets included? Read off the
 /// layout SOURCES: views are not ingested yet where the stylesheet list
 /// is built, and the call is a literal wherever an app writes it.
-fn layouts_link_all_stylesheets<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
-    let layouts = dir.join("app/views/layouts");
-    if !vfs.is_dir(&layouts) {
-        return false;
-    }
-    let Ok(entries) = vfs.read_dir(&layouts) else { return false };
-    entries.iter().any(|entry| {
-        vfs.read_to_string(entry)
-            .map(|src| {
-                src.contains("stylesheet_link_tag :all")
-                    || src.contains("stylesheet_link_tag(:all")
-            })
-            .unwrap_or(false)
+fn layouts_link_all_stylesheets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| {
+        let layouts = dir.join(root).join("views/layouts");
+        if !vfs.is_dir(&layouts) {
+            return false;
+        }
+        let Ok(entries) = vfs.read_dir(&layouts) else { return false };
+        entries.iter().any(|entry| {
+            vfs.read_to_string(entry)
+                .map(|src| {
+                    src.contains("stylesheet_link_tag :all")
+                        || src.contains("stylesheet_link_tag(:all")
+                })
+                .unwrap_or(false)
+        })
     })
 }
 
@@ -4546,13 +4877,14 @@ fn ingest_test_helper_modules<V: Vfs + ?Sized>(
     let mut wanted: Vec<Symbol> = Vec::new();
     let helper_rb = dir.join("test/test_helper.rb");
     if vfs.exists(&helper_rb) {
-        let source = vfs.read(&helper_rb)?;
-        if let Some(classes) = unwrap_or_record(ingest_library_classes(
-            &source,
-            &helper_rb.display().to_string(),
-        ))? {
-            for lc in classes {
-                wanted.extend(lc.includes.iter().map(|c| c.0.clone()));
+        if let Some(source) = read_or_ledger(vfs, &helper_rb)? {
+            if let Some(classes) = unwrap_or_record(ingest_library_classes(
+                &source,
+                &helper_rb.display().to_string(),
+            ))? {
+                for lc in classes {
+                    wanted.extend(lc.includes.iter().map(|c| c.0.clone()));
+                }
             }
         }
     }
@@ -4562,7 +4894,7 @@ fn ingest_test_helper_modules<V: Vfs + ?Sized>(
 
     let mut out: Vec<LibraryClass> = Vec::new();
     for entry in read_rb_files(vfs, &helpers_dir)? {
-        let source = vfs.read(&entry)?;
+        let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
         let Some(classes) =
             unwrap_or_record(ingest_library_classes(&source, &entry.display().to_string()))?
         else {

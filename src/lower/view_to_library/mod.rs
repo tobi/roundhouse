@@ -391,7 +391,13 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     // `local_assigns[:x]` → the bare local `x`. Same place and the same
     // reason as the line above: `collect_extra_params` has already
     // recorded the name as a nil-default param, so the read resolves.
-    rewrite_local_assigns_to_locals(&mut rewritten);
+    let keyword_locals: Vec<&str> = view
+        .strict_locals
+        .iter()
+        .flat_map(|sl| sl.iter().skip(1))
+        .map(|p| p.name.as_str())
+        .collect();
+    rewrite_local_assigns_to_locals(&mut rewritten, &keyword_locals);
 
     // The inferred record arg (e.g. `articles`, `article`) is the
     // required positional. Free locals discovered downstream
@@ -468,6 +474,12 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     if let Some(binding) = form_binding {
         extra_params.retain(|k| k != &binding.form_local);
     }
+    // An extra is a positional param, and a positional param cannot have
+    // a reserved word as its name (`class`). `safe_local` renames it, the
+    // same way `rewrite_local_assigns_to_locals` renames its reads. Call
+    // sites pass extras by position, so they do not see the new name.
+    let extra_params: Vec<String> =
+        extra_params.iter().map(|k| crate::naming::safe_local(k)).collect();
 
     // Typed primary params: (name, type, required). Extras (notice/alert/…)
     // are appended afterward as nullable optionals.
@@ -554,7 +566,12 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     // callers bind provided keyword locals by name, omitted ones default.
     if let Some(sl) = view.strict_locals.as_ref().filter(|_| is_partial) {
         use crate::ty::{Param as TyParam, ParamKind, Ty};
-        let record = &sl[0];
+        // The record is a positional param, so a reserved-word name
+        // (`for:`) goes through `safe_local`, as its reads do. The
+        // keyword locals keep their names: callers pass them by name.
+        let mut record = sl[0].clone();
+        record.name = Symbol::from(crate::naming::safe_local(record.name.as_str()));
+        let record = &record;
         let record_name = record.name.as_str().to_string();
         let kw_locals = &sl[1..];
         // Closure ivars this partial reads, MINUS every declared local: a
@@ -562,8 +579,9 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         // declares `story:` and reads `@story`) collapses to one identifier
         // after the ivar→local rewrite, so the declared param covers it —
         // threading it again would emit a duplicate argument name.
-        let declared: std::collections::HashSet<&str> =
-            sl.iter().map(|p| p.name.as_str()).collect();
+        let declared: std::collections::HashSet<&str> = std::iter::once(record_name.as_str())
+            .chain(kw_locals.iter().map(|p| p.name.as_str()))
+            .collect();
         let closure: Vec<String> = closure_ivars
             .iter()
             .filter(|iv| !declared.contains(iv.as_str()))
@@ -578,7 +596,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         });
         sig_params.push(TyParam {
             name: record.name.clone(),
-            ty: declared_local_ty(view, &record_name, &known_models, lx.app),
+            ty: declared_local_ty(view, sl[0].name.as_str(), &known_models, lx.app),
             kind: ParamKind::Required,
         });
         for iv in &closure {
@@ -3543,17 +3561,30 @@ fn rewrite_lvalue(lv: &LValue) -> LValue {
 /// function and took the page down with a NameError; campfire's
 /// `rooms/layouts/_new` reads a `view_transition_name` no call site
 /// passes, which is exactly the case the spelling exists for.
-fn rewrite_local_assigns_to_locals(expr: &mut Expr) {
+///
+/// A reserved-word local read (`binding.local_variable_get(:for)`, which
+/// ingest turns into the local `for`) is the same kind of read.
+///
+/// The read uses the name that the partial's `def` binds. A keyword
+/// local (`keywords`, the strict locals after the first) keeps its name,
+/// because callers pass it by that name. Every other local is a
+/// positional param named by `safe_local` (`for` → `for_`).
+fn rewrite_local_assigns_to_locals(expr: &mut Expr, keywords: &[&str]) {
     expr.node
-        .for_each_child_mut(&mut rewrite_local_assigns_to_locals);
-    if let Some(name) = local_assigns_key(expr) {
-        *expr = Expr::new(
-            expr.span,
-            ExprNode::Var {
-                id: VarId(0),
-                name: Symbol::from(crate::naming::safe_local(&name)),
-            },
-        );
+        .for_each_child_mut(&mut |c| rewrite_local_assigns_to_locals(c, keywords));
+    let reserved_read = match &*expr.node {
+        ExprNode::Var { name, .. } if crate::naming::is_reserved_local(name.as_str()) => {
+            Some(name.as_str().to_string())
+        }
+        _ => None,
+    };
+    if let Some(name) = local_assigns_key(expr).or(reserved_read) {
+        let name = if keywords.contains(&name.as_str()) {
+            name
+        } else {
+            crate::naming::safe_local(&name)
+        };
+        *expr = Expr::new(expr.span, ExprNode::Var { id: VarId(0), name: Symbol::from(name) });
     }
 }
 

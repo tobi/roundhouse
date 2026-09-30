@@ -617,12 +617,46 @@ fn push_owner_methods(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol
         "after_save",
         self_send(&Symbol::from(format!("_save_rich_text_{}", attr.as_str()))),
     );
+
+    // `dependent: :destroy` — the other half of the macro's `has_one`.
+    // Destroying the owner destroys its rich text, as Rails' cascade does
+    // (a `before_destroy`, the slot `has_many … dependent: :destroy`
+    // lowers to). Without it a destroyed message left its body behind in
+    // `action_text_rich_texts`: once-campfire-rust's model scenario
+    // (scripts/campfire-db-differential) found six such rows after
+    // `m2.destroy!` and `remove_banned_content` — deleted content that
+    // stayed in the database.
+    push(
+        methods,
+        model,
+        Symbol::from(format!("_destroy_rich_text_{}", attr.as_str())),
+        Vec::new(),
+        // `rows.each { |rich_text| rich_text.destroy }`, the shape the
+        // `has_many … dependent: :destroy` cascade lowers to — not
+        // `destroy_all`, which the inlined SELECT (an Array) cannot answer.
+        seq(vec![each_destroy(rich_text_rows(model, attr)), nil_lit()]),
+        Some(fn_sig(vec![], Ty::Nil)),
+        AccessorKind::Method,
+        true,
+    );
+    super::model_to_library::markers::fold_into_or_push(
+        methods,
+        model,
+        "before_destroy",
+        self_send(&Symbol::from(format!("_destroy_rich_text_{}", attr.as_str()))),
+    );
 }
 
 /// `ActionText::RichText.where(record_id: @id, record_type: "<Owner>",
 /// name: "<attr>").first` — all three scope terms the macro's
 /// `has_one … -> { where(name: name) }, as: :record` implies.
 fn first_rich_text(model: &Model, attr: &Symbol) -> Expr {
+    no_arg_send(rich_text_rows(model, attr), "first")
+}
+
+/// The owner's rich-text rows for `attr` — the relation both the reader
+/// and the `dependent: :destroy` cascade stand on.
+fn rich_text_rows(model: &Model, attr: &Symbol) -> Expr {
     let entries = vec![
         (lit_sym(Symbol::from("record_id")), ivar("id")),
         (
@@ -644,10 +678,35 @@ fn first_rich_text(model: &Model, attr: &Symbol) -> Expr {
             parenthesized: true,
         },
     );
-    no_arg_send(query, "first")
+    query
 }
 
 // ── small builders ─────────────────────────────────────────────
+
+/// `rows.each { |rich_text| rich_text.destroy }`.
+fn each_destroy(rows: Expr) -> Expr {
+    let var = Symbol::from("rich_text");
+    let block = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lambda {
+            params: vec![var.clone()],
+            rest_param: None,
+            block_param: None,
+            body: no_arg_send(var_ref(var), "destroy"),
+            block_style: crate::expr::BlockStyle::Brace,
+        },
+    );
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(rows),
+            method: Symbol::from("each"),
+            args: vec![],
+            block: Some(block),
+            parenthesized: false,
+        },
+    )
+}
 
 /// Replace a synthesized method of the same name, or push it. Unlike
 /// `push_synth_instance_method` (which yields to whatever is already

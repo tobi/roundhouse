@@ -41,60 +41,53 @@ module Main
     end
   end
 
-  # Re-nest tep's flat bracket-keyed params into the Rails-style nested
-  # hash the per-resource *Params.from_raw factories expect, and merge
-  # the route's path captures (id, ...).
+  # The controller's params, built the way Rails builds them
+  # (`ActionDispatch::Http::Parameters#parameters`): the body's params,
+  # the query string's merged over them, the route's path captures over
+  # both — each half nested by `ParamBuilder` (runtime/param_builder.rb,
+  # Rails' own rules, held to Rails' answers for 2,755 query strings).
+  # nil where Rails answers 400: a malformed %-escape, invalid UTF-8, a
+  # nesting too deep, a name used as both an Array and a Hash.
   #
-  # tep parses a form body into flat keys (`article[title]` -> "..."`).
-  # The blog nests exactly one resource per request, so collect its
-  # bracketed fields into a single String->String sub-hash, then assign
-  # that sub-hash into the outer poly hash alongside the bare-key
-  # scalars + path captures. The "assign a String or a whole sub-hash"
-  # shape (rather than mutating `out[outer][inner]` in place) is what
-  # makes spinel type `out` as the String->(String|Hash) the controller
-  # reads — same discipline as test_helper's stringify_keys.
-  def self.nest_params(flat, path_params)
-    # Split the flat bracket-keyed params into String->String locals
-    # FIRST (sub = the one nested resource's fields, scalars = bare
-    # keys). Iterating `flat` only into String-typed str_hashes keeps
-    # `flat` (req.req_params) itself String->String — assigning its values
-    # straight into the poly `out` below would back-propagate and widen
-    # req.req_params to poly, breaking unrelated String reads of it.
-    sub = Tep.str_hash
-    scalars = Tep.str_hash
-    outer_name = +""
-    flat.each do |k, v|
-      ob = k.index("[")
-      if ob.nil?
-        scalars[k] = v
-      else
-        cb = k.index("]", ob + 1)
-        if cb.nil?
-          scalars[k] = v
-        else
-          outer_name = k[0, ob]
-          sub[k[(ob + 1)...cb]] = v
-        end
+  # This replaced a re-nesting of tep's flat String->String params that
+  # knew one level of one resource and kept a repeated key's last value:
+  # `user_ids[]=2&user_ids[]=3` reached the controller as `{"" => "3"}`.
+  #
+  # A multipart body's text fields arrive by name from its parser
+  # (`Tep::Request#body_fields`), so a repeated multipart field still
+  # keeps its last value; the urlencoded body and the query string are
+  # parsed from their raw bytes and keep every one.
+  def self.request_params(req, path_params)
+    query = ParamBuilder.from_query_string(req.raw_query)
+    return nil if query.nil?
+    body = {}
+    if req.form?
+      body = ParamBuilder.from_query_string(req.raw_body)
+    elsif req.multipart?
+      keys = []
+      values = []
+      present = []
+      req.body_fields.each do |k, v|
+        keys.push(k)
+        values.push(v)
+        present.push(true)
       end
+      body = ParamBuilder.build(keys, values, present)
     end
-    # Assemble the poly result. deep_dup yields Hash[String, untyped],
-    # wide enough to hold both String scalars and the nested sub-hash;
-    # poly-into-poly unifies (a raw StrStrHash value would not).
-    out = Main.deep_dup(path_params)
-    scalars.each { |k, v| out[k] = v }
-    if outer_name.length > 0
-      out[outer_name] = Main.deep_dup(sub)
-    end
+    return nil if body.nil?
+    out = body
+    query.each { |k, v| out[k] = v }
+    path_params.each { |k, v| out[k] = v }
     out
   end
 
   # The file parts of a multipart body (`Tep::Request#uploads`, keyed
-  # `message[attachment]`), folded into the nested params the way
-  # `nest_params` folds text fields — after it, because the typed
-  # String hash it iterates cannot carry a file. The resource sub-hash
-  # is REBUILT with the file added rather than written into in place,
-  # for the same reason nest_params assigns whole sub-hashes: that is
-  # the shape spinel types as the poly-valued hash the controller reads.
+  # `message[attachment]`), folded into the nested params after
+  # `request_params` builds them, because the typed String hash it
+  # iterates cannot carry a file. The resource sub-hash
+  # is REBUILT with the file added rather than written into in place:
+  # that is the shape spinel types as the poly-valued hash the
+  # controller reads.
   def self.nest_uploads(out, uploads)
     uploads.each do |k, file|
       ob = k.index("[")
@@ -114,23 +107,6 @@ module Main
       end
     end
     nil
-  end
-
-  # Rebuild a string-keyed Hash, recursing into nested Hash values.
-  # Strictly typed `(Hash) -> Hash`; the return is Hash[String, untyped]
-  # because `out` is assigned both a Hash (deep_dup(v)) and a leaf (v).
-  # Identical shape to test_helper's stringify_keys — the construction
-  # spinel reliably types as a poly-valued hash.
-  def self.deep_dup(h)
-    out = {}
-    h.each do |k, v|
-      if v.is_a?(Hash)
-        out[k.to_s] = Main.deep_dup(v)
-      else
-        out[k.to_s] = v
-      end
-    end
-    out
   end
 
   # First-time setup. Idempotent: skips when already configured (so
@@ -399,11 +375,15 @@ module Main
     end
 
     controller = Main.instantiate_controller(matched.controller)
-    # Build the nested Rails-style params (params["article"]["title"])
-    # that the per-resource *Params.from_raw factories expect. tep parses
-    # the form body into flat bracket keys (req.req_params["article[title]"]);
-    # re-nest them + merge the route's path captures (id, ...).
-    controller.params = Main.nest_params(req.req_params, matched.path_params)
+    # The nested Rails-style params (params["article"]["title"]) the
+    # per-resource *Params.from_raw factories expect; see request_params.
+    params = Main.request_params(req, matched.path_params)
+    if params.nil?
+      res.status = 400
+      res.body = "<h1>400 Bad Request</h1>"
+      return
+    end
+    controller.params = params
     controller.path_parameters = matched.path_params
     Main.nest_uploads(controller.params, req.uploads) if req.uploads.length > 0
     # Typed request object + per-request context statics. Helpers are

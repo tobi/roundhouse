@@ -87,6 +87,12 @@ is a report today; its current differences are ledgered in
 [`runtime.md`](../pipeline/runtime.md) under "Response headers differ
 from Rails in SHAPE".
 
+`scripts/campfire-db-differential` compares what the models WRITE: the
+same scenario of model operations (once-campfire-rust's) run by Rails
+and by the transpiled app from the same fixtures, every table diffed,
+then Rails booted on the database the emit wrote — the check that
+someone can go back.
+
 ## Reading a failure
 
 A compare failure is one of three things, and the report usually says

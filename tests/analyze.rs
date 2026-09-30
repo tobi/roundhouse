@@ -1769,6 +1769,34 @@ end
 }
 
 #[test]
+fn csv_generate_types_its_block_and_value() {
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        (
+            "app/models/thing.rb",
+            r#"class Thing < ApplicationRecord
+  def export
+    data = CSV.generate("", headers: ["a"], write_headers: true) do |csv|
+      csv << [1]
+      csv.add_row([2])
+    end
+    data.lines.size
+  end
+end
+"#,
+        ),
+    ]);
+
+    let failures = send_dispatch_failures(&app);
+    for m in ["generate", "<<", "add_row", "lines"] {
+        assert!(!failures.iter().any(|f| f == m), "`{m}` should resolve; failures = {failures:?}");
+    }
+}
+
+#[test]
 fn stdlib_singletons_and_set_resolve() {
     // The hardcoded Ruby stdlib catalog (SecureRandom, CGI, Digest::*,
     // Math, File, Dir, Set) resolves the common call surface, and unary
@@ -2482,7 +2510,7 @@ fn use_zone_answers_its_block_value() {
   end
 
   def opaque(zone)
-    Time.use_zone(zone) { CSV.generate("") { |csv| csv << [1] } }
+    Time.use_zone(zone) { "x".frobnicate }
   end
 end
 "#,
@@ -2493,7 +2521,7 @@ end
     for m in ["use_zone", "current", "+"] {
         assert!(!failures.iter().any(|f| f == m), "`{m}` should resolve; failures = {failures:?}");
     }
-    assert!(failures.iter().any(|f| f == "generate"), "the block's own gap still reports; failures = {failures:?}");
+    assert!(failures.iter().any(|f| f == "frobnicate"), "the block's own gap still reports; failures = {failures:?}");
 }
 
 #[test]
@@ -4272,4 +4300,30 @@ end
         set_room[0]
     );
     assert!(set_room[0].from_concern.is_none(), "the controller's own declaration won, not the concern's");
+}
+
+#[test]
+fn boolean_cast_and_key_conversions_type() {
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        (
+            "app/models/thing.rb",
+            r#"class Thing < ApplicationRecord
+  def probe(flag)
+    on = ActiveModel::Type::Boolean.new.cast(flag)
+    h = { a: "x" }
+    [on.nil?, h.stringify_keys.keys.first.upcase, h.deep_symbolize_keys.keys.first.to_s, h.symbolize_keys.size]
+  end
+end
+"#,
+        ),
+    ]);
+
+    let failures = send_dispatch_failures(&app);
+    for m in ["cast", "stringify_keys", "deep_symbolize_keys", "symbolize_keys", "upcase", "keys"] {
+        assert!(!failures.iter().any(|f| f == m), "`{m}` should resolve; failures = {failures:?}");
+    }
 }
