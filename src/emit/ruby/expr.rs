@@ -574,6 +574,18 @@ fn emit_bool_op_operand(
         ExprNode::Assign { .. } | ExprNode::OpAssign { .. } => {
             return format!("({s})");
         }
+        // A command (`raise E`, `puts a, b`) or a method assignment
+        // (`obj.x = v`, `h[k] = v`) takes everything after it as its
+        // argument. As the right operand of `||`/`&&` a command does not
+        // parse (`user || raise NotFound`); anywhere else either one
+        // swallows what follows: `raise E || x` is `raise(E || x)`, and
+        // `a && obj.x = 1 && b` is `a && (obj.x = (1 && b))`. `and`/`or`
+        // bind looser than both, so their operands stay bare.
+        _ if parent_surface == crate::expr::BoolOpSurface::Symbol
+            && renders_open_ended(child) =>
+        {
+            return format!("({s})");
+        }
         ExprNode::Seq { exprs } if exprs.len() > 1 => {
             return format!("({s})");
         }
@@ -764,6 +776,42 @@ fn renders_as_command_with_block(e: &Expr) -> bool {
         &*e.node,
         ExprNode::Send { args, block: Some(_), parenthesized: false, .. } if !args.is_empty()
     )
+}
+
+/// Does `e` emit with an argument that runs to the end of the
+/// expression? That is a command, meaning a paren-less call with
+/// arguments (`puts a, b`) or a keyword with a value (`raise E`,
+/// `return v`, `next v`, `break v`), or an assignment through a method
+/// (`obj.x = v`, `h[k] = v`, which emit that way whether or not the
+/// call was written with parens). Such an expression is fine as a
+/// statement or a last argument, but as an operand of a tighter-binding
+/// operator it either does not parse or takes the operator's other
+/// operand into its argument. `recv_needs_parens` treats a paren-less
+/// call as a receiver the same way.
+fn renders_open_ended(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Raise { .. } => true,
+        // `return nil` emits as a bare `return`, which has no argument.
+        ExprNode::Return { value } => !matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }),
+        ExprNode::Next { value } | ExprNode::Break { value } => value.is_some(),
+        ExprNode::Send { recv, method, args, parenthesized, .. } => {
+            let m = method.as_str();
+            let r = recv.is_some();
+            let assigns =
+                r && ((m == "[]=" && args.len() == 2) || (is_setter_method(m) && args.len() == 1));
+            // The shapes `emit_send_base` renders with no trailing
+            // argument list: an index read (`h[k]`), a binary operator
+            // with its one operand (`a == b`; `p.=== 1, 2` is a command),
+            // and a receiver-less `!` (a lowering's `! x.nil?`, the
+            // prefix operator, which binds tighter than `&&`).
+            let bracketed = r && m == "[]";
+            let infix = r && args.len() == 1 && is_binary_operator(m);
+            let prefix_not = !r && m == "!";
+            let command = !parenthesized && !args.is_empty() && !bracketed && !infix && !prefix_not;
+            assigns || command
+        }
+        _ => false,
+    }
 }
 
 /// Does `e` emit with a trailing modifier (`x if cond` / `x rescue f`)?
@@ -1679,6 +1727,66 @@ mod tests {
         let zero = Expr::new(Span::default(), ExprNode::Lit { value: Literal::Int { value: 0 } });
         assert_eq!(emit_expr(&send(Some(assign.clone()), ">", vec![zero.clone()])), "(hrc = count) > 0");
         assert_eq!(emit_expr(&send(Some(zero), "+", vec![assign])), "0 + (hrc = count)");
+    }
+
+    #[test]
+    fn open_ended_operand_of_a_symbol_bool_op_keeps_its_parens() {
+        // Source parens are surface only (ingest unwraps them), so the
+        // emitter has to put back the ones a command or a method
+        // assignment needs. Bare, each of the first eleven either does
+        // not parse or parses as something else (`raise E || x` raises
+        // `E || x`). The rest need no parentheses and get none.
+        let ingest = |src: &str| {
+            let parsed = ruby_prism::parse(src.as_bytes());
+            assert_eq!(parsed.errors().count(), 0, "invalid Ruby: {src}");
+            let stmts = parsed.node().as_program_node().unwrap().statements().as_node();
+            crate::ingest::ingest_expr(&stmts, "operand.rb").unwrap()
+        };
+        for (src, want) in [
+            ("user || (raise NotFound.new(404))", "user || (raise NotFound.new(404))"),
+            ("user && (fail \"no\")", "user && (fail \"no\")"),
+            ("user || (puts 1, 2)", "user || (puts 1, 2)"),
+            ("(raise NotFound) || user", "(raise NotFound) || user"),
+            ("(puts 1, 2) && user", "(puts 1, 2) && user"),
+            ("a && (record.slug = s) && b", "a && (record.slug = s) && b"),
+            ("a && (h[:k] = 1) && b", "a && (h[:k] = 1) && b"),
+            ("-> { user || (return 1) }", "-> { user || (return 1) }"),
+            ("xs.each { |x| x || (next 1) }", "xs.each { |x| x || (next 1) }"),
+            ("ok && (pred.=== 1, 2)", "ok && (pred.=== 1, 2)"),
+            ("(pred.=== 1, 2) && ok", "(pred.=== 1, 2) && ok"),
+            // Already fine bare, and still emitted bare.
+            ("user || raise(NotFound)", "user || raise(NotFound)"),
+            ("user || (a + b)", "user || a + b"),
+            ("user || h[:k]", "user || h[:k]"),
+            ("-> { user || (return) }", "-> { user || return }"),
+            ("user or raise NotFound", "user or raise NotFound"),
+            ("a and record.slug = s and b", "a and record.slug = s and b"),
+        ] {
+            let expr = ingest(src);
+            let emitted = emit_expr(&expr);
+            assert_eq!(emitted, want, "source: {src}");
+            assert!(ingest(&emitted) == expr, "IR diverged across emit: {src} -> {emitted}");
+        }
+    }
+
+    #[test]
+    fn synthesized_prefix_not_operand_stays_bare() {
+        // `notice.present?` lowers to `! notice.nil? && …`: a receiver-
+        // less `!` Send, emitted prefix, which binds tighter than `&&`.
+        let nil_check = send(Some(send(None, "notice", vec![])), "nil?", vec![]);
+        let mut not = send(None, "!", vec![nil_check]);
+        if let ExprNode::Send { parenthesized, .. } = &mut *not.node {
+            *parenthesized = false;
+        }
+        assert_eq!(emit_expr(&and_sym(not, send(None, "ok", vec![]))), "! notice.nil? && ok");
+    }
+
+    #[test]
+    fn synthesized_raise_operand_of_a_bool_op_is_parenthesized() {
+        // A lowering builds `Raise` rather than a `raise` call; it emits
+        // as the same command.
+        let raise = Expr::new(Span::default(), ExprNode::Raise { value: lit_str("missing") });
+        assert_eq!(emit_expr(&or_sym(send(None, "found", vec![]), raise)), "found || (raise \"missing\")");
     }
 
     #[test]

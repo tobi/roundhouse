@@ -1918,3 +1918,44 @@ raise "GET /widgets answered #{status}" unless status == 204
         )
         .assert_passes();
 }
+
+/// Not `user || raise NotFound` (a syntax error) or `a && self.x = v && b` (assigns `v && b`): a command or a method assignment as an `&&`/`||` operand keeps its parentheses.
+#[test]
+fn a_command_operand_of_a_boolean_operator_keeps_its_parentheses() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r#"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+
+  def self.find_or_fail(id)
+    find_by(id: id) || (raise ActiveRecord::RecordNotFound, "no article #{id}")
+  end
+
+  def retitle(text, persist)
+    text.present? && (self.title = text) && persist && save
+  end"#,
+        )
+        .write(
+            "test/models/article_guard_test.rb",
+            r#"require "test_helper"
+
+class ArticleGuardTest < ActiveSupport::TestCase
+  test "a raise operand runs only when the left operand is nil" do
+    article = articles(:one)
+    assert_equal article.id, Article.find_or_fail(article.id).id
+    assert_raises(ActiveRecord::RecordNotFound) { Article.find_or_fail(-1) }
+  end
+
+  test "a setter operand assigns its own argument" do
+    article = articles(:one)
+    assert_equal false, article.retitle("Retitled", false)
+    assert_equal "Retitled", article.title
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_guard_test.rb")
+        .assert_passes();
+}
