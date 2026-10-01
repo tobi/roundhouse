@@ -924,16 +924,27 @@ fn ensure_e2e(
     for (path, content) in E2E_SPECS {
         files.push((path.to_string(), content.to_string()));
     }
+    // CI prewarms Chromium from this lockfile. Pin archives to the same
+    // Playwright version so their standalone install reuses that browser.
+    let lock: serde_json::Value =
+        serde_json::from_str(include_str!("../e2e/package-lock.json")).expect("parse e2e lockfile");
+    let playwright_version = lock["packages"]["node_modules/@playwright/test"]["version"]
+        .as_str()
+        .expect("locked Playwright version");
     // "type": "module" matters: global-setup.js is written as ESM, and
     // without it Node loads the file as CommonJS ("exports is not
     // defined in ES module scope").
     files.push((
         "e2e/package.json".to_string(),
-        "{\n  \"name\": \"app-e2e\",\n  \"private\": true,\n  \"type\": \"module\",\n  \
-         \"description\": \"Playwright end-to-end smoke tests for this archive — see ../README.md\",\n  \
-         \"scripts\": {\n    \"test\": \"playwright test\"\n  },\n  \
-         \"devDependencies\": {\n    \"@playwright/test\": \"^1.49.0\"\n  }\n}\n"
-            .to_string(),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "app-e2e",
+            "private": true,
+            "type": "module",
+            "description": "Playwright end-to-end smoke tests for this archive — see ../README.md",
+            "scripts": { "test": "playwright test" },
+            "devDependencies": { "@playwright/test": playwright_version }
+        }))
+        .expect("serialize e2e manifest"),
     ));
     files.push((
         "e2e/playwright.config.js".to_string(),
@@ -6327,6 +6338,30 @@ fn walk_ruby(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_playwright_matches_the_prewarmed_version() {
+        let lock: serde_json::Value =
+            serde_json::from_str(include_str!("../e2e/package-lock.json")).unwrap();
+        let version = lock["packages"]["node_modules/@playwright/test"]["version"]
+            .as_str()
+            .unwrap();
+        for &target in BuildTarget::ALL {
+            let files = ensure_e2e(Vec::new(), target);
+            if matches!(target, BuildTarget::Blog | BuildTarget::TypescriptWorker) {
+                assert!(files.is_empty(), "{} has no server e2e suite", target.as_str());
+                continue;
+            }
+            let manifest = &files.iter().find(|(p, _)| p == "e2e/package.json").unwrap().1;
+            let manifest: serde_json::Value = serde_json::from_str(manifest).unwrap();
+            assert_eq!(
+                manifest["devDependencies"]["@playwright/test"].as_str(),
+                Some(version),
+                "{} must reuse the prewarmed browser, not resolve a newer version",
+                target.as_str()
+            );
+        }
+    }
 
     /// The three test-case parents campfire's `test/channels` and
     /// `test/helpers` write against are lane tests, the way an

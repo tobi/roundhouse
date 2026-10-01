@@ -636,12 +636,21 @@ fn emit_array(elements: &[Expr], style: &crate::expr::ArrayStyle) -> String {
             }
         }
         ArrayStyle::PercentI => {
-            // Symbol list: elements must be symbol literals. Emit bare names
-            // without the leading `:` and space-separate.
+            // Symbol values are decoded. Protect word separators and the
+            // canonical bracket delimiter when rebuilding their source.
             let parts: Vec<String> = elements
                 .iter()
                 .map(|e| match &*e.node {
-                    ExprNode::Lit { value: Literal::Sym { value } } => value.to_string(),
+                    ExprNode::Lit { value: Literal::Sym { value } } => {
+                        let mut escaped = String::new();
+                        for c in value.as_str().chars() {
+                            if matches!(c, '\\' | '[' | ']' | ' ' | '\t' | '\n' | '\r' | '\u{000b}' | '\u{000c}') {
+                                escaped.push('\\');
+                            }
+                            escaped.push(c);
+                        }
+                        escaped
+                    }
                     _ => emit_expr(e),
                 })
                 .collect();
@@ -1396,6 +1405,46 @@ mod tests {
                 parenthesized: true,
             },
         )
+    }
+
+    #[test]
+    fn percent_symbol_arrays_preserve_decoded_values() {
+        let ingest = |source: &str| {
+            let parsed = ruby_prism::parse(source.as_bytes());
+            assert!(parsed.errors().next().is_none(), "invalid Ruby: {source}");
+            let statements = parsed.node().as_program_node().unwrap().statements().as_node();
+            crate::ingest::ingest_expr(&statements, "<symbols>").unwrap()
+        };
+        for (source, expected) in [
+            (r"%i[foo\ bar]", vec!["foo bar"]),
+            (r"%i[foo\]bar]", vec!["foo]bar"]),
+            (r"%i[foo\[bar]", vec!["foo[bar"]),
+            (r"%i[foo\\bar]", vec!["foo\\bar"]),
+            ("%i[one\\\ttwo three\\\nfour]", vec!["one\ttwo", "three\nfour"]),
+            ("%i[a\\\rb b\\\u{000b}c c\\\u{000c}d]", vec!["a\rb", "b\u{000b}c", "c\u{000c}d"]),
+            (r"%i[plain other]", vec!["plain", "other"]),
+        ] {
+            let emitted = emit_expr(&ingest(source));
+            for expression in [ingest(source), ingest(&emitted)] {
+                let ExprNode::Array { elements, style } = &*expression.node else {
+                    panic!("not an array: {source}");
+                };
+                assert_eq!(*style, crate::expr::ArrayStyle::PercentI);
+                let values: Vec<_> = elements.iter().map(|element| {
+                    let ExprNode::Lit { value: Literal::Sym { value } } = &*element.node else {
+                        panic!("not a symbol: {source}");
+                    };
+                    value.as_str()
+                }).collect();
+                assert_eq!(values, expected, "source: {source}; emitted: {emitted}");
+            }
+            let output = std::process::Command::new("ruby")
+                .args(["-rjson", "-e", &format!("print JSON.generate(({emitted}).map(&:to_s))")])
+                .output().expect("native Ruby");
+            assert!(output.status.success(), "{emitted}: {}", String::from_utf8_lossy(&output.stderr));
+            let values: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(values, expected, "native Ruby: {emitted}");
+        }
     }
 
     #[test]

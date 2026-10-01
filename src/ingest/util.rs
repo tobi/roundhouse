@@ -38,8 +38,7 @@ pub(super) fn string_value(node: &Node<'_>) -> Option<String> {
 
 pub(super) fn symbol_value(node: &Node<'_>) -> Option<String> {
     let s = node.as_symbol_node()?;
-    let loc = s.value_loc()?;
-    Some(String::from_utf8_lossy(loc.as_slice()).into_owned())
+    Some(String::from_utf8_lossy(s.unescaped()).into_owned())
 }
 
 /// A symbol OR a string literal, for the DSL slots Rails normalizes

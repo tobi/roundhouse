@@ -48,6 +48,32 @@ reaches the others as their emitters and runtimes catch up.
 | Persistence | `create`, `save`, `update`, `destroy`, `new`/`build` | + `destroy!`, `increment!`, `update_columns`, transactions, dirty tracking predicates |
 | STI | — | `type` column dispatch, subclass scopes, `is_a?` on records |
 
+### SQL identifier boundary
+
+Compiler-generated SQLite DDL, indexes, seeds and Arel/model CRUD quote
+physical identifiers without renaming them, including keywords, spaces,
+hyphens and embedded quotes. Emitted models keep `table_name` raw and
+provide the SQL spelling separately to `Relation`; ordinary filter/order
+chains on those models use it too. A dot in one physical name stays part
+of that name, not a new schema-qualified ingest feature. Quoting metadata
+does not widen the Ruby table-name declarations ingest can interpret.
+
+This is not complete quoting of every SQL path. Association JOIN strings,
+nested dynamic qualifiers/column names and native adapter fallbacks remain
+gaps: accepted source can still generate invalid SQL there, without a new
+unsupported diagnostic. The compiler SQL dialect is SQLite, not
+PostgreSQL/MySQL. `tests/sql_identifiers.rs` executes synthetic SQLite and
+emitted CRuby cases; its other language checks prove DDL string preservation,
+including literal interpolation markers, not whole-project execution on
+every target. Native hand-written models still need SQL-ready identifiers;
+the Base metadata fallback does not dynamically quote arbitrary names.
+
+The runtime typing ledger records one additional unresolved self-send in
+the isolated RBS probe and three additional gradual reads for raw
+`RecordNotFound` messages through Relation's existing untyped model handle.
+The strict fully-typed runtime gate and diagnostics are unchanged; this does
+not add generic class-object/Relation support to strict targets.
+
 ## Action Controller
 
 | | Blog tier | Campfire tier |

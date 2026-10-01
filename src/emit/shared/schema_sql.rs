@@ -45,14 +45,14 @@ pub fn render_schema_statements(schema: &Schema) -> Vec<String> {
         if let Some(vm) = &table.virtual_module {
             out.push(format!(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS {} USING {}({})",
-                table.name.as_str(),
+                crate::naming::sql_ident(table.name.as_str()),
                 vm.module,
                 vm.args.join(", ")
             ));
             continue;
         }
         let mut s = String::new();
-        writeln!(s, "CREATE TABLE IF NOT EXISTS {} (", table.name.as_str()).unwrap();
+        writeln!(s, "CREATE TABLE IF NOT EXISTS {} (", crate::naming::sql_ident(table.name.as_str())).unwrap();
         let mut lines: Vec<String> = Vec::new();
         for col in &table.columns {
             let mut line = String::new();
@@ -94,8 +94,8 @@ pub fn render_schema_statements(schema: &Schema) -> Vec<String> {
             let unique = if idx.unique { "UNIQUE " } else { "" };
             out.push(format!(
                 "CREATE {unique}INDEX IF NOT EXISTS {} ON {} ({})",
-                idx.name.as_str(),
-                table.name.as_str(),
+                crate::naming::sql_ident(idx.name.as_str()),
+                crate::naming::sql_ident(table.name.as_str()),
                 cols.join(", "),
             ));
         }

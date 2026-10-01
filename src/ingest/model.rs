@@ -17,7 +17,8 @@ use crate::{ClassId, Symbol, TableRef};
 use super::expr::ingest_expr;
 use super::util::{
     class_name_path, collect_comments, constant_id_str, constant_path_of, drain_comments_before,
-    find_first_class, flatten_statements, source_has_blank_line, string_value, symbol_value,
+    find_first_class, flatten_statements, source_has_blank_line, string_value, symbol_or_string_value,
+    symbol_value,
 };
 use super::{IngestError, IngestResult};
 
@@ -253,17 +254,6 @@ pub fn ingest_table_name_prefixes(source: &[u8], file: &str) -> TablePrefixes {
     out
 }
 
-/// `self.table_name = "remote_domains"` in a model body: the class
-/// stores in that table, whatever its name would derive. It is the
-/// entire table declaration for a renamed table, so a model that
-/// says it reads the columns of THAT table -- with the conventional
-/// name looked up instead, a `DomainSubscription` over `remote_domains`
-/// had no `shop_id` at all. Only a literal string or symbol counts; a
-/// computed name would have to run to be known.
-fn explicit_table_name(body: ruby_prism::Node<'_>) -> Option<String> {
-    explicit_class_setting(body, "table_name=")
-}
-
 /// `self.table_name_prefix = "three_d_secure_"` in a model body: the
 /// class's own prefix, which wins over any namespace module's.
 fn explicit_table_prefix(body: ruby_prism::Node<'_>) -> Option<String> {
@@ -337,9 +327,9 @@ pub(super) fn ingest_model_with_enum_constants(
     // Rails: `full_table_name_prefix + undecorated_table_name`. The
     // prefix comes from the nearest module parent that declares one,
     // searched innermost-out the way `module_parents` walks.
-    let table_name_override = class.body().and_then(explicit_table_name);
-    let table_name = if let Some(t) = table_name_override {
-        t
+    let table_decl = class.body().map(|body| parse_table_name_decl(body, file)).transpose()?.flatten();
+    let table_name = if let Some((name, _)) = &table_decl {
+        name.clone()
     } else {
         let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
         segments.pop();
@@ -378,6 +368,13 @@ pub(super) fn ingest_model_with_enum_constants(
         let class_consts = ClassConsts::collect(&stmts, file);
         let resolve_constant = |node: &Node<'_>| enum_constants.resolve(node, &enum_owners);
         for stmt in stmts {
+            // Explicit names override convention before schema binding.
+            // Like primary_key, the setter is consumed: lowering already
+            // synthesizes table_name from Model::table for every target.
+            if table_decl.as_ref().is_some_and(|(_, offset)| *offset == stmt.location().start_offset()) {
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
             // `self.primary_key = "key"` is recognized into
             // `Model::primary_key` instead of being kept as a body item:
             // the lowering synthesizes a reader from it, and re-emitting
@@ -2036,6 +2033,82 @@ fn parse_primary_key_decl(stmt: &Node<'_>) -> Option<Symbol> {
     let first = args.arguments().iter().next()?;
     let name = string_value(&first).or_else(|| symbol_value(&first))?;
     Some(Symbol::from(name.as_str()))
+}
+
+/// Bind one direct literal string/symbol `self.table_name` before reading the schema.
+/// Scan the selected class's executable body first: a conditional, compound
+/// or subsequent write must not leave a plausible but incorrect row bound.
+/// Method and nested namespace bodies are separate scopes; their headers
+/// still execute in the enclosing scope and must not hide table writes.
+fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(String, usize)>> {
+    struct Collector {
+        direct: Vec<(usize, usize)>,
+        writes: Vec<Option<(String, usize)>>,
+    }
+    impl Collector {
+        fn record(&mut self, node: &Node<'_>) {
+            if let Some(call) = node.as_call_node() {
+                if constant_id_str(&call.name()) != "table_name=" { return; }
+                let offset = node.location().start_offset();
+                let valid = self.direct.contains(&(offset, node.location().end_offset()))
+                    && call.receiver().is_some_and(|r| r.as_self_node().is_some())
+                    && !call.is_safe_navigation() && call.block().is_none();
+                let name = valid.then_some(())
+                    .and_then(|_| call.arguments())
+                    .filter(|args| args.arguments().len() == 1)
+                    .and_then(|args| symbol_or_string_value(&args.arguments().iter().next()?))
+                    // Shared DDL/DML currently emits bare table names.
+                    // Refuse names needing qualification or SQL quoting.
+                    .filter(|name| {
+                        let mut bytes = name.bytes();
+                        bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                            && !crate::naming::is_sqlite_keyword(name)
+                    });
+                self.writes.push(name.map(|name| (name, offset)));
+            } else {
+                let name = node.as_call_and_write_node().map(|w| w.write_name())
+                    .or_else(|| node.as_call_or_write_node().map(|w| w.write_name()))
+                    .or_else(|| node.as_call_operator_write_node().map(|w| w.write_name()))
+                    .or_else(|| node.as_call_target_node().map(|w| w.name()));
+                if name.is_some_and(|name| constant_id_str(&name) == "table_name=") {
+                    self.writes.push(None);
+                }
+            }
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Collector {
+        fn visit_branch_node_enter(&mut self, node: Node<'pr>) { self.record(&node); }
+        fn visit_leaf_node_enter(&mut self, node: Node<'pr>) { self.record(&node); }
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            if let Some(receiver) = node.receiver() { self.visit(&receiver); }
+        }
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.visit(&node.constant_path());
+            if let Some(superclass) = node.superclass() { self.visit(&superclass); }
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.visit(&node.constant_path());
+        }
+    }
+    let mut collector = Collector {
+        direct: body.as_statements_node()
+            .map(|stmts| stmts.body().iter().filter_map(|s| s.as_call_node())
+                .map(|s| (s.location().start_offset(), s.location().end_offset())).collect())
+            .unwrap_or_else(|| vec![(body.location().start_offset(), body.location().end_offset())]),
+        writes: Vec::new(),
+    };
+    ruby_prism::Visit::visit(&mut collector, &body);
+    if collector.writes.is_empty() {
+        Ok(None)
+    } else if collector.writes.len() == 1 && collector.writes[0].is_some() {
+        Ok(collector.writes.pop().unwrap())
+    } else {
+        Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "table_name binding requires one direct self.table_name assignment to a literal string or symbol naming a safe bare SQL identifier".into(),
+        })
+    }
 }
 
 fn dependent_from_sym(s: &str) -> Option<crate::dialect::Dependent> {

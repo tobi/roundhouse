@@ -437,7 +437,7 @@ fn synth_delete_all(owner: &ClassId, table: &Table) -> MethodDef {
                 Span::synthetic(),
                 ExprNode::Lit {
                     value: Literal::Str {
-                        value: format!("DELETE FROM {}", table.name.as_str()),
+                        value: format!("DELETE FROM {}", crate::naming::sql_ident(table.name.as_str())),
                     },
                 },
             )],
@@ -552,8 +552,8 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table) -> MethodDef {
             arel_lit_str(format!(
                 "SELECT {} FROM {} WHERE {} = ",
                 cols_csv,
-                table.name.as_str(),
-                key.as_str()
+                crate::naming::sql_ident(table.name.as_str()),
+                crate::naming::sql_ident(key.as_str())
             )),
             arel_lit_str("?".to_string()),
             arel_lit_str(" LIMIT 1".to_string()),
@@ -570,8 +570,8 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table) -> MethodDef {
         let sql_prefix = arel_lit_str(format!(
             "SELECT {} FROM {} WHERE {} = ",
             cols_csv,
-            table.name.as_str(),
-            key.as_str()
+            crate::naming::sql_ident(table.name.as_str()),
+            crate::naming::sql_ident(key.as_str())
         ));
         let escape_id = Expr::new(
             Span::synthetic(),
@@ -683,7 +683,7 @@ fn synth_columns_sql(owner: &ClassId, table: &Table) -> MethodDef {
     let cols_csv: String = table
         .columns
         .iter()
-        .map(|c| format!("{t}.{c} AS {c}", t = table.name.as_str(), c = crate::naming::sql_ident(c.name.as_str())))
+        .map(|c| format!("{t}.{c} AS {c}", t = crate::naming::sql_ident(table.name.as_str()), c = crate::naming::sql_ident(c.name.as_str())))
         .collect::<Vec<_>>()
         .join(", ");
     MethodDef {

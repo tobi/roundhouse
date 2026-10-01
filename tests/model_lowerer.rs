@@ -137,6 +137,7 @@ fn article_lowers_with_schema_methods() {
     // update.
     for expected in [
         "table_name",
+        "_table_sql",
         "schema_columns",
         "schema_time_columns",
         "instantiate",
@@ -157,6 +158,7 @@ fn article_lowers_with_schema_methods() {
     // class methods; everything else is instance.
     let class_methods = [
         "table_name",
+        "_table_sql",
         "schema_columns",
         "schema_time_columns",
         "instantiate",
@@ -1413,7 +1415,6 @@ fn unclaimed_model_class_writes_report_spanned_warnings() {
 
     for (statement, setter) in [
         ("self.probe_flag = true", "probe_flag="),
-        ("self.table_name = computed_table", "table_name="),
         ("self.table_name_prefix = computed_prefix", "table_name_prefix="),
     ] {
         let source = format!("class Widget < ApplicationRecord\n  {statement}\nend\n");
@@ -1431,6 +1432,15 @@ fn unclaimed_model_class_writes_report_spanned_warnings() {
         assert_eq!(&source[d.span.start as usize..d.span.end as usize], statement);
         assert!(d.message.contains("Widget"), "{d:?}");
     }
+}
+
+#[test]
+fn computed_model_table_names_fail_before_lowering() {
+    let source = b"class Widget < ApplicationRecord\n  self.table_name = computed_table\nend\n";
+    let error = roundhouse::ingest::ingest_model(
+        source, "app/models/widget.rb", &roundhouse::schema::Schema::default(), &Default::default(),
+    ).expect_err("a computed table must not bind Widget to a guessed schema");
+    assert!(error.to_string().contains("table_name binding"), "{error}");
 }
 
 #[test]

@@ -1473,7 +1473,13 @@ fn every_runtime_method_body_concretely_typed() {
     // `blank?`. What it bought: `ActiveModel::Type::Boolean.new.cast(…)`
     // in five corpus apps (discourse, chatwoot, mastodon, lobsters,
     // forem), which had no method to reach on spinel.
-    const CEILING: usize = 507;
+    // SQL identifier metadata: 507 -> 510, Relation 226 -> 229,
+    // MEASURED against unchanged upstream; other files are unchanged.
+    // first!, find and find_by! read raw @model.table_name for their
+    // error messages once @table holds the SQL spelling. These are
+    // three additional gradual sites through the existing untyped
+    // model contract, not new untyped signatures or relaxed Bar A.
+    const CEILING: usize = 510;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

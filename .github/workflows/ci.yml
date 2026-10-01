@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded PR runs without serializing distinct PRs or main pushes.
+# Pages keeps its separate deployment-only lock below.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
   pages: write
@@ -77,19 +83,20 @@ jobs:
   # goes red it is the analyzer's next entry, not noise.
   # -------------------------------------------------------------------
   store-check:
+    needs: generate-fixture
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: ruby/setup-ruby@v1
+      # generate-fixture already builds the store and runs the guide's
+      # Rails tests before uploading it; analyze that same source tree.
+      - uses: actions/download-artifact@v8
         with:
-          ruby-version: "3.4"
-      - name: Install Rails
-        run: gem install rails
-      - name: Build the store by following the guide (runs its tests)
-        run: cd fixtures && ../scripts/create-store store
+          name: real-blog-fixture
+      - name: Extract fixture
+        run: tar -xzf real-blog.tar.gz
       - name: cargo build
         run: cargo build --release --bin roundhouse
       - name: The analyzer reports no errors, no warnings and no ingest gaps on the store
@@ -336,10 +343,10 @@ jobs:
         run: cargo test --test crystal_toolchain -- --ignored --nocapture
 
   framework-tests-swift:
-    needs: generate-fixture
     # Per-target framework-test conformance gate for the Swift target:
     # transpiles runtime/ruby/test/**/*_test.rb to XCTest classes and runs
-    # them under `swift test`. Complements smoke-swift (the archive's
+    # them together under one `swift test`, independent of the fixtures.
+    # Complements smoke-swift (the archive's
     # real-blog suite): this one runs the framework runtime's own
     # assertions, catching adapter drift the app tests miss. Sibling of
     # framework-tests-kotlin. NOTE: needs a full toolchain with XCTest —
@@ -856,8 +863,9 @@ jobs:
       # only defines that method against libvips >= 8.13 — the runner
       # image's copy is older, so `bin/rails db:prepare` died on the
       # app's own hardening line.
+      # CRuby binds libvips through FFI; only compiled Spinel needs headers.
       - name: System libvips
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev sqlite3
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips42 sqlite3
       - name: Cache the prepared oracle
         id: oracle
         uses: actions/cache@v4
@@ -910,6 +918,45 @@ jobs:
       - name: scripts/campfire-db-differential
         run: scripts/campfire-db-differential /tmp/campfire
 
+  # All GC modes execute the same program; compile it once and preserve
+  # its executable bit in a tarball. The DB differential builds its own
+  # scenario overlay and must not reuse this binary.
+  build-campfire-compare-spinel:
+    needs: build-spinel
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v8
+        with:
+          name: spinel-dist
+          path: spinel-dist
+      - name: Stage spinel binaries
+        run: |
+          chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
+          echo "$PWD/spinel-dist" >> $GITHUB_PATH
+      - name: System libvips + libsqlite3-dev + libjemalloc-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev libsqlite3-dev libjemalloc-dev
+      - name: Fetch pinned once-campfire
+        run: |
+          curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
+          mkdir -p /tmp/campfire && tar -xzf /tmp/campfire.tar.gz -C /tmp/campfire --strip-components=1
+      - name: Emit and build the comparison binary
+        run: |
+          cargo run --quiet --bin roundhouse -- --target spinel /tmp/campfire \
+            -o build/campfire-compare-spinel --allow-unsupported
+          make -C build/campfire-compare-spinel build
+          tar -czf campfire-compare-spinel.tar.gz -C build campfire-compare-spinel
+      - uses: actions/upload-artifact@v7
+        with:
+          name: campfire-compare-spinel
+          path: campfire-compare-spinel.tar.gz
+          compression-level: 0
+          retention-days: 1
+
   # campfire-compare-spinel: the same equivalence, with the compiled
   # BINARY as the emit lane — Rails' broadcast frames vs the binary's.
   # A real gate since matz/spinel#4240 (SanitizeTags inert through an
@@ -928,7 +975,7 @@ jobs:
   # decision needs a workload with a large, stable retained heap, and a
   # long-lived process holding connection registries and a rendered
   # room page is that shape — lobsters is request-shaped, LangArena the
-  # opposite. Both legs consume the SAME build-spinel artifact of the
+  # opposite. All legs consume the SAME comparison binary artifact of the
   # SAME run, so a red `minor-gc` beside a green `default` is the
   # collector alone. That is the report he wants most: reduce it, file
   # it upstream, and say minor-GC-only in the title. Only the served
@@ -953,7 +1000,7 @@ jobs:
   # nothing.
   campfire-compare-spinel:
     name: campfire-compare-spinel (${{ matrix.gc }})
-    needs: build-spinel
+    needs: build-campfire-compare-spinel
     runs-on: ubuntu-latest
     timeout-minutes: 45
     continue-on-error: true
@@ -988,6 +1035,14 @@ jobs:
         run: |
           chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
+      - uses: actions/download-artifact@v8
+        with:
+          name: campfire-compare-spinel
+      - name: Extract the comparison binary
+        run: |
+          mkdir -p build
+          tar -xzf campfire-compare-spinel.tar.gz -C build
+          test -x build/campfire-compare-spinel/build/blog
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
         # libjemalloc-dev because the emitted spin.toml names jemalloc as
         # this program's allocator and `spin build` links `-ljemalloc`.
@@ -1010,7 +1065,7 @@ jobs:
       - name: Walk gems
         run: gem install websocket-driver --no-document
       - name: scripts/campfire-compare --spinel ${{ matrix.flag }}
-        run: scripts/campfire-compare --spinel ${{ matrix.flag }} /tmp/campfire
+        run: scripts/campfire-compare --reuse "$PWD/build/campfire-compare-spinel" --spinel ${{ matrix.flag }} /tmp/campfire
       - name: scripts/campfire-db-differential --spinel
         if: matrix.gc == 'default'
         run: scripts/campfire-db-differential --spinel /tmp/campfire
@@ -1113,7 +1168,7 @@ jobs:
       #             the poster frame got attached.
       - name: Install libvips (ruby-vips binds it through FFI) and ffmpeg
         run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev ffmpeg
+          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42 ffmpeg
       #   concurrent-ruby, net-http-persistent, web-push — also from the
       #             app, all three behind `WebPush::Pool`: the thread
       #             pools it posts deliveries to, the keep-alive client
@@ -1897,7 +1952,7 @@ jobs:
   # boot knowledge lives here (that's the point — it's all in the
   # archive). The repo-side playwright install pre-warms the browser
   # cache + system deps so the README's own `npx playwright install
-  # chromium` (same ^1.49 range) is a cache hit.
+  # chromium` (version pinned to the repo's e2e lockfile) is a cache hit.
   #
   # ruby/jruby ride smoke too: their scaffold document ships as
   # SPECIMEN.md and the generated quick-start takes README.md. Only
@@ -2213,7 +2268,7 @@ jobs:
   # publish *current emit* even when per-target toolchain/compare jobs
   # fail (broken emit is exactly what's interesting to investigate).
   #
-  # So build-site only gates on the fixture being available. It does
+  # So build-site only gates on the fixture and compiler wasm. It does
   # not gate on unit / toolchain-* / compare-* — a flaky elixir CI run
   # or a known-broken target shouldn't stall the archive workflow, and
   # the archive itself is available via the workflow-run artifact even
@@ -2228,15 +2283,9 @@ jobs:
   # rebuilding the site.
   # -------------------------------------------------------------------
   build-site:
-    # campfire-conformance is here for ORDERING ONLY — its summary.json is
-    # this job's input. The `if:` deliberately does not require it to have
-    # SUCCEEDED: that job is blocking (pinned input, so a red floor is a
-    # real regression and must fail the run), but the page it feeds is the
-    # thing that says WHAT regressed, and suppressing the page on the run
-    # where it is most useful would be exactly backwards. A missing
-    # artifact degrades to a skipped render and a warning, not a broken
-    # site build.
-    needs: [generate-fixture, build-wasm, campfire-conformance, build-campfire-archive]
+    # Publish blog archives before waiting for the independent Campfire
+    # inputs. assemble-site adds those to the same bytes before deployment.
+    needs: [generate-fixture, build-wasm]
     if: ${{ !cancelled() && needs.generate-fixture.result == 'success' && needs.build-wasm.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -2311,39 +2360,6 @@ jobs:
         env:
           ROUNDHOUSE_ASSETS_DIR: build/assets
         run: cargo run --release --bin roundhouse -- --site
-
-      # The campfire archive, built by the parallel build-campfire-archive
-      # job. It lands AFTER `--site` because build_site() removes and
-      # recreates the output directory, which would take _site/campfire
-      # with it.
-      #
-      # The bytes go live at rubys.github.io/roundhouse/campfire/spinel.tgz
-      # (source; needs a spinel checkout) and campfire/docker.tgz (the
-      # `spin pack` output with a Dockerfile; needs Docker and nothing
-      # else). Both are linked from site/apps/campfire.html.
-      #
-      # Tolerant of a missing artifact ON PURPOSE, and for the same reason
-      # this job does not require campfire-conformance to have SUCCEEDED:
-      # per matz/spinel#314 the published archives are an extraction
-      # surface for upstream bug repros, so a broken campfire emit must not
-      # stall publication of the eleven blog archives beside it.
-      - uses: actions/download-artifact@v8
-        continue-on-error: true
-        with:
-          name: campfire-archive
-          path: _site/campfire
-      - name: Report campfire archives
-        run: |
-          if [ -f _site/campfire/spinel.tgz ]; then
-            echo "campfire archive: $(du -h _site/campfire/spinel.tgz | cut -f1)"
-          else
-            echo "::warning::no campfire archive this run (build-campfire-archive did not produce one)"
-          fi
-          if [ -f _site/campfire/docker.tgz ]; then
-            echo "campfire Docker archive: $(du -h _site/campfire/docker.tgz | cut -f1)"
-          else
-            echo "::warning::no campfire Docker archive this run (spinel toolchain missing?)"
-          fi
 
       # Live SharedWorker blog demo → _site/blog/. Emits real-blog under
       # the worker profile, vite-builds it with ROUNDHOUSE_BASE set to the
@@ -2663,35 +2679,8 @@ jobs:
         if: steps.fetch-campfire-bench.outputs.campfire_bench == 'present'
         run: scripts/bench-report _site/bench/campfire/summary.json _site/bench/campfire/index.html
 
-      # Campfire conformance — ONCE Campfire's own Minitest suite run
-      # against an emit of the pinned CAMPFIRE_SHA, by the
-      # campfire-conformance job in THIS run. Unlike its lobsters sibling
-      # the data is not fetched from a bench box: the input is pinned, so
-      # the suite runs in CI and the page published beside this commit
-      # describes this commit.
-      #
-      # `continue-on-error`, because the artifact is absent whenever that
-      # job died before writing it — which must degrade to "no page", not
-      # "no site".
-      - name: Fetch campfire conformance data
-        id: fetch-campfire-suite
-        continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: campfire-conformance-summary
-          path: _site/bench/campfire-suite
-      - name: Render campfire conformance page
-        run: |
-          if [ -f _site/bench/campfire-suite/summary.json ]; then
-            scripts/campfire-suite-report _site/bench/campfire-suite _site/bench/campfire-suite/index.html
-          else
-            echo "::warning::campfire conformance summary unavailable; skipping conformance page render"
-            rm -rf _site/bench/campfire-suite
-            rmdir _site/bench 2>/dev/null || true
-          fi
-
       # Campfire conformance, COMPILED — the same emitted source as the
-      # page above, with each test file built to its own native binary by
+      # interpreted report, with each test file built to its own native binary by
       # spinel and run. Fetched from the bench box rather than produced
       # here, and that split is the whole difference between the two:
       #
@@ -2743,11 +2732,103 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
+          name: site-base
+          path: _site
+
+  # Finish Pages assembly without keeping blog smoke jobs behind Campfire.
+  assemble-site:
+    # campfire-conformance is here for ORDERING ONLY — its summary.json is
+    # this job's input. The `if:` deliberately does not require it to have
+    # SUCCEEDED: that job is blocking (pinned input, so a red floor is a
+    # real regression and must fail the run), but the page it feeds is the
+    # thing that says WHAT regressed, and suppressing the page on the run
+    # where it is most useful would be exactly backwards. A missing
+    # artifact degrades to a skipped render and a warning, not a broken
+    # site build.
+    needs: [build-site, campfire-conformance, build-campfire-archive]
+    if: ${{ !cancelled() && needs.build-site.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - uses: actions/download-artifact@v8
+        with:
+          name: site-base
+          path: site-base
+      - name: Restore the site
+        run: mkdir -p _site && tar -xf site-base/artifact.tar -C _site
+
+      # The campfire archive, built by the parallel build-campfire-archive
+      # job. It lands AFTER `--site` because build_site() removes and
+      # recreates the output directory, which would take _site/campfire
+      # with it.
+      #
+      # The bytes go live at rubys.github.io/roundhouse/campfire/spinel.tgz
+      # (source; needs a spinel checkout) and campfire/docker.tgz (the
+      # `spin pack` output with a Dockerfile; needs Docker and nothing
+      # else). Both are linked from site/apps/campfire.html.
+      #
+      # Tolerant of a missing artifact ON PURPOSE, and for the same reason
+      # this job does not require campfire-conformance to have SUCCEEDED:
+      # per matz/spinel#314 the published archives are an extraction
+      # surface for upstream bug repros, so a broken campfire emit must not
+      # stall publication of the eleven blog archives beside it.
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: campfire-archive
+          path: _site/campfire
+      - name: Report campfire archives
+        run: |
+          if [ -f _site/campfire/spinel.tgz ]; then
+            echo "campfire archive: $(du -h _site/campfire/spinel.tgz | cut -f1)"
+          else
+            echo "::warning::no campfire archive this run (build-campfire-archive did not produce one)"
+          fi
+          if [ -f _site/campfire/docker.tgz ]; then
+            echo "campfire Docker archive: $(du -h _site/campfire/docker.tgz | cut -f1)"
+          else
+            echo "::warning::no campfire Docker archive this run (spinel toolchain missing?)"
+          fi
+
+      # Campfire conformance — ONCE Campfire's own Minitest suite run
+      # against an emit of the pinned CAMPFIRE_SHA, by the
+      # campfire-conformance job in THIS run. Unlike its lobsters sibling
+      # the data is not fetched from a bench box: the input is pinned, so
+      # the suite runs in CI and the page published beside this commit
+      # describes this commit.
+      #
+      # `continue-on-error`, because the artifact is absent whenever that
+      # job died before writing it — which must degrade to "no page", not
+      # "no site".
+      - name: Fetch campfire conformance data
+        id: fetch-campfire-suite
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: campfire-conformance-summary
+          path: _site/bench/campfire-suite
+      - name: Render campfire conformance page
+        run: |
+          if [ -f _site/bench/campfire-suite/summary.json ]; then
+            scripts/campfire-suite-report _site/bench/campfire-suite _site/bench/campfire-suite/index.html
+          else
+            echo "::warning::campfire conformance summary unavailable; skipping conformance page render"
+            rm -rf _site/bench/campfire-suite
+            rmdir _site/bench 2>/dev/null || true
+          fi
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
           path: _site
 
   deploy:
     needs:
-      - build-site
+      - assemble-site
       - unit
     if: github.ref == 'refs/heads/main'
     # Only one Pages deployment at a time. Scoped to this job, not the

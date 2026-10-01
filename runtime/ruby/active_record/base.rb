@@ -169,6 +169,13 @@ module ActiveRecord
       raise NotImplementedError, "#{name}.table_name must be overridden"
     end
 
+    # Emitted schema-backed models override this with the compiler's
+    # quoted identifier. The default preserves hand-written ordinary
+    # models; table_name itself always remains raw metadata.
+    def self._table_sql
+      table_name
+    end
+
     def self.schema_columns
       raise NotImplementedError, "#{name}.schema_columns must be overridden"
     end

@@ -867,7 +867,13 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // lobsters' `story.tags & filtered_tags`, which raised TypeError on
     // every story page, and intersections that no longer come back empty
     // for two sides that loaded the same rows.
-    const CEILING: usize = 1055;
+    // SQL identifier metadata: 1055 -> 1056, +1, MEASURED against the
+    // unchanged upstream corpus by method. Base#_table_sql delegates to
+    // table_name for native ordinary models; this probe does not resolve
+    // class self-sends. Emitted models return a typed SQL identifier
+    // literal instead. Relation's count is unchanged, and the separate
+    // every_runtime_method_body_is_fully_typed gate remains in force.
+    const CEILING: usize = 1056;
 
     assert!(
         all_untyped.len() <= CEILING,

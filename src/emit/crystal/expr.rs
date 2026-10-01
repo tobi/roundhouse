@@ -1692,7 +1692,9 @@ pub(super) fn emit_literal(l: &Literal) -> String {
                 format!("{s}.0")
             }
         }
-        Literal::Str { value } => format!("{value:?}"),
+        // Rust's debug escaping covers quotes/backslashes, but Crystal
+        // also interpolates #{...}; literal data must stay literal.
+        Literal::Str { value } => format!("{value:?}").replace("#{", "\\#{"),
         Literal::Sym { value } => format!(":{value}"),
         Literal::Regex { pattern, flags } => format!(
             "/{}/{flags}",

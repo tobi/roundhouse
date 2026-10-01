@@ -3372,7 +3372,7 @@ fn ruby_regex_to_go(pattern: &str) -> String {
 /// rejects (`U+007B '{' illegal in escape sequence`); Go uses `\b`
 /// `\f` plus the fixed-width `\xHH` / `\uHHHH` / `\UHHHHHHHH`
 /// forms. Covers all controls + the standard escapable chars.
-fn go_str_literal(s: &str) -> String {
+pub(super) fn go_str_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {

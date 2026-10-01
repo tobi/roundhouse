@@ -8,7 +8,7 @@ module ActiveRecord
   #
   # No `method_missing`, no `define_method`: every method is written out.
   # The model is held as a plain class-object value (`@model`) whose
-  # `table_name` / `instantiate` class methods supply the per-model facts;
+  # `_table_sql` / `instantiate` class methods supply the per-model facts;
   # calling them is ordinary dispatch.
   #
   # Database access and value escaping go through `ActiveRecord.adapter`
@@ -29,7 +29,7 @@ module ActiveRecord
   class Relation
     def initialize(model)
       @model = model
-      @table = model.table_name
+      @table = model._table_sql
       @wheres = []
       @joins = []
       @orders = []
@@ -836,7 +836,7 @@ module ActiveRecord
     # dispatch layer) instead of returning nil when the relation is empty.
     def first!
       record = first
-      raise RecordNotFound, "Couldn't find record in #{@table}" if record.nil?
+      raise RecordNotFound, "Couldn't find record in #{@model.table_name}" if record.nil?
       record
     end
 
@@ -1183,7 +1183,7 @@ module ActiveRecord
       record = first
       @wheres.pop
       if record.nil?
-        raise RecordNotFound, "Couldn't find record in #{@table} with id=#{id}"
+        raise RecordNotFound, "Couldn't find record in #{@model.table_name} with id=#{id}"
       end
       record
     end
@@ -1211,7 +1211,7 @@ module ActiveRecord
     # `find_by!` — `find_by` that raises `RecordNotFound` on no match.
     def find_by!(conditions)
       record = find_by(conditions)
-      raise RecordNotFound, "Couldn't find record in #{@table}" if record.nil?
+      raise RecordNotFound, "Couldn't find record in #{@model.table_name}" if record.nil?
       record
     end
 

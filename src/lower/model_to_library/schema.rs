@@ -62,7 +62,7 @@ pub(super) fn push_schema_methods(
                 methods.push(synth_temporal_writer(owner, col));
             }
         }
-        methods.push(synth_attr_writer(owner, col));
+        methods.push(synth_attr_writer(owner, col, model));
         methods.push(synth_column_predicate(owner, col));
         // `<col>_previously_changed?` and `saved_change_to_<col>?`
         // (ActiveModel::Dirty subset) — both read the runtime Base's
@@ -143,20 +143,27 @@ pub(super) fn push_schema_methods(
     // push::subscriptions` and SQLite answered "unrecognized token
     // ':'". Third copy of this rule found in one session
     // ([[feedback_port_dont_derive_inflections]]).
-    methods.push(MethodDef {
-        name_span: crate::span::Span::synthetic(),
-        name: Symbol::from("table_name"),
-        receiver: MethodReceiver::Class,
-        params: Vec::new(),
-        body: lit_str(model.table.0.as_str().to_string()),
-        signature: Some(fn_sig(vec![], Ty::Str)),
-        effects: EffectSet::default(),
-        enclosing_class: Some(owner.0.clone()),
-        kind: AccessorKind::Method,
-        is_async: false,
+    // Public metadata stays raw; Relation consumes the SQL spelling so
+    // dynamic chains use the same quoting authority as compiled Arel.
+    for (name, value) in [
+        ("table_name", model.table.0.as_str().to_string()),
+        ("_table_sql", crate::naming::sql_ident(model.table.0.as_str())),
+    ] {
+        methods.push(MethodDef {
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from(name),
+            receiver: MethodReceiver::Class,
+            params: Vec::new(),
+            body: lit_str(value),
+            signature: Some(fn_sig(vec![], Ty::Str)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(owner.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
             mutates_self: false,
             block_param: None,
-    });
+        });
+    }
 
     // def self.primary_key — emitted ONLY when the model overrode
     // Rails' default, so the runtime Base's `"id"` answers for everyone
@@ -987,14 +994,15 @@ fn synth_key_alias_writer(owner: &ClassId, key: &Column) -> MethodDef {
     }
 }
 
-fn synth_attr_writer(owner: &ClassId, col: &Column) -> MethodDef {
+fn synth_attr_writer(owner: &ClassId, col: &Column, model: &Model) -> MethodDef {
     let value_param = Symbol::from("value");
     // Writers always take the STORAGE type and write the storage ivar:
     // `<col>=` / `@<col>` in general, `<col>_raw=` / `@<col>_raw` (Str)
     // for a temporal column. Every synthesized hydration path assigns
     // stored text, so this keeps the whole write side String-shaped.
     let col_ty = super::ty_of_column_slot(col);
-    let rhs = with_ty(var_ref(value_param.clone()), col_ty.clone());
+    let rhs = enum_setter_value(model, col, with_ty(var_ref(value_param.clone()), col_ty.clone()))
+        .unwrap_or_else(|| with_ty(var_ref(value_param.clone()), col_ty.clone()));
     // Assign expression evaluates to the RHS in Ruby; same in TS.
     let body = with_ty(
         Expr::new(
@@ -2642,15 +2650,51 @@ fn synth_index_read(owner: &ClassId, table: &Table, model: &Model) -> MethodDef 
 /// inlined table so all thirteen targets get one body.
 ///
 /// `None` — leaving today's `Cast` — for a column that is not an enum,
-/// for a NULLABLE one (the surrounding `|| <default>` / nil-guard
-/// shapes decide nil there, and a helper that answers `0` for nil would
-/// overwrite that decision), and for a mapping whose stored values are
-/// not all integers (nothing in the corpus writes one, and a guess
-/// would write the wrong cell).
+/// and for a mapping whose stored values are not all integers (nothing
+/// in the corpus writes one, and a guess would write the wrong cell). A
+/// NULLABLE column keeps its nil through `nil_guarded`.
 fn enum_label_cast(model: &Model, col: &Column, raw: Expr) -> Option<Expr> {
-    if matches!(super::ty_of_column_slot(col), Ty::Union { .. }) {
-        return None;
+    let text = Expr::new(Span::synthetic(), ExprNode::Cast { value: raw.clone(), target_ty: Ty::Str });
+    let call = enum_int_call(model, col, with_ty(text, Ty::Str))?;
+    Some(nil_guarded(col, raw, call))
+}
+
+/// The setter's twin of [`enum_label_cast`]: `record.status = "archived"` reaches the column through `status=`.
+fn enum_setter_value(model: &Model, col: &Column, value: Expr) -> Option<Expr> {
+    let text = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(value.clone()),
+            method: Symbol::from("to_s"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    let call = enum_int_call(model, col, with_ty(text, Ty::Str))?;
+    Some(nil_guarded(col, value, call))
+}
+
+// Not a helper answering nil itself: a nullable column's nil has to stay nil, and `enum_int` answers an Integer.
+fn nil_guarded(col: &Column, raw: Expr, call: Expr) -> Expr {
+    if !matches!(super::ty_of_column_slot(col), Ty::Union { .. }) {
+        return call;
     }
+    let is_nil = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(raw), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false },
+        ),
+        Ty::Bool,
+    );
+    let nil = with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }), Ty::Nil);
+    with_ty(
+        Expr::new(Span::synthetic(), ExprNode::If { cond: is_nil, then_branch: nil, else_branch: call }),
+        super::ty_of_column_slot(col),
+    )
+}
+
+fn enum_int_call(model: &Model, col: &Column, text: Expr) -> Option<Expr> {
     let mapping = model.enums.get(&col.name)?;
     if mapping.is_empty() {
         return None;
@@ -2690,17 +2734,7 @@ fn enum_label_cast(model: &Model, col: &Column, raw: Expr) -> Option<Expr> {
                 )),
                 method: Symbol::from("enum_int"),
                 args: vec![
-                    // `Cast` to Str is the bridge the strict targets
-                    // use for every other attrs read; the ruby family
-                    // unwraps it to the bare value, which compares
-                    // equal to a label just the same.
-                    with_ty(
-                        Expr::new(
-                            Span::synthetic(),
-                            ExprNode::Cast { value: raw, target_ty: Ty::Str },
-                        ),
-                        Ty::Str,
-                    ),
+                    text,
                     array(labels, Ty::Str),
                     array(values, Ty::Int),
                 ],

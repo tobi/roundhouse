@@ -928,6 +928,78 @@ fn method_ref_block_arg_runs() {
         .assert_passes();
 }
 
+/// A literal table override must reach the emitted row readers and SQL,
+/// not merely quiet the analyzer. Two differently named models share the
+/// real articles table via string/symbol declarations; writes through either
+/// must be visible to Article, without touching convention-derived decoys.
+#[test]
+fn explicit_model_table_names_run_against_the_declared_table() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "  add_foreign_key \"comments\", \"articles\"",
+            r#"  create_table "archived_articles" do |t|
+    t.string "title"
+    t.text "body"
+  end
+  create_table "ledger_entries" do |t|
+    t.string "title"
+    t.text "body"
+  end
+  add_foreign_key "comments", "articles""#,
+        )
+        .write(
+            "app/models/archived_article.rb",
+            "class ArchivedArticle < ApplicationRecord\n  self.table_name = \"articles\"\nend\n",
+        )
+        .write(
+            "app/models/ledger/entry.rb",
+            r#"module Ledger
+  def self.table_name_prefix
+    "ledger_"
+  end
+  class Entry < ApplicationRecord
+    self.table_name = :"art\x69cles"
+  end
+end
+"#,
+        )
+        .write(
+            "app/models/decoy/archived_article.rb",
+            "class Decoy::ArchivedArticle < ApplicationRecord\nend\n",
+        )
+        .write(
+            "app/models/ledger_entry.rb",
+            "class LedgerEntry < ApplicationRecord\nend\n",
+        )
+        .run_ruby(
+            r#"raise ArchivedArticle.table_name.inspect unless ArchivedArticle.table_name == "articles"
+raise Ledger::Entry.table_name.inspect unless Ledger::Entry.table_name == "articles"
+decoy = Decoy::ArchivedArticle.create!(title: "Conventional decoy", body: "Leave untouched")
+prefixed_decoy = LedgerEntry.create!(title: "Prefixed decoy", body: "Leave untouched too")
+record = ArchivedArticle.create!(title: "Original", body: "A long enough body")
+raise unless Article.find(record.id).title == "Original"
+entry = Ledger::Entry.find(record.id)
+raise unless entry.title == "Original"
+entry.update!(title: "Changed")
+raise unless Article.find(record.id).title == "Changed"
+entry.destroy!
+raise unless Article.find_by(id: record.id).nil?
+symbol_record = Ledger::Entry.create!(title: "Symbol-created", body: "A long enough body")
+raise unless Article.find(symbol_record.id).title == "Symbol-created"
+ArchivedArticle.find(symbol_record.id).update!(title: "String-updated")
+raise unless Ledger::Entry.find(symbol_record.id).title == "String-updated"
+Ledger::Entry.find(symbol_record.id).destroy!
+raise unless Article.find_by(id: symbol_record.id).nil?
+raise unless Decoy::ArchivedArticle.count == 1
+raise unless Decoy::ArchivedArticle.find(decoy.id).title == "Conventional decoy"
+raise unless LedgerEntry.count == 1
+raise unless LedgerEntry.find(prefixed_decoy.id).title == "Prefixed decoy"
+"#,
+        )
+        .assert_passes();
+}
+
 /// Not only `Model.scope`: a scope the target model inherits from an abstract base answers on an association reaching it too.
 #[test]
 fn an_inherited_scope_answers_on_an_association() {
@@ -1109,5 +1181,47 @@ end
 raise "constructor identity" unless FactoryPacket.build.class == FactoryReading
 raise "constructor consumer" unless FactoryConsumer.label == "CUSTOM"
 "#)
+        .assert_passes();
+}
+
+/// Not `"published".to_i`: an enum column assigned a label at run time stores the label's value, as Rails does.
+#[test]
+fn an_enum_label_assigned_at_run_time_stores_its_value() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"state\", default: 0",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  enum :state, { draft: 0, published: 1 }",
+        )
+        .write(
+            "test/models/article_enum_label_test.rb",
+            r#"require "test_helper"
+
+class ArticleEnumLabelTest < ActiveSupport::TestCase
+  test "a label reaching the setter, update or []= stores its value" do
+    labels = ["published", "draft"]
+    article = articles(:one)
+
+    article.state = labels[0]
+    article.save!
+    assert Article.find(article.id).published?
+
+    article.update(state: labels[1])
+    assert Article.find(article.id).draft?
+
+    article[:state] = labels[0]
+    article.save!
+    assert Article.find(article.id).published?
+    assert_equal 0, Article.where(state: :draft).where(id: article.id).count
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_enum_label_test.rb")
         .assert_passes();
 }
