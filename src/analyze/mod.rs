@@ -26,6 +26,8 @@
 mod alba;
 mod body;
 pub(crate) use body::string_answers;
+pub(crate) use body::ConstResolverTask;
+pub use body::PreparedConstResolver;
 pub mod async_color;
 pub mod attribution;
 pub mod preload;
@@ -776,7 +778,7 @@ impl Analyzer {
             concern_folded: HashMap::new(),
             refined_action_bindings: HashMap::new(),
             inquirers: inquiry::inquirer_methods(app),
-            const_resolver: std::sync::Arc::new(body::ConstResolver::from_app_sources(&app.sources)),
+            const_resolver: app.const_resolver.for_sources(&app.sources),
             typed_constants: IdentityHashMap::default(),
         }
     }

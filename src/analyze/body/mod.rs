@@ -24,7 +24,8 @@ use crate::ty::{Row, Ty};
 
 mod diagnostic;
 mod const_resolution;
-pub(crate) use const_resolution::ConstResolver;
+pub(crate) use const_resolution::{ConstResolver, ConstResolverTask};
+pub use const_resolution::PreparedConstResolver;
 use const_resolution::ResolvedConstant;
 mod narrowing;
 mod send;

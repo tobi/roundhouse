@@ -10,9 +10,11 @@ use std::sync::Arc;
 use rubydex::indexing::local_graph::LocalGraph;
 use rubydex::indexing::{IndexerBackend, LanguageId, build_local_graph};
 use rubydex::model::declaration::Declaration;
+use rubydex::model::document::Document as RubydexDocument;
 use rubydex::model::definitions::Definition;
 use rubydex::model::graph::Graph;
 use rubydex::model::identity_maps::IdentityHashMap;
+use rubydex::model::name::ParentScope;
 use rubydex::model::ids::{DeclarationId, UriId};
 use rubydex::resolution::Resolver;
 
@@ -45,15 +47,21 @@ pub(super) enum ResolvedConstant {
     Value(DeclarationId),
 }
 
-type Answers = HashMap<(FileId, u32), Option<ResolvedConstant>>;
+/// Rubydex answers for one source file, keyed by the byte offset of
+/// each written constant name.
+type FileAnswers = HashMap<u32, Option<ResolvedConstant>>;
 
 pub(crate) struct ConstResolver {
-    references: Answers,
-    indexed_files: Vec<bool>,
+    /// Indexed by `FileId - 1`. `None` marks a source that Rubydex did
+    /// not index, such as an ERB template.
+    files: Vec<Option<FileAnswers>>,
 }
 
-/// One Rubydex input document. The thread that indexes it builds the
-/// URI, so each URI costs one allocation.
+fn is_indexed(source: &SourceFile) -> bool {
+    source.path.ends_with(".rb")
+}
+
+/// One Rubydex input document. The indexing thread builds its URI.
 struct Document<'a> {
     uri_prefix: &'static str,
     path: &'a str,
@@ -64,15 +72,59 @@ struct Document<'a> {
 impl Document<'_> {
     fn index(&self) -> LocalGraph {
         let uri = [self.uri_prefix, self.path].concat();
-        build_local_graph(uri, self.text, &self.language, IndexerBackend::RubyIndexer)
+        constant_graph(
+            build_local_graph(uri, self.text, &self.language, IndexerBackend::RubyIndexer),
+            self.text,
+        )
     }
 }
 
-/// The caller thread merges local graphs one at a time. On an app with
-/// 60 MB of Ruby, more than 8 parsers made the merge no faster and held
-/// more parse memory.
+/// Roundhouse asks Rubydex only about constants written in the source.
+/// Instance methods, variables, attributes, visibility calls, and method
+/// aliases do not change how a constant resolves, so they leave the graph
+/// before the merge. Methods with a receiver stay, because `def self.x`
+/// and `def X.y` create singleton classes. The indexer also records a
+/// `<X>` reference to the singleton class of each method call receiver.
+/// No written name resolves through those references, and in a large
+/// app they are 38% of all references, so they leave too. The rebuilt
+/// document lists only the kept entries.
+fn constant_graph(local: LocalGraph, text: &str) -> LocalGraph {
+    let (uri_id, document, definitions, strings, names, constant_references, _, _) =
+        local.into_parts();
+    let document = RubydexDocument::new(document.uri().to_string(), text);
+    let mut graph = LocalGraph::from_parts(uri_id, document, strings, names);
+    for definition in definitions.into_values() {
+        let keep = match &definition {
+            Definition::Class(_)
+            | Definition::SingletonClass(_)
+            | Definition::Module(_)
+            | Definition::Constant(_)
+            | Definition::ConstantAlias(_)
+            | Definition::ConstantVisibility(_) => true,
+            Definition::Method(method) => method.receiver().is_some(),
+            _ => false,
+        };
+        if keep {
+            graph.add_definition(definition);
+        }
+    }
+    for reference in constant_references.into_values() {
+        let singleton_receiver = matches!(
+            graph.names().get(reference.name_id()).map(|name| name.parent_scope()),
+            Some(ParentScope::Attached(_))
+        );
+        if !singleton_receiver {
+            graph.add_constant_reference(reference);
+        }
+    }
+    graph
+}
+
+/// Rubydex work runs on at most this many threads. The caller thread
+/// merges local graphs one at a time. On an app with 60 MB of Ruby, more
+/// than 8 parsers made the merge no faster and held more parse memory.
 #[cfg(not(target_arch = "wasm32"))]
-const MAX_INDEX_WORKERS: usize = 8;
+const MAX_WORKERS: usize = 8;
 
 /// Rubydex parses each document independently, so workers build the
 /// local graphs in parallel. This thread merges them in input order, so
@@ -86,7 +138,7 @@ fn index_documents(documents: &[Document<'_>]) -> Graph {
 
     let workers = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
-        .min(MAX_INDEX_WORKERS)
+        .min(MAX_WORKERS)
         .min(documents.len());
     let next = AtomicUsize::new(0);
     let mut graph = Graph::new();
@@ -168,29 +220,22 @@ fn is_assigned_value(graph: &Graph, declaration: &Declaration) -> bool {
 impl ConstResolver {
     /// Index real Ruby app sources with their original 1-based file IDs.
     pub(crate) fn from_app_sources(sources: &[SourceFile]) -> Self {
-        let indexed_files: Vec<bool> =
-            sources.iter().map(|source| source.path.ends_with(".rb")).collect();
-        let mut graph =
-            crate::timings::phase("rubydex: index", || index_sources(sources, &indexed_files));
+        let mut graph = crate::timings::phase("rubydex: index", || index_sources(sources));
         // Rubydex resolves all source references after every file enters
         // its graph, including declarations in later files.
         crate::timings::phase("rubydex: resolve", || Resolver::new(&mut graph).resolve());
-        let references = crate::timings::phase("rubydex: answers", || {
-            collect_answers(&graph, sources, &indexed_files)
-        });
-        crate::timings::phase("rubydex: release graph", || drop(graph));
-        Self {
-            references,
-            indexed_files,
-        }
+        let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
+        drop(graph);
+        Self { files }
+    }
+
+    fn file(&self, file: FileId) -> Option<&FileAnswers> {
+        let index = file.0.checked_sub(1)?;
+        self.files.get(index as usize)?.as_ref()
     }
 
     pub(super) fn has_source_file(&self, file: FileId) -> bool {
-        file.0
-            .checked_sub(1)
-            .and_then(|index| self.indexed_files.get(index as usize))
-            .copied()
-            .unwrap_or(false)
+        self.file(file).is_some()
     }
 
     /// IR spans cover the entire `A::B::C` path. Rubydex records the
@@ -202,14 +247,85 @@ impl ConstResolver {
     ) -> Option<Option<&ResolvedConstant>> {
         let length = u32::try_from(path.last()?.as_str().len()).ok()?;
         let start = span.end.checked_sub(length)?;
-        self.references.get(&(span.file, start)).map(Option::as_ref)
+        self.file(span.file)?.get(&start).map(Option::as_ref)
+    }
+}
+
+/// Rubydex answers that ingest resolved for `App::sources`. They derive
+/// from the sources, so `App` does not serialize or compare them.
+#[derive(Clone, Default)]
+pub struct PreparedConstResolver(Option<Arc<ConstResolver>>);
+
+impl PreparedConstResolver {
+    /// The answers that ingest prepared, if they cover these sources.
+    /// No pass edits `App::sources` after ingest, so a matching count
+    /// means the same sources. Other apps get new answers.
+    pub(crate) fn for_sources(&self, sources: &[SourceFile]) -> Arc<ConstResolver> {
+        match &self.0 {
+            Some(resolver) if resolver.files.len() == sources.len() => {
+                Arc::clone(resolver)
+            }
+            _ => Arc::new(ConstResolver::from_app_sources(sources)),
+        }
+    }
+}
+
+impl PartialEq for PreparedConstResolver {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for PreparedConstResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = if self.0.is_some() { "ready" } else { "absent" };
+        write!(f, "PreparedConstResolver({state})")
+    }
+}
+
+/// Rubydex resolution that runs while ingest finishes the passes that
+/// register no sources. The browser build has no threads, so it
+/// resolves before those passes.
+pub(crate) struct ConstResolverTask {
+    #[cfg(not(target_arch = "wasm32"))]
+    thread: std::thread::JoinHandle<ConstResolver>,
+    #[cfg(target_arch = "wasm32")]
+    resolver: ConstResolver,
+}
+
+impl ConstResolverTask {
+    pub(crate) fn start(sources: Arc<Vec<SourceFile>>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let thread = std::thread::Builder::new()
+                .name("rubydex".into())
+                .stack_size(crate::stack::COMPILER_STACK_BYTES)
+                .spawn(move || ConstResolver::from_app_sources(&sources))
+                .expect("spawn the Rubydex thread");
+            Self { thread }
+        }
+        #[cfg(target_arch = "wasm32")]
+        Self {
+            resolver: ConstResolver::from_app_sources(&sources),
+        }
+    }
+
+    pub(crate) fn finish(self) -> PreparedConstResolver {
+        #[cfg(not(target_arch = "wasm32"))]
+        let resolver = self
+            .thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        #[cfg(target_arch = "wasm32")]
+        let resolver = self.resolver;
+        PreparedConstResolver(Some(Arc::new(resolver)))
     }
 }
 
 /// Framework declarations come from embedded Ruby implementations and
 /// Ruby core RBS, never from fabricated suffix aliases. App sources keep
 /// their paths as URIs so answers map back to their file IDs.
-fn index_sources(sources: &[SourceFile], indexed_files: &[bool]) -> Graph {
+fn index_sources(sources: &[SourceFile]) -> Graph {
     let mut documents = vec![Document {
         uri_prefix: CORE_URI,
         path: "",
@@ -222,83 +338,108 @@ fn index_sources(sources: &[SourceFile], indexed_files: &[bool]) -> Graph {
         text,
         language: LanguageId::Ruby,
     }));
-    documents.extend(sources.iter().zip(indexed_files).filter(|(_, ruby)| **ruby).map(
-        |(source, _)| Document {
-            uri_prefix: "",
-            path: &source.path,
-            text: &source.text,
-            language: LanguageId::Ruby,
-        },
-    ));
+    documents.extend(sources.iter().filter(|source| is_indexed(source)).map(|source| Document {
+        uri_prefix: "",
+        path: &source.path,
+        text: &source.text,
+        language: LanguageId::Ruby,
+    }));
     index_documents(&documents)
 }
 
 /// Rubydex resolves names, ownership, and lexical scope. Keep only its
 /// immutable answers for positions Roundhouse will type; the full graph
-/// leaves memory before the inference fixpoint starts.
-fn collect_answers(graph: &Graph, sources: &[SourceFile], indexed_files: &[bool]) -> Answers {
-    let mut references = HashMap::new();
-    let mut class_cache: IdentityHashMap<DeclarationId, (Arc<ClassId>, bool)> =
-        IdentityHashMap::default();
-    for (index, source) in sources.iter().enumerate() {
-        if !indexed_files[index] {
-            continue;
-        }
-        let file = FileId((index + 1) as u32);
-        let uri = UriId::from(source.path.as_str());
-        let Some(document) = graph.documents().get(&uri) else {
+/// leaves memory before the inference fixpoint starts. The answers for
+/// each file are independent, so workers collect them in parallel.
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_answers(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnswers>> {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_WORKERS);
+    let chunk = sources.len().div_ceil(workers).max(1);
+    std::thread::scope(|scope| {
+        let chunks: Vec<_> = sources
+            .chunks(chunk)
+            .map(|chunk| scope.spawn(move || answer_files(graph, chunk)))
+            .collect();
+        chunks
+            .into_iter()
+            .flat_map(|chunk| {
+                chunk.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
+/// The browser build has no threads.
+#[cfg(target_arch = "wasm32")]
+fn collect_answers(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnswers>> {
+    answer_files(graph, sources)
+}
+
+fn answer_files(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnswers>> {
+    let mut class_cache = IdentityHashMap::default();
+    sources
+        .iter()
+        .map(|source| is_indexed(source).then(|| answer_file(graph, source, &mut class_cache)))
+        .collect()
+}
+
+fn answer_file(
+    graph: &Graph,
+    source: &SourceFile,
+    class_cache: &mut IdentityHashMap<DeclarationId, (Arc<ClassId>, bool)>,
+) -> FileAnswers {
+    let mut answers = FileAnswers::new();
+    let Some(document) = graph.documents().get(&UriId::from(source.path.as_str())) else {
+        return answers;
+    };
+    for reference_id in document.constant_references() {
+        let Some(reference) = graph.constant_references().get(reference_id) else {
             continue;
         };
-        for reference_id in document.constant_references() {
-            let Some(reference) = graph.constant_references().get(reference_id) else {
-                continue;
-            };
-            let offset = reference.offset();
-            // Rubydex also records a synthetic `<Article>` reference
-            // at an `Article.method` receiver. Only the token's
-            // written name belongs to this expression's source span.
-            let written = source
-                .text
-                .get(offset.start() as usize..offset.end() as usize);
-            let name = graph
-                .names()
-                .get(reference.name_id())
-                .and_then(|name| graph.strings().get(name.str()));
-            if !name.is_some_and(|name| written == Some(name.as_str())) {
-                continue;
-            }
-            let target = graph
-                .name_id_to_declaration_id(*reference.name_id())
-                .and_then(|id| graph.declarations().get(id).map(|decl| (*id, decl)))
-                .map(|(id, declaration)| {
-                    if declaration.as_namespace().is_some()
-                        && !is_assigned_value(graph, declaration)
-                    {
-                        let (class, runtime) = class_cache.entry(id).or_insert_with(|| {
-                            (
-                                Arc::new(ClassId(Symbol::from(declaration.name()))),
-                                is_runtime_declaration(graph, declaration),
-                            )
-                        });
-                        ResolvedConstant::Namespace {
-                            class: Arc::clone(class),
-                            runtime: *runtime,
-                        }
-                    } else {
-                        ResolvedConstant::Value(id)
+        let offset = reference.offset();
+        // A superclass or mixin reference spans its whole `A::B` path,
+        // so it starts at the same offset as the `A` reference. Only a
+        // reference whose span is exactly its written name belongs to
+        // that offset.
+        let written = source.text.get(offset.start() as usize..offset.end() as usize);
+        let name = graph
+            .names()
+            .get(reference.name_id())
+            .and_then(|name| graph.strings().get(name.str()));
+        if !name.is_some_and(|name| written == Some(name.as_str())) {
+            continue;
+        }
+        let target = graph
+            .name_id_to_declaration_id(*reference.name_id())
+            .and_then(|id| graph.declarations().get(id).map(|decl| (*id, decl)))
+            .map(|(id, declaration)| {
+                if declaration.as_namespace().is_some() && !is_assigned_value(graph, declaration) {
+                    let (class, runtime) = class_cache.entry(id).or_insert_with(|| {
+                        (
+                            Arc::new(ClassId(Symbol::from(declaration.name()))),
+                            is_runtime_declaration(graph, declaration),
+                        )
+                    });
+                    ResolvedConstant::Namespace {
+                        class: Arc::clone(class),
+                        runtime: *runtime,
                     }
-                });
-            match references.entry((file, offset.start())) {
-                Entry::Vacant(slot) => {
-                    slot.insert(target);
+                } else {
+                    ResolvedConstant::Value(id)
                 }
-                Entry::Occupied(mut slot) => {
-                    if slot.get().is_none() && target.is_some() {
-                        slot.insert(target);
-                    }
+            });
+        match answers.entry(offset.start()) {
+            Entry::Vacant(slot) => {
+                slot.insert(target);
+            }
+            Entry::Occupied(mut slot) => {
+                if slot.get().is_none() && target.is_some() {
+                    slot.insert(target);
                 }
             }
         }
     }
-    references
+    answers
 }

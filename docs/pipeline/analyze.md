@@ -67,7 +67,11 @@ registries:
   `App.sources` once. It also indexes Ruby sources in `runtime/ruby/`
   and `runtime/spinel/`, plus RBS declarations for Ruby core classes.
   It resolves each source reference in its Ruby lexical scope, without
-  invented suffix aliases.
+  invented suffix aliases. Ingest starts this work on another thread
+  after the last source registers, and the remaining ingest passes run
+  at the same time. The Rubydex graph keeps only the definitions that
+  can change a constant lookup and the constant names written in the
+  source.
   Roundhouse keeps compact answers keyed by source position and
   releases the Rubydex graph before its typing passes.
   `Analyzer::build_constant_registry` infers each constant's value

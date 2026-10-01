@@ -118,7 +118,7 @@ look at an unfamiliar codebase.
 
 ## Measure a slow check
 
-Set `ROUNDHOUSE_TIMINGS=1` before `roundhouse check`. The command prints elapsed time for ingest, analysis, diagnosis, and each inference round. It also prints peak RSS on macOS and Linux. The command does not print measurements by default.
+Set `ROUNDHOUSE_TIMINGS=1` before `roundhouse check`. The command prints elapsed time for ingest, analysis, diagnosis, and each inference round. It also prints the Rubydex index, resolve, and answer steps, and the time that ingest waits for Rubydex. It also prints peak RSS on macOS and Linux. The command does not print measurements by default.
 
 ## A clean run
 
