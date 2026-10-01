@@ -388,7 +388,13 @@ impl Analyzer {
             // (writer) all resolve.
             for (name, ty) in &model.attributes.fields {
                 let n = name.as_str();
-                cls.instance_methods.insert(name.clone(), ty.clone());
+                // Not the stored value: an enum's reader answers its label, or nil for a value no label names.
+                let reader_ty = if crate::dialect::enum_reads_label(model, name) {
+                    Ty::Union { variants: vec![Ty::Str, Ty::Nil] }
+                } else {
+                    ty.clone()
+                };
+                cls.instance_methods.insert(name.clone(), reader_ty);
                 let predicate = Symbol::from(format!("{n}?"));
                 cls.instance_methods.entry(predicate).or_insert(Ty::Bool);
                 let writer = Symbol::from(format!("{n}="));

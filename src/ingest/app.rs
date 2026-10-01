@@ -1548,6 +1548,7 @@ end
     app.root = dir.display().to_string().trim_end_matches('/').to_string();
 
     resolve_polymorphic_targets(&mut app);
+    inherit_enums(&mut app.models);
     // Before the splice: it (and every later consumer) looks concerns up
     // by ClassId, so the lexical-scope resolution has to have happened.
     qualify_relative_includes(&mut app);
@@ -5344,4 +5345,28 @@ fn mapper_extension_block_methods<V: Vfs + ?Sized>(
         }
     }
     out
+}
+
+// Not left on the declaring base: an abstract base's `enum :state` reads through the subclass's own column reader, which has to know the mapping.
+fn inherit_enums(models: &mut [crate::dialect::Model]) {
+    let declared: std::collections::HashMap<crate::ident::ClassId, (Option<crate::ident::ClassId>, indexmap::IndexMap<crate::ident::Symbol, Vec<(String, crate::expr::Literal)>>)> =
+        models.iter().map(|m| (m.name.clone(), (m.parent.clone(), m.enums.clone()))).collect();
+    let defaults: std::collections::HashMap<crate::ident::ClassId, indexmap::IndexMap<crate::ident::Symbol, crate::expr::Literal>> =
+        models.iter().map(|m| (m.name.clone(), m.enum_defaults.clone())).collect();
+    for m in models.iter_mut() {
+        let mut current = m.parent.clone();
+        for _ in 0..32 {
+            let Some(p) = current else { break };
+            let Some((grand, enums)) = declared.get(&p) else { break };
+            for (col, mapping) in enums {
+                m.enums.entry(col.clone()).or_insert_with(|| mapping.clone());
+            }
+            if let Some(d) = defaults.get(&p) {
+                for (col, v) in d {
+                    m.enum_defaults.entry(col.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            current = grand.clone();
+        }
+    }
 }

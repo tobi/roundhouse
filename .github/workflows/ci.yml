@@ -1184,6 +1184,8 @@ jobs:
       #             cannot silently take the pool with it.
       - name: Install the gems the emitted suite loads
         run: gem install sqlite3 bcrypt nokogiri webmock mocha rqrcode ruby-vips sentry-ruby platform_agent concurrent-ruby net-http-persistent web-push rails-html-sanitizer --no-document
+      - name: Verify the suite's bcrypt test configuration
+        run: ruby tests/campfire_suite_bcrypt.rb
       - name: Fetch once-campfire at the pinned SHA
         run: |
           set -euo pipefail

@@ -81,6 +81,11 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub enums: IndexMap<Symbol, Vec<(String, crate::expr::Literal)>>,
 
+    /// `enum :status, …, default: :active` — the stored value an unset
+    /// attribute starts at, which Rails prefers over the column default.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub enum_defaults: IndexMap<Symbol, crate::expr::Literal>,
+
     /// STI subclass class-ids whose rows live in THIS model's table
     /// (stamped by `lower::sti_scope`, which already derives the
     /// subclass->base map for scoping and `becomes!`). Non-empty turns
@@ -1614,4 +1619,18 @@ pub struct Fixture {
     /// `_fixture: model_class:` — the class the rows load, for a set
     /// whose path doesn't name it. `None` derives it from `path`.
     pub model_class: Option<Symbol>,
+}
+
+/// An enum whose every stored value is an integer: its reader answers the label.
+pub fn enum_reads_label(model: &Model, column: &Symbol) -> bool {
+    model.enums.get(column).is_some_and(|m| enum_mapping_reads_label(m))
+}
+
+// Not every string mapping: one whose labels are its values (`%w[…].index_by(&:itself)`) reads the column as it is.
+pub fn enum_mapping_reads_label(m: &[(String, crate::expr::Literal)]) -> bool {
+    use crate::expr::Literal;
+    !m.is_empty()
+        && (m.iter().all(|(_, v)| matches!(v, Literal::Int { .. }))
+            || (m.iter().all(|(_, v)| matches!(v, Literal::Str { .. }))
+                && m.iter().any(|(l, v)| !matches!(v, Literal::Str { value } if value == l))))
 }

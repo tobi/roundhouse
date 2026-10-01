@@ -1184,6 +1184,195 @@ raise "constructor consumer" unless FactoryConsumer.label == "CUSTOM"
         .assert_passes();
 }
 
+/// Not only a string default: schema.rb's unquoted `default: true`, `default: 1.5` and `default: -3` reach a new record, and a value the caller passes still wins.
+#[test]
+fn a_schema_default_that_is_not_a_string_seeds_a_new_record() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.boolean \"visible\", default: true\n    t.boolean \"listed\", default: true, null: false\n    t.float \"score\", default: 1.5\n    t.integer \"rank\", default: 7\n    t.integer \"offset\", default: -3, null: false\n    t.integer \"state\", default: 1, null: false",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  enum :state, { draft: 0, published: 1 }",
+        )
+        .write(
+            "test/models/article_default_test.rb",
+            r#"require "test_helper"
+
+class ArticleDefaultTest < ActiveSupport::TestCase
+  test "an unset column takes its schema default" do
+    article = Article.new
+    assert_equal true, article.visible
+    assert_equal true, article.listed
+    assert_equal 1.5, article.score
+    assert_equal 7, article.rank
+    assert_equal(-3, article.offset)
+    assert article.published?
+  end
+
+  test "a created record keeps the default" do
+    article = Article.create!(title: "Defaults", body: "A body long enough to validate.")
+    reloaded = Article.find(article.id)
+    assert_equal true, reloaded.visible
+    assert_equal 7, reloaded.rank
+    assert reloaded.published?
+  end
+
+  test "a value the caller passes wins over the default" do
+    article = Article.new(visible: false, listed: false, rank: nil, score: nil, state: "draft")
+    assert_equal false, article.visible
+    assert_equal false, article.listed
+    assert_nil article.rank
+    assert_nil article.score
+    assert article.draft?
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_default_test.rb")
+        .assert_passes();
+}
+
+/// Not a NoMethodError: `read_attribute`/`write_attribute` are a model's `[]`/`[]=`, inside the model and on a record alike.
+#[test]
+fn read_and_write_attribute_reach_the_column() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"state\", default: 0, null: false",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  enum :state, { draft: 0, published: 1 }\n\n  def shout_title\n    write_attribute(:title, read_attribute(:title).upcase)\n  end",
+        )
+        .write(
+            "test/models/article_attribute_test.rb",
+            r#"require "test_helper"
+
+class ArticleAttributeTest < ActiveSupport::TestCase
+  test "read_attribute and write_attribute on a record" do
+    article = articles(:one)
+    article.write_attribute(:state, "published")
+    assert_equal "published", article.read_attribute(:state)
+    assert_equal "published", article.read_attribute("state")
+    article.save!
+    assert Article.find(article.id).published?
+  end
+
+  test "the bare forms inside the model" do
+    article = Article.new(title: "quiet")
+    article.shout_title
+    assert_equal "QUIET", article.title
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_attribute_test.rb")
+        .assert_passes();
+}
+
+/// Not the column default: `enum …, default:` is the value Rails gives an unset attribute, and a value the caller passes still wins.
+#[test]
+fn an_enum_default_option_seeds_a_new_record() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"priority\"\n    t.string \"tone\", default: \"quiet\"",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  enum :priority, { low: 0, high: 1 }, default: :high\n  enum :tone, { quiet: \"quiet\", loud: \"loud\" }, default: :loud",
+        )
+        .write(
+            "test/models/article_enum_default_test.rb",
+            r#"require "test_helper"
+
+class ArticleEnumDefaultTest < ActiveSupport::TestCase
+  test "an unset enum takes the declared default" do
+    article = Article.new
+    assert article.high?
+    assert article.loud?
+  end
+
+  test "a created record keeps it" do
+    article = Article.create!(title: "Defaults", body: "A body long enough to validate.")
+    reloaded = Article.find(article.id)
+    assert_equal "high", reloaded.priority
+    assert_equal "loud", reloaded.tone
+  end
+
+  test "a value the caller passes wins" do
+    article = Article.new(priority: :low, tone: :quiet)
+    assert article.low?
+    assert article.quiet?
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_enum_default_test.rb")
+        .assert_passes();
+}
+
+/// Not stored as 0: a label no mapping names raises ArgumentError as Rails' enum type does, and a string-backed enum reads back its label.
+#[test]
+fn an_enum_rejects_a_label_it_does_not_name() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"state\", default: 0, null: false\n    t.integer \"priority\"\n    t.string \"tone\"",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  enum :state, { draft: 0, published: 1 }\n  enum :priority, { low: 0, high: 1 }\n  enum :tone, { quiet: \"q\", loud: \"l\" }",
+        )
+        .write(
+            "test/models/article_enum_reject_test.rb",
+            r#"require "test_helper"
+
+class ArticleEnumRejectTest < ActiveSupport::TestCase
+  test "a label the mapping does not name raises" do
+    labels = ["bogus", "Draft", "loud!"]
+    article = articles(:one)
+    assert_raises(ArgumentError) { article.state = labels[0] }
+    assert_raises(ArgumentError) { article.state = labels[1] }
+    assert_raises(ArgumentError) { article.update(state: labels[0]) }
+    assert_raises(ArgumentError) { article[:state] = labels[0] }
+    assert_raises(ArgumentError) { Article.new(state: labels[0]) }
+    assert_raises(ArgumentError) { article.tone = labels[2] }
+    assert_equal "draft", Article.find(article.id).state
+  end
+
+  test "a blank value clears a nullable enum" do
+    blank = ""
+    article = Article.new(priority: "high")
+    article.priority = blank
+    assert_nil article.priority
+  end
+
+  test "a string-backed enum stores its value and reads its label" do
+    article = Article.create!(title: "Tone", body: "A body long enough to validate.", tone: :loud)
+    reloaded = Article.find(article.id)
+    assert_equal "loud", reloaded.tone
+    assert reloaded.loud?
+    assert_equal 1, Article.loud.where(id: article.id).count
+    assert_equal({ "quiet" => "q", "loud" => "l" }, Article.tones)
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_enum_reject_test.rb")
+        .assert_passes();
+}
+
 /// Not `"published".to_i`: an enum column assigned a label at run time stores the label's value, as Rails does.
 #[test]
 fn an_enum_label_assigned_at_run_time_stores_its_value() {
@@ -1223,5 +1412,73 @@ end
 "#,
         )
         .run_test("test/models/article_enum_label_test.rb")
+        .assert_passes();
+}
+
+/// Not the stored integer: an integer-mapped enum reads back its label, as Rails' reader, `[]` and `attributes` do.
+#[test]
+fn an_integer_enum_reads_back_its_label() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"state\", default: 0",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  enum :state, { draft: 0, published: 1 }\n\n  def state_label\n    state.humanize\n  end",
+        )
+        .write(
+            "test/models/article_enum_reader_test.rb",
+            r#"require "test_helper"
+
+class ArticleEnumReaderTest < ActiveSupport::TestCase
+  test "an integer enum reads back its label" do
+    article = articles(:one)
+    article.update(state: :published)
+    reloaded = Article.find(article.id)
+    assert_equal "published", reloaded.state
+    assert_equal "Published", reloaded.state_label
+    assert_equal "published", reloaded[:state]
+    assert_equal "published", reloaded.attributes["state"]
+    assert reloaded.published?
+    assert !reloaded.draft?
+    assert reloaded.state == "published"
+    assert_equal 1, Article.where(state: :published).where(id: article.id).count
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_enum_reader_test.rb")
+        .assert_passes();
+}
+
+/// Not left on the String: `humanize` and `titleize` are ActiveSupport reopens, answered here as ActiveSupport does.
+#[test]
+fn string_humanize_and_titleize_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r#"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+
+  def self.inflections_probe
+    ["employee_salary".humanize, "author_id".humanize, "hello-world".titleize, "SSLError".titleize, "raiders_of_the_lost_ark".titleize].join("|")
+  end"#,
+        )
+        .write(
+            "test/models/article_inflections_test.rb",
+            r#"require "test_helper"
+
+class ArticleInflectionsTest < ActiveSupport::TestCase
+  test "humanize and titleize answer as ActiveSupport does" do
+    assert_equal "Employee salary|Author|Hello World|Ssl Error|Raiders Of The Lost Ark", Article.inflections_probe
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_inflections_test.rb")
         .assert_passes();
 }
