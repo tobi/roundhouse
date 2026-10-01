@@ -226,30 +226,6 @@ pub struct ClassInfo {
     pub app_declared: bool,
 }
 
-/// Resolve a single-segment Const ref (like `Const { path:
-/// ["HashWithIndifferentAccess"] }` from app source) to a fully-
-/// qualified ClassId by walking the class registry. Returns the
-/// fully-qualified `Symbol` when exactly one registry key matches —
-/// "matches" meaning the key has `::` separator(s) AND the last
-/// segment equals `name`. App-class single-segment keys (`Article`,
-/// `Comment`) don't match (no `::`), so they stay bare. Multiple
-/// matches (rare — would be e.g. `ActiveRecord::Base` and
-/// `ActionController::Base`) leave the ref bare too — body-typer
-/// can't disambiguate without lexical scope, and the bare form
-/// still types via the registry's last-segment alias entry.
-/// The class a written owner path names, resolved the way Ruby
-/// resolves a constant: the enclosing scopes from the inside out, then
-/// the top level.
-///
-/// `DEFAULT_MODE = Mode::Fill` inside `UI::Selector` means
-/// `UI::Selector::Mode`, and nothing else does — which matters in an
-/// app where a dozen components each declare their own `Mode`. Walking
-/// the nesting is what tells them apart; a suffix match over the class
-/// registry cannot, and gives up on the ambiguity instead.
-/// A class name written inside `scope` (a qualified class name),
-/// resolved lexically: `scope::name`, then each enclosing namespace,
-/// and finally the name as written. `None` when no registered class
-/// answers, so an unknown name (a gem's class) is left as written.
 pub(crate) fn lexical_class(
     written: &ClassId,
     scope: &str,
@@ -267,120 +243,6 @@ pub(crate) fn lexical_class(
     classes.contains_key(written).then(|| written.clone())
 }
 
-fn resolve_owner_path(
-    written: &str,
-    ctx: &Ctx,
-    classes: &HashMap<ClassId, ClassInfo>,
-    index: &ConstIndex,
-) -> Option<ClassId> {
-    if let Some(absolute) = written.strip_prefix("::") {
-        let id = ClassId(Symbol::from(absolute));
-        return classes.contains_key(&id).then_some(id);
-    }
-    if let Some(Ty::Class { id, .. }) = &ctx.self_ty {
-        let mut scope: Vec<&str> = id.0.as_str().split("::").collect();
-        while !scope.is_empty() {
-            let candidate = ClassId(Symbol::from(
-                format!("{}::{written}", scope.join("::")).as_str(),
-            ));
-            if classes.contains_key(&candidate) {
-                return Some(candidate);
-            }
-            scope.pop();
-        }
-    }
-    let written_id = ClassId(Symbol::from(written));
-    if classes.contains_key(&written_id) {
-        return Some(written_id);
-    }
-    index.unique_suffix(written).map(ClassId)
-}
-
-/// The registry's qualified class names (those with a `::`), keyed by
-/// their last segment: the lookup behind `expand_bare_const` and the
-/// owner-path expansion. Both used to scan every registered class per
-/// constant read, which is quadratic in app size — on Shopify core
-/// (~30k classes) that scan was most of a typing pass.
-#[derive(Default)]
-pub struct ConstIndex {
-    by_last: HashMap<String, Vec<Symbol>>,
-    /// The same, less the classes a bare name cannot reach by its last
-    /// segment: the app's own (Ruby resolves those lexically) and a
-    /// gem's (a gem's nested class is reached by its full name).
-    ambient_by_last: HashMap<String, Vec<Symbol>>,
-}
-
-impl ConstIndex {
-    pub fn build(classes: &HashMap<ClassId, ClassInfo>) -> Self {
-        let mut by_last: HashMap<String, Vec<Symbol>> = HashMap::new();
-        let mut ambient_by_last: HashMap<String, Vec<Symbol>> = HashMap::new();
-        for (key, info) in classes.iter() {
-            if let Some((_, last)) = key.0.as_str().rsplit_once("::") {
-                if info.gem_boundary {
-                    continue;
-                }
-                by_last.entry(last.to_string()).or_default().push(key.0.clone());
-                if !info.app_declared {
-                    ambient_by_last.entry(last.to_string()).or_default().push(key.0.clone());
-                }
-            }
-        }
-        Self { by_last, ambient_by_last }
-    }
-
-    /// The one qualified class whose name ends in `::written`, when
-    /// exactly one does. More than one match is not a guess worth
-    /// making.
-    fn unique_suffix(&self, written: &str) -> Option<Symbol> {
-        Self::unique_in(&self.by_last, written)
-    }
-
-    /// [`Self::unique_suffix`] over the classes a bare name can reach by
-    /// its last segment alone (see `ambient_by_last`).
-    fn unique_ambient_suffix(&self, written: &str) -> Option<Symbol> {
-        Self::unique_in(&self.ambient_by_last, written)
-    }
-
-    fn unique_in(map: &HashMap<String, Vec<Symbol>>, written: &str) -> Option<Symbol> {
-        let last = written.rsplit("::").next()?;
-        let suffix = format!("::{written}");
-        let mut found: Option<&Symbol> = None;
-        for full in map.get(last)? {
-            if full.as_str().ends_with(&suffix) {
-                if found.is_some() {
-                    return None; // ambiguous
-                }
-                found = Some(full);
-            }
-        }
-        found.cloned()
-    }
-}
-
-
-fn expand_bare_const(
-    name: &Symbol,
-    classes: &HashMap<ClassId, ClassInfo>,
-    index: &ConstIndex,
-) -> Option<Symbol> {
-    let target = name.as_str();
-    // A class registered under exactly this bare name wins outright —
-    // `Account` in app code means the Account model, not the nested
-    // `Mastodon::CLI::Maintenance::Account` stub a lib/ script happens
-    // to declare. (Ruby resolves toward the outer scope too.) Before
-    // the recursive app walk, nested same-named classes were rarely
-    // ingested, so this case never fired; now it's the common one.
-    if classes.contains_key(&ClassId(name.clone())) {
-        return None;
-    }
-    // Ruby's own top-level constants are never app classes, so an app's
-    // `ActiveModel::Serializers::JSON` must not capture a bare `JSON.parse`
-    // (shopify core; it then typed a stdlib call as the app module's).
-    if RUBY_TOP_LEVEL.contains(&target) {
-        return None;
-    }
-    index.unique_ambient_suffix(target)
-}
 
 /// Reusable body-type walker. Holds a borrow of the dispatch table so
 /// repeated `analyze_expr` calls reuse the same lookup structures
@@ -4005,20 +3867,6 @@ fn is_ivar_params_rooted(e: &crate::expr::Expr, locals: &HashMap<Symbol, Ty>) ->
         _ => is_param_local(e, locals),
     }
 }
-/// Top-level constants Ruby and its default/bundled gems define. A bare
-/// reference to one of these means the stdlib constant; see
-/// `expand_bare_const`.
-const RUBY_TOP_LEVEL: &[&str] = &[
-    "Base64", "Benchmark", "BigDecimal", "CGI", "CSV", "Comparable", "Complex", "Coverage",
-    "Date", "DateTime", "Digest", "Dir", "ERB", "Encoding", "Enumerable", "Errno", "Etc",
-    "Fiber", "File", "FileUtils", "Find", "Forwardable", "GC", "IO", "IPAddr", "JSON",
-    "Kernel", "Logger", "Marshal", "Math", "Monitor", "Mutex", "Net", "ObjectSpace", "Open3",
-    "OpenSSL", "OpenStruct", "PP", "Pathname", "Prism", "Process", "Psych", "Random",
-    "Rational", "Ripper", "SecureRandom", "Set", "Shellwords", "Signal", "Singleton",
-    "Socket", "StringIO", "Struct", "Tempfile", "Thread", "Time", "Timeout", "URI", "YAML",
-    "Zlib",
-];
-
 /// `[a, b].min` / `.max` (no count, no block) on an array LITERAL: the
 /// literal has at least one element, so the extremum is an element, never
 /// the `nil` an empty collection would give. `[x, LIMIT].min` is the
