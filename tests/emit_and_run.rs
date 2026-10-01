@@ -176,6 +176,95 @@ fn a_constant_assigned_from_a_call_runs_as_its_value() {
         .assert_passes();
 }
 
+/// Ingest copies a concern's methods into the controller that includes
+/// it, and the emitted controller drops the `include`. A class that
+/// resolved inside the concern's module must still name that class
+/// after the move.
+#[test]
+fn a_concern_class_reference_survives_the_copy_into_its_controller() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/price_support.rb",
+            "module PriceSupport\n  class RateCalculator\n    def self.value\n      7\n    end\n  end\n\n  def price\n    RateCalculator.value\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/quotes_controller.rb",
+            "class QuotesController < ApplicationController\n  include PriceSupport\n\n  def show\n    @value = price\n  end\nend\n",
+        )
+        .run_ruby(
+            "require_relative 'app/controllers/quotes_controller'\nraise 'concern class reference' unless QuotesController.new.price == 7",
+        )
+        .assert_passes();
+}
+
+/// Ingest hoists a file-level constant into the first class of the
+/// file, but Ruby declares it on Object. The inferred value must belong
+/// to the declaration that the read resolves to.
+#[test]
+fn a_file_level_constant_runs_from_the_class_below_it() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/review_probe.rb",
+            "ROOT_LIMIT = 7\n\nclass LimitReader\n  def self.value\n    ROOT_LIMIT\n  end\nend\n",
+        )
+        .run_ruby("raise 'file-level constant' unless LimitReader.value == 7")
+        .assert_passes();
+}
+
+/// ERB views are not indexed. A qualified class read there must not
+/// take the value of an unrelated constant with the same last segment,
+/// and a qualified value read takes the value declared at its full name.
+#[test]
+fn a_qualified_class_in_a_view_ignores_a_same_named_value() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/archive.rb",
+            "module Marker\n  Item = 1\nend\n\nmodule Archive\n  class Item\n    def self.label\n      \"archive\"\n    end\n  end\nend\n",
+        )
+        .edit(
+            "app/views/articles/index.html.erb",
+            "<% content_for :title, \"Articles\" %>",
+            "<% content_for :title, \"Articles\" %>\n<p id=\"archive-label\"><%= Archive::Item.label %></p>\n<p id=\"marker-item\"><%= Marker::Item + 1 %></p>",
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "    assert_select \"h1\", \"Articles\"\n",
+            "    assert_select \"h1\", \"Articles\"\n    assert_select \"#archive-label\", \"archive\"\n    assert_select \"#marker-item\", \"2\"\n",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
+/// Each constant in the chain reads the one before it. The value must
+/// reach the end of a chain longer than any fixed number of rounds.
+#[test]
+fn a_long_constant_chain_reaches_its_value() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/chain.rb",
+            "class Chain\n  A = 1\n  B = A\n  C = B\n  D = C\n  E = D\n  F = E\n\n  def self.value\n    F\n  end\nend\n",
+        )
+        .run_ruby("raise 'constant chain' unless Chain.value == 1")
+        .assert_passes();
+}
+
+/// Rubydex declares Object, BasicObject, Kernel, Module and Class
+/// itself. Those are Ruby's own classes, not unknown constants.
+#[test]
+fn object_new_runs_as_the_ruby_built_in() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/object_reader.rb",
+            "class ObjectReader\n  def self.value\n    Object.new\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/sentinels_controller.rb",
+            "class SentinelsController < ApplicationController\n  def show\n    @sentinel = Object.new\n  end\nend\n",
+        )
+        .run_ruby("raise 'Object.new' unless ObjectReader.value.instance_of?(Object)")
+        .assert_passes();
+}
+
 /// #139 typed `Model.human_attribute_name` as a String, which took the
 /// call from an error to clean, but no runtime defines it, so every
 /// page rendering the form raises `undefined method

@@ -66,6 +66,8 @@ registries:
 - Constants remain partially covered. Rubydex indexes the Ruby files in
   `App.sources` once. It also indexes Ruby sources in `runtime/ruby/`
   and `runtime/spinel/`, plus RBS declarations for Ruby core classes.
+  The classes that Rubydex itself declares (`BasicObject`, `Kernel`,
+  `Object`, `Module`, `Class`) also count as Ruby core.
   It resolves each source reference in its Ruby lexical scope, without
   invented suffix aliases. Ingest starts this work on another thread
   after the last source registers, and the remaining ingest passes run
@@ -73,12 +75,19 @@ registries:
   can change a constant lookup and the constant names written in the
   source.
   Roundhouse keeps compact answers keyed by source position and
-  releases the Rubydex graph before its typing passes.
+  releases the Rubydex graph before its typing passes. A read that
+  resolves to a class keeps the qualified class path in the IR, so the
+  read names the same class after ingest copies a concern method into
+  another class.
   `Analyzer::build_constant_registry` infers each constant's value
-  type and stores it under its Rubydex declaration ID. A small
-  fixpoint resolves dependencies between those values.
-  Generated expressions use the typed local scope because they have
-  no source reference.
+  type and stores it under the Rubydex declaration ID of its source
+  definition. The ID comes from the source position, so a file-level
+  constant that ingest moves into a class keeps its top-level ID. The
+  rounds continue until no value changes, so a chain such as `B = A`
+  resolves at any depth. A cycle stays unresolved.
+  Views and generated expressions have no Rubydex answer. A bare name
+  there uses the typed local scope. A qualified name uses only the
+  value declared at that full name.
 - The analyzer reports an error for an unresolved source constant.
   It does not select another class by a matching name suffix.
   `parse_module_constants` types literal constants in framework Ruby.

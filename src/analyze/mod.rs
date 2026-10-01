@@ -1186,23 +1186,25 @@ impl Analyzer {
     /// names and their lexical resolution, so source reads use its
     /// `DeclarationId` to find these inferred types. The bare-name map
     /// remains only for generated expressions without Ruby source.
-    /// A short fixpoint lets `B = A` use A's value from the prior round.
+    /// The rounds continue until no value changes, so `B = A` can use
+    /// the value of `A` from the round before.
     fn build_constant_registry(
         &self,
         app: &App,
     ) -> (HashMap<Symbol, Ty>, IdentityHashMap<DeclarationId, Ty>) {
-        fn declaration_id(owner: &Ty, name: &Symbol) -> Option<DeclarationId> {
-            let Ty::Class { id, .. } = owner else { return None };
-            Some(DeclarationId::from(format!("{id}::{name}").as_str()))
-        }
+        // Ingest can move a constant to another IR owner: a file-level
+        // constant goes to the first class of its file. The declaration
+        // ID comes from the source position, not from the owner.
+        let declaration_id = |name: &Symbol, value: &Expr| {
+            self.const_resolver.constant_declaration(value.span, name.as_str())
+        };
         // (defining class, last-segment name, Rubydex ID, value).
-        let mut entries: Vec<(Ty, Symbol, DeclarationId, Expr)> = Vec::new();
+        let mut entries: Vec<(Ty, Symbol, Option<DeclarationId>, Expr)> = Vec::new();
         let mut push_const = |self_ty: Ty, expr: &Expr| {
             if let ExprNode::Assign { target: LValue::Const { path }, value } = &*expr.node {
                 if let Some(last) = path.last() {
-                    if let Some(id) = declaration_id(&self_ty, last) {
-                        entries.push((self_ty, last.clone(), id, value.clone()));
-                    }
+                    let id = declaration_id(last, value);
+                    entries.push((self_ty, last.clone(), id, value.clone()));
                 }
             }
         };
@@ -1234,21 +1236,19 @@ impl Analyzer {
         for lc in &app.library_classes {
             for (name, value) in &lc.constants {
                 let self_ty = Ty::Class { id: lc.name.clone(), args: vec![] };
-                if let Some(id) = declaration_id(&self_ty, name) {
-                    entries.push((self_ty, name.clone(), id, value.clone()));
-                }
+                entries.push((self_ty, name.clone(), declaration_id(name, value), value.clone()));
             }
         }
 
         let mut map: HashMap<Symbol, Ty> = HashMap::new();
         let mut ambiguous: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
-        // Cap matches the outer analyze fixpoint; one level of constant
-        // dependency needs two passes, the cap leaves slack.
         let mut resolved: IdentityHashMap<DeclarationId, Ty> = IdentityHashMap::default();
-        // Constant dependencies resolve by their declaration owner, not by
-        // a global bare-name entry. Carry the previous round's owner values
-        // so `B = A` can type after `A` has been inferred.
-        for _ in 0..4 {
+        // Each round can type one more link of a `B = A` chain, so n
+        // values need at most n + 1 rounds when no value changes after
+        // it is typed. A cycle (`A = B`, `B = A`) never types and stays
+        // unknown, and the read reports it. The bound also stops values
+        // that change on each round.
+        for _ in 0..=entries.len() {
             let mut next: HashMap<Symbol, Ty> = HashMap::new();
             let mut next_resolved: IdentityHashMap<DeclarationId, Ty> = IdentityHashMap::default();
             let shared = body::ConstScope::global(map.clone());
@@ -1269,7 +1269,9 @@ impl Analyzer {
                 if matches!(ty, Ty::Var { .. }) {
                     continue;
                 }
-                next_resolved.insert(*id, ty.clone());
+                if let Some(id) = id {
+                    next_resolved.insert(*id, ty.clone());
+                }
                 if ambiguous.contains(name) {
                     continue;
                 }

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use rubydex::model::identity_maps::IdentityHashMap;
-use rubydex::model::ids::DeclarationId;
+use rubydex::model::ids::{DeclarationId, declaration_id_from_lookup_name};
 
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, TyVar};
@@ -267,25 +267,10 @@ impl<'a> BodyTyper<'a> {
                 // A later typing pass may resolve a value constant whose
                 // owner was unknown in an earlier constant fixpoint round.
                 expr.diagnostic = None;
-                let last = path.last();
-                let exact_class_id = || {
-                    if path.len() == 1 {
-                        ClassId(path[0].clone())
-                    } else {
-                        let mut name = String::new();
-                        for part in path.iter() {
-                            if !name.is_empty() {
-                                name.push_str("::");
-                            }
-                            name.push_str(part.as_str());
-                        }
-                        ClassId(Symbol::from(name))
-                    }
-                };
                 // Never search by suffix or borrow another scope's
                 // same-named declaration: only the exact written class.
-                let exact_modeled_class = || {
-                    let id = exact_class_id();
+                let exact_modeled_class = |path: &[Symbol]| {
+                    let id = written_class_id(path);
                     if self.classes().contains_key(&id) {
                         Ty::Class { id, args: vec![] }
                     } else {
@@ -306,6 +291,7 @@ impl<'a> BodyTyper<'a> {
                         let id = class.as_ref().clone();
                         if self.classes().contains_key(&id) || *runtime {
                             expr.decisions |= crate::expr::RESOLVED_CLASS_REF;
+                            qualify_resolved_path(path, &id);
                             Ty::Class { id, args: vec![] }
                         } else {
                             unknown()
@@ -317,27 +303,36 @@ impl<'a> BodyTyper<'a> {
                         .unwrap_or_else(unknown),
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
-                    Some(None) => exact_modeled_class(),
+                    Some(None) => exact_modeled_class(path),
                     // No reference in an indexed file: a lowering pass
                     // generated this node with a borrowed source span
                     // (Alba's serializers).
-                    None if indexed_source => exact_modeled_class(),
+                    None if indexed_source => exact_modeled_class(path),
+                    // Views and generated IR have no Rubydex answer. A
+                    // bare name can use the app's bare-name values. A
+                    // qualified name `A::B` names its owner, so only the
+                    // value declared at that full name answers it.
                     None => {
-                        if let Some(ty) = last.and_then(|name| ctx.constants.get(name)) {
-                            ty.clone()
+                        let value = if let [name] = path.as_slice() {
+                            ctx.constants.get(name).cloned()
                         } else {
-                            // Standalone runtime and generated IR have no
-                            // indexed source. Retain the written class path,
-                            // but never guess another class by its suffix.
-                            Ty::Class { id: exact_class_id(), args: vec![] }
-                        }
+                            let name = written_class_id(path);
+                            self.typed_constants
+                                .and_then(|values| {
+                                    values.get(&declaration_id_from_lookup_name(name.0.as_str()))
+                                })
+                                .cloned()
+                        };
+                        // Otherwise retain the written class path, but
+                        // never guess another class by its suffix.
+                        value.unwrap_or_else(|| Ty::Class { id: written_class_id(path), args: vec![] })
                     }
                 };
                 if indexed_source && matches!(ty, Ty::Var { .. }) {
                     expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None,
                         construct: Symbol::from("constant"),
-                        detail: exact_class_id().0.as_str().to_string(),
+                        detail: written_class_id(path).0.as_str().to_string(),
                     });
                 }
                 ty
@@ -1549,6 +1544,47 @@ pub(super) fn lit_ty(lit: &Literal) -> Ty {
     }
 }
 
+/// The class path as written, joined with `::`.
+fn written_class_id(path: &[Symbol]) -> ClassId {
+    if let [name] = path {
+        return ClassId(name.clone());
+    }
+    let mut name = String::new();
+    for part in path {
+        if !name.is_empty() {
+            name.push_str("::");
+        }
+        name.push_str(part.as_str());
+    }
+    ClassId(Symbol::from(name))
+}
+
+/// Rubydex can resolve a relative path to a name with a lexical prefix:
+/// `RateCalculator` inside `module PriceSupport` is
+/// `PriceSupport::RateCalculator`. Ingest copies a concern's methods
+/// into each class that includes it, and an emitter can nest a
+/// declaration in another way. Thus the IR keeps the qualified path,
+/// which names the same class from every lexical scope. A rooted path
+/// (`::A`) already names its class. A path that the resolved name does
+/// not end with (a constant alias) stays as written.
+fn qualify_resolved_path(path: &mut Vec<Symbol>, resolved: &ClassId) {
+    if path.first().is_none_or(|head| head.as_str().starts_with("::")) {
+        return;
+    }
+    let mut prefix = resolved.0.as_str();
+    for segment in path.iter().rev() {
+        let Some(rest) = prefix
+            .strip_suffix(segment.as_str())
+            .and_then(|rest| rest.strip_suffix("::"))
+        else {
+            return;
+        };
+        prefix = rest;
+    }
+    if !prefix.is_empty() {
+        *path = resolved.0.as_str().split("::").map(Symbol::from).collect();
+    }
+}
 
 pub(super) fn unknown() -> Ty {
     Ty::Var { var: TyVar(0) }

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use rubydex::indexing::local_graph::LocalGraph;
 use rubydex::indexing::{IndexerBackend, LanguageId, build_local_graph};
+use rubydex::model::built_in::BUILT_IN_URI;
 use rubydex::model::declaration::Declaration;
 use rubydex::model::document::Document as RubydexDocument;
 use rubydex::model::definitions::Definition;
@@ -47,9 +48,15 @@ pub(super) enum ResolvedConstant {
     Value(DeclarationId),
 }
 
-/// Rubydex answers for one source file, keyed by the byte offset of
-/// each written constant name.
-type FileAnswers = HashMap<u32, Option<ResolvedConstant>>;
+/// Rubydex answers for one source file.
+#[derive(Default)]
+struct FileAnswers {
+    /// Keyed by the byte offset where each written constant name starts.
+    references: HashMap<u32, Option<ResolvedConstant>>,
+    /// Each constant definition as (offset where its name ends, name,
+    /// declaration), sorted by offset.
+    constants: Vec<(u32, Box<str>, DeclarationId)>,
+}
 
 pub(crate) struct ConstResolver {
     /// Indexed by `FileId - 1`. `None` marks a source that Rubydex did
@@ -187,6 +194,9 @@ fn index_documents(documents: &[Document<'_>]) -> Graph {
     graph
 }
 
+/// Roundhouse models the Ruby core: the RBS block above, the Ruby
+/// runtime, and the classes that Rubydex itself installs (`BasicObject`,
+/// `Kernel`, `Object`, `Module`, `Class`).
 fn is_runtime_declaration(graph: &Graph, declaration: &Declaration) -> bool {
     declaration.definitions().iter().any(|id| {
         graph
@@ -194,7 +204,8 @@ fn is_runtime_declaration(graph: &Graph, declaration: &Declaration) -> bool {
             .get(id)
             .and_then(|definition| graph.documents().get(definition.uri_id()))
             .is_some_and(|document| {
-                document.uri() == CORE_URI || document.uri().starts_with(RUNTIME_URI_PREFIX)
+                let uri = document.uri();
+                uri == CORE_URI || uri == BUILT_IN_URI || uri.starts_with(RUNTIME_URI_PREFIX)
             })
     })
 }
@@ -239,7 +250,8 @@ impl ConstResolver {
     }
 
     /// IR spans cover the entire `A::B::C` path. Rubydex records the
-    /// final name at the span end minus the name's byte length.
+    /// final name at the span end minus the name's byte length. The typer
+    /// can qualify a relative path, but the final name stays the same.
     pub(super) fn reference(
         &self,
         span: Span,
@@ -247,7 +259,23 @@ impl ConstResolver {
     ) -> Option<Option<&ResolvedConstant>> {
         let length = u32::try_from(path.last()?.as_str().len()).ok()?;
         let start = span.end.checked_sub(length)?;
-        self.file(span.file)?.get(&start).map(Option::as_ref)
+        self.file(span.file)?.references.get(&start).map(Option::as_ref)
+    }
+
+    /// The declaration that a constant assignment defines. The IR keeps
+    /// the assigned value, and Ruby writes the name just before it, so
+    /// the definition is the last one in the file whose name ends at or
+    /// before the value. Ingest can give the value another IR owner (a
+    /// file-level constant goes to the first class of its file), but
+    /// the source position does not change.
+    pub(crate) fn constant_declaration(&self, value: Span, name: &str) -> Option<DeclarationId> {
+        if value.is_synthetic() {
+            return None;
+        }
+        let constants = &self.file(value.file)?.constants;
+        let index = constants.partition_point(|(end, ..)| *end <= value.start).checked_sub(1)?;
+        let (_, defined, id) = &constants[index];
+        (defined.as_ref() == name).then_some(*id)
     }
 }
 
@@ -390,7 +418,7 @@ fn answer_file(
     source: &SourceFile,
     class_cache: &mut IdentityHashMap<DeclarationId, (Arc<ClassId>, bool)>,
 ) -> FileAnswers {
-    let mut answers = FileAnswers::new();
+    let mut answers = FileAnswers::default();
     let Some(document) = graph.documents().get(&UriId::from(source.path.as_str())) else {
         return answers;
     };
@@ -430,7 +458,7 @@ fn answer_file(
                     ResolvedConstant::Value(id)
                 }
             });
-        match answers.entry(offset.start()) {
+        match answers.references.entry(offset.start()) {
             Entry::Vacant(slot) => {
                 slot.insert(target);
             }
@@ -441,5 +469,19 @@ fn answer_file(
             }
         }
     }
+    for definition_id in document.definitions() {
+        let definition = graph.definitions().get(definition_id);
+        let (name_id, offset) = match definition {
+            Some(Definition::Constant(it)) => (it.name_id(), it.offset()),
+            Some(Definition::ConstantAlias(it)) => (it.name_id(), it.offset()),
+            _ => continue,
+        };
+        let name = graph.names().get(name_id).and_then(|name| graph.strings().get(name.str()));
+        let id = definition.and_then(|definition| graph.definition_to_declaration_id(definition));
+        if let (Some(name), Some(id)) = (name, id) {
+            answers.constants.push((offset.end(), name.as_str().into(), *id));
+        }
+    }
+    answers.constants.sort_unstable_by_key(|(end, ..)| *end);
     answers
 }
