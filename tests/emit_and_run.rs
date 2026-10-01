@@ -162,6 +162,20 @@ fn framework_exception_resolves_from_real_runtime_source() {
         .assert_passes();
 }
 
+/// Rubydex promotes `X = <call>` to a module once code calls a method
+/// on `X`. These are still values: `.freeze` and `.map` build a Hash, an
+/// Array, and a String, and each read must type and run as that value.
+#[test]
+fn a_constant_assigned_from_a_call_runs_as_its_value() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/frozen_table.rb",
+            "class FrozenTable\n  STATUSES = { processed: \"processed\" }.freeze\n  NAMES = [\"a\", \"b\"].freeze\n  LABEL = \"label\".freeze\n  DOUBLED = [1, 2].map { |n| n * 2 }\n  def self.summary\n    [STATUSES[:processed].upcase, NAMES.first, LABEL.upcase, DOUBLED.last.to_s].join(\",\")\n  end\nend\n",
+        )
+        .run_ruby("raise 'frozen constant' unless FrozenTable.summary == 'PROCESSED,a,LABEL,4'")
+        .assert_passes();
+}
+
 /// #139 typed `Model.human_attribute_name` as a String, which took the
 /// call from an error to clean, but no runtime defines it, so every
 /// page rendering the form raises `undefined method

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use rubydex::indexing::{IndexerBackend, LanguageId, build_local_graph};
 use rubydex::model::declaration::Declaration;
+use rubydex::model::definitions::Definition;
 use rubydex::model::graph::Graph;
 use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::ids::{DeclarationId, UriId};
@@ -69,6 +70,24 @@ fn is_runtime_declaration(graph: &Graph, declaration: &Declaration) -> bool {
                 document.uri() == CORE_URI || document.uri().starts_with(RUNTIME_URI_PREFIX)
             })
     })
+}
+
+/// Rubydex promotes `X = <method call>` to a module when code calls a
+/// method on `X`, because the call could build a class (`Struct.new`).
+/// Roundhouse types the assigned value instead. A `class` or `module`
+/// definition, including `Class.new` and `Module.new`, keeps the namespace.
+fn is_assigned_value(graph: &Graph, declaration: &Declaration) -> bool {
+    let mut assigned = false;
+    for id in declaration.definitions() {
+        match graph.definitions().get(id) {
+            Some(Definition::Constant(_)) => assigned = true,
+            Some(Definition::Class(_) | Definition::Module(_) | Definition::SingletonClass(_)) => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    assigned
 }
 
 impl ConstResolver {
@@ -141,7 +160,9 @@ impl ConstResolver {
                     .name_id_to_declaration_id(*reference.name_id())
                     .and_then(|id| graph.declarations().get(id).map(|decl| (*id, decl)))
                     .map(|(id, declaration)| {
-                        if declaration.as_namespace().is_some() {
+                        if declaration.as_namespace().is_some()
+                            && !is_assigned_value(&graph, declaration)
+                        {
                             let (class, runtime) = class_cache.entry(id).or_insert_with(|| {
                                 (
                                     Arc::new(ClassId(Symbol::from(declaration.name()))),
