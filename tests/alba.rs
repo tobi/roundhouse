@@ -313,7 +313,7 @@ fn constructor_reader_evidence_requires_unmodified_required_parameters() {
 }
 
 #[test]
-fn unused_resources_and_unrelated_library_diagnostics_are_unchanged() {
+fn unused_resources_leave_unresolved_library_constants_reported() {
     let source = SOURCE.split("class SurveyProbe").next().unwrap().to_owned()
         + "\nclass Unrelated; def call; UnknownVendor.unknown; end; end\n";
     let mut app = ingest_app_from_tree(HashMap::from([(
@@ -322,7 +322,11 @@ fn unused_resources_and_unrelated_library_diagnostics_are_unchanged() {
     )]))
     .unwrap();
     Analyzer::new(&app).analyze(&mut app);
-    assert!(diagnose(&app).is_empty());
+    let diagnostics = diagnose(&app);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code(), "unsupported");
+    assert!(diagnostics[0].message.contains("UnknownVendor"), "{diagnostics:?}");
+    assert_eq!(diagnostics[0].severity, roundhouse::diagnostic::Severity::Error);
 }
 
 #[test]

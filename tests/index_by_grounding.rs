@@ -44,7 +44,7 @@ fn a_class_body_index_by_grounds_to_the_runtime_function() {
 end
 "#,
     );
-    assert!(src.contains("ActiveSupport.index_by(BUILTIN)"), "{src}");
+    assert!(src.contains("ActiveSupport.index_by(Sound::BUILTIN)"), "{src}");
     // The receiver moved into argument position exactly once — a second
     // copy would evaluate a receiver with effects twice.
     assert_eq!(src.matches("BUILTIN").count(), 2, "{src}");

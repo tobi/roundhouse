@@ -18,6 +18,13 @@ use crate::ident::{Symbol, VarId};
 use crate::span::Span;
 use crate::ty::Ty;
 
+/// The source reference names a modeled class or module. The Ruby emitter
+/// uses its resolved `Ty::Class` when it changes lexical nesting.
+pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
+/// A generated constant may borrow a source span for diagnostics/layout;
+/// that position is not a written Ruby constant reference to index.
+pub const GENERATED_CONST_REF: u64 = 1 << 3;
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for;
@@ -95,10 +102,10 @@ pub struct Expr {
     /// consumption notes. `None` for nodes the lowerer didn't tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<IrHint>,
-    /// Bit-packed decisions stamped by per-target decide passes.
-    /// Bits 0–31 are reserved for cross-target concerns (e.g.
-    /// `NEEDS_PARENS`, `LAST_USE`) populated by shared analyses;
-    /// bits 32–63 are per-target-local (e.g. rust's `OWNED`,
+    /// Bit-packed source facts and target decisions. Bits 0–31 are
+    /// cross-target (`NEEDS_PARENS`, `LAST_USE`, `RESOLVED_CLASS_REF`);
+    /// the analyzer sets source facts and the decide passes set the rest.
+    /// Bits 32–63 are per-target-local (e.g. rust's `OWNED`,
     /// `CLONE_AT`). See `src/emit/rust/decide/bits.rs` for the
     /// rust bit allocation. Default `0` = "no decisions" — emitters
     /// that don't run a decide pass see no behavioral change.
@@ -150,6 +157,9 @@ impl Expr {
     /// threading a span argument through every small IR constructor.
     pub fn inherit_span(&mut self, enclosing: Span) {
         if self.span.is_synthetic() {
+            if matches!(&*self.node, ExprNode::Const { .. }) {
+                self.decisions |= GENERATED_CONST_REF;
+            }
             self.span = enclosing;
         }
         let here = self.span;

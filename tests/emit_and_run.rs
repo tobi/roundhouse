@@ -174,6 +174,217 @@ fn a_lambda_target_before_action_gates_the_action_it_guards() {
         .assert_passes();
 }
 
+/// An inner class wins over another class with the same last segment.
+#[test]
+fn a_bare_inner_class_runs_after_resolution() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/ui/selector.rb",
+            "module UI\n  class Selector\n    class Mode\n      def self.value\n        \"selected\"\n      end\n    end\n    def self.value\n      Mode.value\n    end\n  end\n  class Other\n    class Mode\n    end\n  end\nend\n",
+        )
+        .run_ruby("raise 'wrong inner class' unless UI::Selector.value == 'selected'")
+        .assert_passes();
+}
+
+#[test]
+fn rubydex_aliases_and_rooted_names_keep_their_runtime_identity() {
+    emit_and_run::real_blog()
+        .write("app/services/constant_names.rb", r#"
+class ConstantTarget
+  def self.value
+    11
+  end
+end
+module ConstantNames
+  class ConstantTarget
+    def self.value
+      22
+    end
+  end
+  AliasTarget = ConstantTarget
+  def self.values
+    [AliasTarget.value, ::ConstantTarget.value]
+  end
+end
+"#)
+        .run_ruby("raise 'alias/root identity' unless ConstantNames.values == [22, 11]")
+        .assert_passes();
+}
+
+#[test]
+fn rubydex_unresolved_library_constants_are_reported_before_execution() {
+    let run = emit_and_run::real_blog()
+        .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    acme-core (1.0.0)\n\nDEPENDENCIES\n  acme-core\n")
+        .write("app/services/constant_failure.rb", "class ConstantFailure\n  def self.value\n    AcmeCore::Client\n  end\nend\n")
+        .run_ruby("ConstantFailure.value");
+    assert!(!run.success, "unresolved constant unexpectedly ran");
+    assert!(run.errors.iter().any(|error| error.contains("AcmeCore::Client")),
+        "unresolved library constant must not check clean: errors={:?}, stderr={}", run.errors, run.stderr);
+    let source = run.emitted.parent().unwrap().join("app");
+    let check = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .arg("check").arg(&source).output().expect("CLI check");
+    let diagnostics = String::from_utf8_lossy(&check.stderr);
+    assert!(!check.status.success(), "CLI cannot certify a missing emitted constant: {diagnostics}");
+    assert!(diagnostics.contains("error[unsupported]"), "{diagnostics}");
+    assert!(diagnostics.contains("AcmeCore::Client"), "{diagnostics}");
+    let strict_output = run.emitted.parent().unwrap().join("strict-output");
+    let strict = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "ruby"]).arg(&source).arg("-o").arg(&strict_output)
+        .output().expect("strict CLI emission");
+    let diagnostics = String::from_utf8_lossy(&strict.stderr);
+    assert!(!strict.status.success(), "strict emission certified missing constant: {diagnostics}");
+    assert!(diagnostics.contains("AcmeCore::Client"), "{diagnostics}");
+    assert!(!strict_output.join("main.rb").exists(), "strict refusal must not publish the app");
+}
+
+#[test]
+fn rubydex_float_builtin_values_keep_numeric_runtime_behavior() {
+    emit_and_run::real_blog()
+        .write("app/services/float_limit.rb", "class FloatLimit\n  def self.value\n    [1 < Float::INFINITY, Float::EPSILON > 0.0, Float::NAN.nan?]\n  end\nend\n")
+        .run_ruby("raise 'float builtins' unless FloatLimit.value == [true, true, true]")
+        .assert_passes();
+}
+
+#[test]
+fn rubydex_concern_value_constants_keep_their_namespace_after_splicing() {
+    emit_and_run::real_blog()
+        .write("app/services/price_constants.rb", "module PriceConstants\n  OFFSET = 3\n  def price_offset\n    OFFSET\n  end\nend\n")
+        .write("app/controllers/prices_controller.rb", "class PricesController < ApplicationController\n  include PriceConstants\n  def show\n    @offset = price_offset\n  end\nend\n")
+        .run_ruby("require_relative 'app/controllers/prices_controller'\nraise 'moved value constant' unless PricesController.new.price_offset == 3")
+        .assert_passes();
+}
+
+/// `class UI::ExplicitSelector` does not lexically include `UI`, even
+/// though emitted Ruby nests it there. Keep a top-level same-suffix class
+/// distinct from the one inside UI after source-backed resolution.
+#[test]
+fn a_compact_class_uses_its_source_lexical_constant() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/ui/explicit_selector.rb",
+            "class SourceScopeResolution\n  def self.value\n    \"top-level\"\n  end\nend\nmodule UI\n  class SourceScopeResolution\n    def self.value\n      \"nested\"\n    end\n  end\nend\nclass UI::ExplicitSelector\n  def self.value\n    SourceScopeResolution.value\n  end\nend\n",
+        )
+        .run_ruby(
+            "raise 'wrong lexical constant' unless UI::ExplicitSelector.value == 'top-level'",
+        )
+        .assert_passes();
+}
+
+/// The runtime defines this exception in `active_support_ext.rb`.
+#[test]
+fn framework_exception_resolves_from_real_runtime_source() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/signature_probe.rb",
+            "class SignatureProbe\n  def self.call\n    begin\n      raise ActiveSupport::MessageVerifier::InvalidSignature\n    rescue ActiveSupport::MessageVerifier::InvalidSignature\n      \"handled\"\n    end\n  end\nend\n",
+        )
+        .run_ruby("raise 'signature error was not caught' unless SignatureProbe.call == 'handled'")
+        .assert_passes();
+}
+
+/// Rubydex promotes `X = <call>` to a module once code calls a method
+/// on `X`. These are still values: `.freeze` and `.map` build a Hash, an
+/// Array, and a String, and each read must type and run as that value.
+#[test]
+fn a_constant_assigned_from_a_call_runs_as_its_value() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/frozen_table.rb",
+            "class FrozenTable\n  STATUSES = { processed: \"processed\" }.freeze\n  NAMES = [\"a\", \"b\"].freeze\n  LABEL = \"label\".freeze\n  DOUBLED = [1, 2].map { |n| n * 2 }\n  def self.summary\n    [STATUSES[:processed].upcase, NAMES.first, LABEL.upcase, DOUBLED.last.to_s].join(\",\")\n  end\nend\n",
+        )
+        .run_ruby("raise 'frozen constant' unless FrozenTable.summary == 'PROCESSED,a,LABEL,4'")
+        .assert_passes();
+}
+
+/// Ingest copies a concern's methods into the controller that includes
+/// it, and the emitted controller drops the `include`. A class that
+/// resolved inside the concern's module must still name that class
+/// after the move.
+#[test]
+fn a_concern_class_reference_survives_the_copy_into_its_controller() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/price_support.rb",
+            "module PriceSupport\n  class RateCalculator\n    def self.value\n      7\n    end\n  end\n\n  def price\n    RateCalculator.value\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/quotes_controller.rb",
+            "class QuotesController < ApplicationController\n  include PriceSupport\n\n  def show\n    @value = price\n  end\nend\n",
+        )
+        .run_ruby(
+            "require_relative 'app/controllers/quotes_controller'\nraise 'concern class reference' unless QuotesController.new.price == 7",
+        )
+        .assert_passes();
+}
+
+/// Ingest hoists a file-level constant into the first class of the
+/// file, but Ruby declares it on Object. The inferred value must belong
+/// to the declaration that the read resolves to.
+#[test]
+fn a_file_level_constant_runs_from_the_class_below_it() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/review_probe.rb",
+            "ROOT_LIMIT = 7\n\nclass LimitReader\n  def self.value\n    ROOT_LIMIT\n  end\nend\n",
+        )
+        .run_ruby("raise 'file-level constant' unless LimitReader.value == 7")
+        .assert_passes();
+}
+
+/// ERB views are not indexed. A qualified class read there must not
+/// take the value of an unrelated constant with the same last segment,
+/// and a qualified value read takes the value declared at its full name.
+#[test]
+fn a_qualified_class_in_a_view_ignores_a_same_named_value() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/archive.rb",
+            "module Marker\n  Item = 1\nend\n\nmodule Archive\n  class Item\n    def self.label\n      \"archive\"\n    end\n  end\nend\n",
+        )
+        .edit(
+            "app/views/articles/index.html.erb",
+            "<% content_for :title, \"Articles\" %>",
+            "<% content_for :title, \"Articles\" %>\n<p id=\"archive-label\"><%= Archive::Item.label %></p>\n<p id=\"marker-item\"><%= Marker::Item + 1 %></p>",
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "    assert_select \"h1\", \"Articles\"\n",
+            "    assert_select \"h1\", \"Articles\"\n    assert_select \"#archive-label\", \"archive\"\n    assert_select \"#marker-item\", \"2\"\n",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
+/// Each constant in the chain reads the one before it. The value must
+/// reach the end of a chain longer than any fixed number of rounds.
+#[test]
+fn a_long_constant_chain_reaches_its_value() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/chain.rb",
+            "class Chain\n  A = 1\n  B = A\n  C = B\n  D = C\n  E = D\n  F = E\n\n  def self.value\n    F\n  end\nend\n",
+        )
+        .run_ruby("raise 'constant chain' unless Chain.value == 1")
+        .assert_passes();
+}
+
+/// Rubydex declares Object, BasicObject, Kernel, Module and Class
+/// itself. Those are Ruby's own classes, not unknown constants.
+#[test]
+fn object_new_runs_as_the_ruby_built_in() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/object_reader.rb",
+            "class ObjectReader\n  def self.value\n    Object.new\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/sentinels_controller.rb",
+            "class SentinelsController < ApplicationController\n  def show\n    @sentinel = Object.new\n  end\nend\n",
+        )
+        .run_ruby("raise 'Object.new' unless ObjectReader.value.instance_of?(Object)")
+        .assert_passes();
+}
+
 /// #139 typed `Model.human_attribute_name` as a String, which took the
 /// call from an error to clean, but no runtime defines it, so every
 /// page rendering the form raises `undefined method
@@ -1904,5 +2115,21 @@ end
 "#,
         )
         .run_test("test/models/article_guard_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn rubydex_qualified_value_constants_survive_shared_lowerings() {
+    emit_and_run::real_blog()
+        .write("app/services/collection_constants.rb", r#"
+class CollectionConstants
+  WORDS = ["a", "bb"]
+  LENGTHS = WORDS.index_by(&:length)
+  def self.values
+    [LENGTHS[2], "a".in?(WORDS)]
+  end
+end
+"#)
+        .run_ruby("raise 'qualified lowered constants' unless CollectionConstants.values == ['bb', true]")
         .assert_passes();
 }

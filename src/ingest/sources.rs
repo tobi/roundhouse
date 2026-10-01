@@ -68,6 +68,13 @@ pub fn reset() {
     SOURCES.with(|s| *s.borrow_mut() = Registry::default());
 }
 
+/// Guard the positional Rubydex answers in release as well as debug builds.
+/// Length alone does not protect FileIds against replacement or reordering.
+pub(super) fn assert_snapshot_matches(snapshot: &[SourceFile], drained: &[SourceFile]) {
+    assert!(snapshot == drained,
+        "source identities changed after the Rubydex snapshot; snapshot after the complete source walk");
+}
+
 /// Record a source file and return its `FileId` (1-based). Idempotent
 /// by path: a second registration of the same path returns the
 /// existing id and keeps the first text.
@@ -252,5 +259,34 @@ mod tests {
         assert_eq!(b, FileId(2));
         let files = drain();
         assert_eq!(files.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod rubydex_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn rubydex_snapshot_rejects_late_real_source_in_release_too() {
+        reset();
+        register("app/services/first.rb", "class First; end");
+        let before = snapshot();
+        register("components/payments/test/test_helper.rb", "class Late; end");
+        let after = drain();
+        assert!(std::panic::catch_unwind(|| assert_snapshot_matches(&before, &after)).is_err());
+        reset();
+    }
+
+    #[test]
+    fn rubydex_snapshot_preserves_ids_through_generated_passes() {
+        reset();
+        let id = register("components/payments/lib/probe.rb", "class Probe; end");
+        let before = snapshot();
+        assert_eq!(register("<delegate>", "class Generated; end"), FileId(0));
+        assert_eq!(register("components/payments/lib/probe.rb", "ignored"), id);
+        let after = drain();
+        assert_snapshot_matches(&before, &after);
+        assert_eq!(after[id.0 as usize - 1].path, before[id.0 as usize - 1].path);
+        reset();
     }
 }

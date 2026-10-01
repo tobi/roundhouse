@@ -63,18 +63,49 @@ registries:
   `yield` renders content and types `Str` (the Yield arm in
   `src/analyze/body/mod.rs`).
 - `super(...)` parent-method tracking — typed `Ty::Untyped`.
-- Constants are partially covered. Module-level frozen Hash/Array
-  constants in framework Ruby are tracked (`parse_module_constants`
-  in `src/runtime_src.rs`), and `Analyzer::build_constant_registry`
-  builds a whole-app name→type registry from `CONST = …` assignments
-  in model/controller class bodies — with its own small fixpoint, so
-  a constant defined in terms of another resolves once its dependency
-  does. Constant shapes outside those channels still fall through.
+- Constants remain partially covered. Rubydex indexes the Ruby files in
+  `App.sources` once. It also indexes Ruby sources in `runtime/ruby/`
+  and `runtime/spinel/`, plus RBS declarations for Ruby core classes.
+  The classes that Rubydex itself declares (`BasicObject`, `Kernel`,
+  `Object`, `Module`, `Class`) also count as Ruby core.
+  It resolves each source reference in its Ruby lexical scope, without
+  invented suffix aliases. Ingest starts this work on another thread
+  after the last source registers, and the remaining ingest passes run
+  at the same time. The Rubydex graph keeps only the definitions that
+  can change a constant lookup and the constant names written in the
+  source.
+  Roundhouse keeps compact answers keyed by source position and
+  releases the Rubydex graph before its typing passes. A read that
+  resolves to a class keeps the qualified class path in the IR, so the
+  read names the same class or value after ingest copies a concern method into
+  another class.
+  `Analyzer::build_constant_registry` infers each constant's value
+  type and stores it under the Rubydex declaration ID of its source
+  definition. The ID comes from the source position, so a file-level
+  constant that ingest moves into a class keeps its top-level ID. The
+  rounds continue until no value changes, so a chain such as `B = A`
+  resolves at any depth. A cycle stays unresolved.
+  Source snapshots and drains must preserve paths, text and order;
+  release builds enforce this identity and reject late registrations.
+  Prepared answers are reused only for the same ordered source contents.
+  Generated constants borrowing a real span carry an explicit origin bit;
+  missing Ruby documents or missing source-position answers cannot use
+  that fallback. Normal ingest persists `source_index_required`, and
+  clearing its source table triggers `source_index_missing`. Standalone
+  hand-built IR apps with no sources use exact modeled dispatch instead;
+  this API mode does not certify source indexing.
+  Views and generated expressions have no Rubydex answer. A bare name
+  there uses the typed local scope. A qualified name uses only the
+  value declared at that full name.
+- The analyzer reports an error for an unresolved source constant.
+  This includes executable library methods, parameter defaults and
+  constant initializers; an unresolved constant cannot check clean and
+  emit an unsupported raise. It does not select another class by a matching
+  name suffix.
+  `parse_module_constants` types literal constants in framework Ruby.
 
-Each gap lands when a fixture forces it; the analyzer never fails, it
-either leaves a `Ty::Var(n)` placeholder (inference gap, surfaced as
-an `UnresolvedType` Warning) or a `Ty::Untyped` (RBS-declared gradual
-escape, surfaced as a `GradualUntyped` Warning).
+Other inference gaps leave `Ty::Var(n)` or RBS `Ty::Untyped`.
+The analyzer reports these as warnings.
 
 ### Type variants worth knowing about
 
