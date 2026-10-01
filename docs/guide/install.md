@@ -63,7 +63,7 @@ another platform or CPU, a commit newer than the last snapshot, a fix
 you are testing before it lands, or the developer tools (`roundhouse-ast`,
 `dump_ir`, `emit_preview`) that the snapshot deliberately leaves out.
 
-You need a Rust toolchain (1.85 or later) and a working libclang: the
+You need a Rust toolchain (1.89 or later) and a working libclang: the
 `ruby-prism-sys` and `ruby-rbs-sys` build scripts generate their C
 bindings with bindgen, which loads clang's own resource headers.
 

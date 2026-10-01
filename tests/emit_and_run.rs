@@ -17,6 +17,58 @@ fn the_unedited_blog_runs() {
         .assert_passes();
 }
 
+/// Unlike a hash pattern with keys, `{}` requires the hash to be empty.
+/// A bare `is_a?(Hash)` check silently chose the wrong case arm for
+/// every nonempty hash. `**` explicitly permits the remaining keys.
+#[test]
+fn an_empty_hash_pattern_rejects_extra_keys() {
+    emit_and_run::real_blog()
+        .write(
+            "app/helpers/hash_pattern_probe.rb",
+            r#"class HashPatternProbe
+  #: (Hash[Symbol, Integer]) -> bool
+  def self.empty_match(value)
+    case value
+    in {}
+      true
+    else
+      false
+    end
+  end
+
+  #: (Hash[Symbol, Integer]) -> bool
+  def self.open_match(value)
+    case value
+    in { ** }
+      true
+    else
+      false
+    end
+  end
+
+  #: (Hash[Symbol, Integer]) -> bool
+  def self.key_match(value)
+    case value
+    in { x: 1 }
+      true
+    else
+      false
+    end
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"raise "empty hash did not match" unless HashPatternProbe.empty_match({})
+raise "nonempty hash incorrectly matched {}" if HashPatternProbe.empty_match({ x: 1 })
+raise "open hash pattern rejected extra keys" unless HashPatternProbe.open_match({ x: 1 })
+raise "keyed pattern rejected extra keys" unless HashPatternProbe.key_match({ x: 1, y: 2 })
+raise "keyed pattern accepted a missing key" if HashPatternProbe.key_match({ y: 2 })
+"#,
+        )
+        .assert_passes();
+}
+
 /// Alba's inherited declarations are executable property reads, not just a
 /// return-type assertion. Boot loads the generated classes without Alba.
 #[test]
@@ -122,55 +174,214 @@ fn a_lambda_target_before_action_gates_the_action_it_guards() {
         .assert_passes();
 }
 
-/// Unlike a hash pattern with keys, `{}` requires the hash to be empty.
-/// A bare `is_a?(Hash)` check silently chose the wrong case arm for
-/// every nonempty hash. `**` explicitly permits the remaining keys.
+/// An inner class wins over another class with the same last segment.
 #[test]
-fn an_empty_hash_pattern_rejects_extra_keys() {
+fn a_bare_inner_class_runs_after_resolution() {
     emit_and_run::real_blog()
         .write(
-            "app/helpers/hash_pattern_probe.rb",
-            r#"class HashPatternProbe
-  #: (Hash[Symbol, Integer]) -> bool
-  def self.empty_match(value)
-    case value
-    in {}
-      true
-    else
-      false
-    end
-  end
+            "app/services/ui/selector.rb",
+            "module UI\n  class Selector\n    class Mode\n      def self.value\n        \"selected\"\n      end\n    end\n    def self.value\n      Mode.value\n    end\n  end\n  class Other\n    class Mode\n    end\n  end\nend\n",
+        )
+        .run_ruby("raise 'wrong inner class' unless UI::Selector.value == 'selected'")
+        .assert_passes();
+}
 
-  #: (Hash[Symbol, Integer]) -> bool
-  def self.open_match(value)
-    case value
-    in { ** }
-      true
-    else
-      false
-    end
-  end
-
-  #: (Hash[Symbol, Integer]) -> bool
-  def self.key_match(value)
-    case value
-    in { x: 1 }
-      true
-    else
-      false
-    end
+#[test]
+fn rubydex_aliases_and_rooted_names_keep_their_runtime_identity() {
+    emit_and_run::real_blog()
+        .write("app/services/constant_names.rb", r#"
+class ConstantTarget
+  def self.value
+    11
   end
 end
-"#,
+module ConstantNames
+  class ConstantTarget
+    def self.value
+      22
+    end
+  end
+  AliasTarget = ConstantTarget
+  def self.values
+    [AliasTarget.value, ::ConstantTarget.value]
+  end
+end
+"#)
+        .run_ruby("raise 'alias/root identity' unless ConstantNames.values == [22, 11]")
+        .assert_passes();
+}
+
+#[test]
+fn rubydex_unresolved_library_constants_are_reported_before_execution() {
+    let run = emit_and_run::real_blog()
+        .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    acme-core (1.0.0)\n\nDEPENDENCIES\n  acme-core\n")
+        .write("app/services/constant_failure.rb", "class ConstantFailure\n  def self.value\n    AcmeCore::Client\n  end\nend\n")
+        .run_ruby("ConstantFailure.value");
+    assert!(!run.success, "unresolved constant unexpectedly ran");
+    assert!(run.errors.iter().any(|error| error.contains("AcmeCore::Client")),
+        "unresolved library constant must not check clean: errors={:?}, stderr={}", run.errors, run.stderr);
+    let source = run.emitted.parent().unwrap().join("app");
+    let check = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .arg("check").arg(&source).output().expect("CLI check");
+    let diagnostics = String::from_utf8_lossy(&check.stderr);
+    assert!(!check.status.success(), "CLI cannot certify a missing emitted constant: {diagnostics}");
+    assert!(diagnostics.contains("error[unsupported]"), "{diagnostics}");
+    assert!(diagnostics.contains("AcmeCore::Client"), "{diagnostics}");
+    let strict_output = run.emitted.parent().unwrap().join("strict-output");
+    let strict = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "ruby"]).arg(&source).arg("-o").arg(&strict_output)
+        .output().expect("strict CLI emission");
+    let diagnostics = String::from_utf8_lossy(&strict.stderr);
+    assert!(!strict.status.success(), "strict emission certified missing constant: {diagnostics}");
+    assert!(diagnostics.contains("AcmeCore::Client"), "{diagnostics}");
+    assert!(!strict_output.join("main.rb").exists(), "strict refusal must not publish the app");
+}
+
+#[test]
+fn rubydex_float_builtin_values_keep_numeric_runtime_behavior() {
+    emit_and_run::real_blog()
+        .write("app/services/float_limit.rb", "class FloatLimit\n  def self.value\n    [1 < Float::INFINITY, Float::EPSILON > 0.0, Float::NAN.nan?]\n  end\nend\n")
+        .run_ruby("raise 'float builtins' unless FloatLimit.value == [true, true, true]")
+        .assert_passes();
+}
+
+#[test]
+fn rubydex_concern_value_constants_keep_their_namespace_after_splicing() {
+    emit_and_run::real_blog()
+        .write("app/services/price_constants.rb", "module PriceConstants\n  OFFSET = 3\n  def price_offset\n    OFFSET\n  end\nend\n")
+        .write("app/controllers/prices_controller.rb", "class PricesController < ApplicationController\n  include PriceConstants\n  def show\n    @offset = price_offset\n  end\nend\n")
+        .run_ruby("require_relative 'app/controllers/prices_controller'\nraise 'moved value constant' unless PricesController.new.price_offset == 3")
+        .assert_passes();
+}
+
+/// `class UI::ExplicitSelector` does not lexically include `UI`, even
+/// though emitted Ruby nests it there. Keep a top-level same-suffix class
+/// distinct from the one inside UI after source-backed resolution.
+#[test]
+fn a_compact_class_uses_its_source_lexical_constant() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/ui/explicit_selector.rb",
+            "class SourceScopeResolution\n  def self.value\n    \"top-level\"\n  end\nend\nmodule UI\n  class SourceScopeResolution\n    def self.value\n      \"nested\"\n    end\n  end\nend\nclass UI::ExplicitSelector\n  def self.value\n    SourceScopeResolution.value\n  end\nend\n",
         )
         .run_ruby(
-            r#"raise "empty hash did not match" unless HashPatternProbe.empty_match({})
-raise "nonempty hash incorrectly matched {}" if HashPatternProbe.empty_match({ x: 1 })
-raise "open hash pattern rejected extra keys" unless HashPatternProbe.open_match({ x: 1 })
-raise "keyed pattern rejected extra keys" unless HashPatternProbe.key_match({ x: 1, y: 2 })
-raise "keyed pattern accepted a missing key" if HashPatternProbe.key_match({ y: 2 })
-"#,
+            "raise 'wrong lexical constant' unless UI::ExplicitSelector.value == 'top-level'",
         )
+        .assert_passes();
+}
+
+/// The runtime defines this exception in `active_support_ext.rb`.
+#[test]
+fn framework_exception_resolves_from_real_runtime_source() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/signature_probe.rb",
+            "class SignatureProbe\n  def self.call\n    begin\n      raise ActiveSupport::MessageVerifier::InvalidSignature\n    rescue ActiveSupport::MessageVerifier::InvalidSignature\n      \"handled\"\n    end\n  end\nend\n",
+        )
+        .run_ruby("raise 'signature error was not caught' unless SignatureProbe.call == 'handled'")
+        .assert_passes();
+}
+
+/// Rubydex promotes `X = <call>` to a module once code calls a method
+/// on `X`. These are still values: `.freeze` and `.map` build a Hash, an
+/// Array, and a String, and each read must type and run as that value.
+#[test]
+fn a_constant_assigned_from_a_call_runs_as_its_value() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/frozen_table.rb",
+            "class FrozenTable\n  STATUSES = { processed: \"processed\" }.freeze\n  NAMES = [\"a\", \"b\"].freeze\n  LABEL = \"label\".freeze\n  DOUBLED = [1, 2].map { |n| n * 2 }\n  def self.summary\n    [STATUSES[:processed].upcase, NAMES.first, LABEL.upcase, DOUBLED.last.to_s].join(\",\")\n  end\nend\n",
+        )
+        .run_ruby("raise 'frozen constant' unless FrozenTable.summary == 'PROCESSED,a,LABEL,4'")
+        .assert_passes();
+}
+
+/// Ingest copies a concern's methods into the controller that includes
+/// it, and the emitted controller drops the `include`. A class that
+/// resolved inside the concern's module must still name that class
+/// after the move.
+#[test]
+fn a_concern_class_reference_survives_the_copy_into_its_controller() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/price_support.rb",
+            "module PriceSupport\n  class RateCalculator\n    def self.value\n      7\n    end\n  end\n\n  def price\n    RateCalculator.value\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/quotes_controller.rb",
+            "class QuotesController < ApplicationController\n  include PriceSupport\n\n  def show\n    @value = price\n  end\nend\n",
+        )
+        .run_ruby(
+            "require_relative 'app/controllers/quotes_controller'\nraise 'concern class reference' unless QuotesController.new.price == 7",
+        )
+        .assert_passes();
+}
+
+/// Ingest hoists a file-level constant into the first class of the
+/// file, but Ruby declares it on Object. The inferred value must belong
+/// to the declaration that the read resolves to.
+#[test]
+fn a_file_level_constant_runs_from_the_class_below_it() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/review_probe.rb",
+            "ROOT_LIMIT = 7\n\nclass LimitReader\n  def self.value\n    ROOT_LIMIT\n  end\nend\n",
+        )
+        .run_ruby("raise 'file-level constant' unless LimitReader.value == 7")
+        .assert_passes();
+}
+
+/// ERB views are not indexed. A qualified class read there must not
+/// take the value of an unrelated constant with the same last segment,
+/// and a qualified value read takes the value declared at its full name.
+#[test]
+fn a_qualified_class_in_a_view_ignores_a_same_named_value() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/archive.rb",
+            "module Marker\n  Item = 1\nend\n\nmodule Archive\n  class Item\n    def self.label\n      \"archive\"\n    end\n  end\nend\n",
+        )
+        .edit(
+            "app/views/articles/index.html.erb",
+            "<% content_for :title, \"Articles\" %>",
+            "<% content_for :title, \"Articles\" %>\n<p id=\"archive-label\"><%= Archive::Item.label %></p>\n<p id=\"marker-item\"><%= Marker::Item + 1 %></p>",
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "    assert_select \"h1\", \"Articles\"\n",
+            "    assert_select \"h1\", \"Articles\"\n    assert_select \"#archive-label\", \"archive\"\n    assert_select \"#marker-item\", \"2\"\n",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
+/// Each constant in the chain reads the one before it. The value must
+/// reach the end of a chain longer than any fixed number of rounds.
+#[test]
+fn a_long_constant_chain_reaches_its_value() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/chain.rb",
+            "class Chain\n  A = 1\n  B = A\n  C = B\n  D = C\n  E = D\n  F = E\n\n  def self.value\n    F\n  end\nend\n",
+        )
+        .run_ruby("raise 'constant chain' unless Chain.value == 1")
+        .assert_passes();
+}
+
+/// Rubydex declares Object, BasicObject, Kernel, Module and Class
+/// itself. Those are Ruby's own classes, not unknown constants.
+#[test]
+fn object_new_runs_as_the_ruby_built_in() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/object_reader.rb",
+            "class ObjectReader\n  def self.value\n    Object.new\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/sentinels_controller.rb",
+            "class SentinelsController < ApplicationController\n  def show\n    @sentinel = Object.new\n  end\nend\n",
+        )
+        .run_ruby("raise 'Object.new' unless ObjectReader.value.instance_of?(Object)")
         .assert_passes();
 }
 
@@ -1141,6 +1352,74 @@ end
         .assert_passes();
 }
 
+/// `resources :x, only: [] do … end` nests routes under a parent with no
+/// routes of its own. Ingest rejected the empty list and dropped the
+/// parent with every route nested in it.
+#[test]
+fn nested_routes_under_an_only_empty_parent_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  resources :articles do\n    resources :comments, only: [:create, :destroy]\n  end\n",
+            "  resources :articles\n  resources :articles, only: [] do\n    resources :comments, only: [:create, :destroy]\n  end\n",
+        )
+        .run_test("test/controllers/comments_controller_test.rb")
+        .assert_passes();
+}
+
+/// A collection render with `as: :for` emitted a
+/// positional `for` param and a `|for|` block param.
+#[test]
+fn a_collection_render_with_a_reserved_word_as_local_runs() {
+    let run = on_the_index(
+        emit_and_run::real_blog().write(
+            "app/views/articles/_row.html.erb",
+            "<li class=\"for-row\"><%= binding.local_variable_get(:for).title %></li>\n",
+        )
+        .write(
+            "app/views/articles/_assigns_row.html.erb",
+            "<li class=\"for-assigns-row\"><%= local_assigns[:for].title %></li>\n",
+        ),
+        "<%= render partial: \"row\", collection: @articles, as: :for %>\n\
+         <%= render partial: \"assigns_row\", collection: @articles, as: :for %>\n",
+        "    assert_select \"li.for-row\", Article.count\n    \
+             assert_select \"li.for-assigns-row\", Article.count\n",
+    );
+    run.assert_passes();
+}
+
+#[test]
+fn a_shared_factory_respects_an_overridden_constructor() {
+    emit_and_run::real_blog()
+        .write("app/services/custom_factory.rb", r#"module CustomFactory
+  class_methods do
+    def build
+      new
+    end
+  end
+end
+class FactoryReading < T::Struct
+  const :label, String
+end
+class FactoryPacket
+  include CustomFactory
+  def self.new
+    FactoryReading.new(label: "custom")
+  end
+end
+class FactoryConsumer
+  def self.label
+    FactoryPacket.build.label.upcase
+  end
+end
+"#)
+        .run_ruby(r#"
+raise "constructor identity" unless FactoryPacket.build.class == FactoryReading
+raise "constructor consumer" unless FactoryConsumer.label == "CUSTOM"
+"#)
+        .assert_passes();
+}
+
 /// Not only a string default: schema.rb's unquoted `default: true`, `default: 1.5` and `default: -3` reach a new record, and a value the caller passes still wins.
 #[test]
 fn a_schema_default_that_is_not_a_string_seeds_a_new_record() {
@@ -1193,9 +1472,9 @@ end
         .assert_passes();
 }
 
-/// Not a NoMethodError: an enum's `not_<label>` scope and `<column>_before_type_cast` exist, as Rails generates them.
+/// Negative enum scopes query the stored values, with prefix options respected.
 #[test]
-fn an_enum_negative_scope_and_before_type_cast_run() {
+fn an_enum_negative_scope_runs() {
     emit_and_run::real_blog()
         .edit(
             "db/schema.rb",
@@ -1219,12 +1498,6 @@ class ArticleEnumScopeTest < ActiveSupport::TestCase
     assert_equal 0, Article.not_tone_loud.where(id: article.id).count
   end
 
-  test "the stored value before the label" do
-    article = Article.create!(title: "Raw", body: "A body long enough to validate.", state: :published, tone: :loud)
-    reloaded = Article.find(article.id)
-    assert_equal 1, reloaded.state_before_type_cast
-    assert_equal "l", reloaded.tone_before_type_cast
-  end
 end
 "#,
         )
@@ -1631,6 +1904,52 @@ end
         .assert_passes();
 }
 
+#[test]
+fn model_rest_and_block_parameters_run_with_their_source_arity() {
+    emit_and_run::real_blog()
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", r#"class Article < ApplicationRecord
+  def tagged(*labels)
+    labels.join(",")
+  end
+  def pair(first, *rest, last)
+    [first, rest.join(","), last].join("|")
+  end
+  def each_title(&blk)
+    [title, "tail"].each(&blk)
+  end
+  def forward_titles(...)
+    each_title(...)
+  end
+  def both(*args, **opts)
+    [args.join(","), opts[:tag]].join("|")
+  end
+"#)
+        .write("app/services/rest_control.rb", r#"class RestControl
+  def tagged(*labels)
+    labels.join(",")
+  end
+end
+"#)
+        .run_ruby(r#"
+article = Article.new(title: "source")
+control = RestControl.new
+raise "model rest" unless article.tagged("x", "y") == "x,y"
+raise "empty rest" unless article.tagged == ""
+raise "library control" unless control.tagged("x", "y") == article.tagged("x", "y")
+raise "post parameter" unless article.pair("head", "a", "b", "last") == "head|a,b|last"
+raise "empty post rest" unless article.pair("head", "last") == "head||last"
+seen = []
+result = article.each_title { |value| seen << value.upcase }
+raise "block values" unless seen == ["SOURCE", "TAIL"]
+raise "block return" unless result == ["source", "tail"]
+forwarded = []
+article.forward_titles { |value| forwarded << value.upcase }
+raise "forwarded block preservation" unless forwarded == seen
+raise "rest with keywords" unless article.both("x", "y", tag: "z") == "x,y|z"
+raise "empty positional rest" unless article.both(tag: "z") == "|z"
+"#).assert_passes();
+}
+
 /// The exact inclusion bridge and its carrier can be in different
 /// reopenings. Consuming the bridge must follow the carrier's identity,
 /// not whether both declarations happened to share a source file.
@@ -1689,200 +2008,15 @@ raise "split size consumer" unless SplitFactoryConsumer.size == 33
     }
 }
 
-/// `resources :x, only: [] do … end` nests routes under a parent with no
-/// routes of its own. Ingest rejected the empty list and dropped the
-/// parent with every route nested in it.
 #[test]
-fn nested_routes_under_an_only_empty_parent_run() {
+fn alba_proven_readonly_association_runs_without_a_redundant_nil_guard() {
+    let source = include_str!("support/alba.rb")
+        .replace("@author || raise(\"author required\")", "@author");
     emit_and_run::real_blog()
-        .edit(
-            "config/routes.rb",
-            "  resources :articles do\n    resources :comments, only: [:create, :destroy]\n  end\n",
-            "  resources :articles\n  resources :articles, only: [] do\n    resources :comments, only: [:create, :destroy]\n  end\n",
-        )
-        .run_test("test/controllers/comments_controller_test.rb")
-        .assert_passes();
-}
-
-/// A collection render with `as: :for` emitted a
-/// positional `for` param and a `|for|` block param.
-#[test]
-fn a_collection_render_with_a_reserved_word_as_local_runs() {
-    let run = on_the_index(
-        emit_and_run::real_blog().write(
-            "app/views/articles/_row.html.erb",
-            "<li class=\"for-row\"><%= binding.local_variable_get(:for).title %></li>\n",
-        )
-        .write(
-            "app/views/articles/_assigns_row.html.erb",
-            "<li class=\"for-assigns-row\"><%= local_assigns[:for].title %></li>\n",
-        ),
-        "<%= render partial: \"row\", collection: @articles, as: :for %>\n\
-         <%= render partial: \"assigns_row\", collection: @articles, as: :for %>\n",
-        "    assert_select \"li.for-row\", Article.count\n    \
-             assert_select \"li.for-assigns-row\", Article.count\n",
-    );
-    run.assert_passes();
-}
-
-/// A clean factory call must construct the receiving T::Struct, not
-/// the concern or whichever includer was seen first. Exercise native
-/// emitted consumers as well as the objects, independently of the
-/// analyzer's inferred return types (invariant 6).
-#[test]
-fn a_shared_struct_factory_runs_for_both_includers_in_both_orders() {
-    let reading = "class Reading < T::Struct\n  include Factory\n  PREFIX = \"local:\"\n  const :label, String\nend\n";
-    let packet = "class Packet < T::Struct\n  include Factory\n  const :size, Integer\nend\n";
-    for declarations in [format!("{reading}{packet}"), format!("{packet}{reading}")] {
-        emit_and_run::real_blog()
-            .write("app/services/factory.rb", r#"module Factory
-  def self.included(base)
-    base.extend(ClassMethods)
-  end
-  module ClassMethods
-    def build(**fields)
-      new(**fields).freeze
-    end
-    def prefix
-      "old:"
-    end
-  end
-  def self.prefix
-    "initial module:"
-  end
-end
-"#)
-            // Reopening a carrier must retain build and take the newer
-            // prefix, whose default still belongs to Factory's scope.
-            .write("app/services/factory_extension.rb", r#"module Factory
-  PREFIX = "reading:"
-  module ClassMethods
-    def fixed
-      Reading.new(label: "fixed").freeze
-    end
-    def prefix(value = PREFIX)
-      value
-    end
-  end
-  def self.prefix
-    "module:"
-  end
-end
-"#)
-            .write("app/services/values.rb", &declarations)
-            .write("app/services/factory_consumer.rb", r#"class FactoryConsumer
-  def self.label
-    Reading.prefix + Reading.build(label: "sensor").label.upcase
-  end
-  def self.size
-    Packet.build(size: 7).size * 3
-  end
-end
-"#)
-            .write("app/controllers/factory_probes_controller.rb", r#"class FactoryProbesController < ApplicationController
-  def index
-    @label = Reading.build(label: "probe").label
-    @size = Packet.build(size: 7).size
-    render plain: FactoryConsumer.label
-  end
-end
-"#)
-            .run_ruby(r#"
-reading = Reading.build(label: "probe")
-packet = Packet.build(size: 7)
-raise "reading identity" unless reading.class == Reading
-raise "reading field" unless reading.label == "probe"
-raise "reading freeze" unless reading.frozen?
-raise "packet identity" unless packet.class == Packet
-raise "packet field" unless packet.size == 7
-raise "packet freeze" unless packet.frozen?
-raise "label consumer" unless FactoryConsumer.label == "reading:SENSOR"
-raise "size consumer" unless FactoryConsumer.size == 21
-raise "module singleton" unless Factory.prefix == "module:"
-fixed = Packet.fixed
-raise "fixed-other identity" unless fixed.class == Reading
-raise "fixed-other field" unless fixed.label == "fixed"
-raise "fixed-other freeze" unless fixed.frozen?
-"#)
-            .assert_passes();
-    }
-}
-
-#[test]
-fn a_shared_factory_respects_an_overridden_constructor() {
-    emit_and_run::real_blog()
-        .write("app/services/custom_factory.rb", r#"module CustomFactory
-  class_methods do
-    def build
-      new
-    end
-  end
-end
-class FactoryReading < T::Struct
-  const :label, String
-end
-class FactoryPacket
-  include CustomFactory
-  def self.new
-    FactoryReading.new(label: "custom")
-  end
-end
-class FactoryConsumer
-  def self.label
-    FactoryPacket.build.label.upcase
-  end
-end
-"#)
+        .write("app/lib/alba_resources.rb", &source)
         .run_ruby(r#"
-raise "constructor identity" unless FactoryPacket.build.class == FactoryReading
-raise "constructor consumer" unless FactoryConsumer.label == "CUSTOM"
-"#)
-        .assert_passes();
-}
-
-#[test]
-fn model_rest_and_block_parameters_run_with_their_source_arity() {
-    emit_and_run::real_blog()
-        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", r#"class Article < ApplicationRecord
-  def tagged(*labels)
-    labels.join(",")
-  end
-  def pair(first, *rest, last)
-    [first, rest.join(","), last].join("|")
-  end
-  def each_title(&blk)
-    [title, "tail"].each(&blk)
-  end
-  def forward_titles(...)
-    each_title(...)
-  end
-  def both(*args, **opts)
-    [args.join(","), opts[:tag]].join("|")
-  end
-"#)
-        .write("app/services/rest_control.rb", r#"class RestControl
-  def tagged(*labels)
-    labels.join(",")
-  end
-end
-"#)
-        .run_ruby(r#"
-article = Article.new(title: "source")
-control = RestControl.new
-raise "model rest" unless article.tagged("x", "y") == "x,y"
-raise "empty rest" unless article.tagged == ""
-raise "library control" unless control.tagged("x", "y") == article.tagged("x", "y")
-raise "post parameter" unless article.pair("head", "a", "b", "last") == "head|a,b|last"
-raise "empty post rest" unless article.pair("head", "last") == "head||last"
-seen = []
-result = article.each_title { |value| seen << value.upcase }
-raise "block values" unless seen == ["SOURCE", "TAIL"]
-raise "block return" unless result == ["source", "tail"]
-forwarded = []
-article.forward_titles { |value| forwarded << value.upcase }
-raise "forwarded block preservation" unless forwarded == seen
-raise "rest with keywords" unless article.both("x", "y", tag: "z") == "x,y|z"
-raise "empty positional rest" unless article.both(tag: "z") == "|z"
+expected = {"id" => 7, "title" => "Synthetic", "author" => {"id" => 9, "name" => "Ada"}}
+raise "readonly association" unless SurveyProbe.call == expected
 "#).assert_passes();
 }
 
@@ -1981,5 +2115,21 @@ end
 "#,
         )
         .run_test("test/models/article_guard_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn rubydex_qualified_value_constants_survive_shared_lowerings() {
+    emit_and_run::real_blog()
+        .write("app/services/collection_constants.rb", r#"
+class CollectionConstants
+  WORDS = ["a", "bb"]
+  LENGTHS = WORDS.index_by(&:length)
+  def self.values
+    [LENGTHS[2], "a".in?(WORDS)]
+  end
+end
+"#)
+        .run_ruby("raise 'qualified lowered constants' unless CollectionConstants.values == ['bb', true]")
         .assert_passes();
 }

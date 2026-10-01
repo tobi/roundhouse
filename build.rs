@@ -90,13 +90,32 @@ fn embed_runtime_files() {
         collect(&dir, top, &mut entries);
     }
     entries.sort();
+    let dest = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(dest.join("runtime_files.rs"), runtime_table(entries.iter()))
+        .expect("write runtime_files.rs");
+    // The browser analyzer also needs framework and Spinel shim
+    // declarations. Exclude emit scaffolds and tests from its table.
+    let ruby = entries.iter().filter(|(path, _)| {
+        (path.starts_with("runtime/ruby/") || path.starts_with("runtime/spinel/"))
+            && path.ends_with(".rb")
+            && !path
+                .split('/')
+                .any(|part| part == "test" || part == "scaffold")
+    });
+    std::fs::write(dest.join("runtime_const_sources.rs"), runtime_table(ruby))
+        .expect("write runtime_const_sources.rs");
+}
+
+fn runtime_table<'a>(entries: impl Iterator<Item = &'a (String, PathBuf)>) -> String {
     let mut out = String::from("&[\n");
-    for (rel, abs) in &entries {
-        out.push_str(&format!("    ({rel:?}, include_str!({:?})),\n", abs.display().to_string()));
+    for (rel, abs) in entries {
+        out.push_str(&format!(
+            "    ({rel:?}, include_str!({:?})),\n",
+            abs.display().to_string()
+        ));
     }
     out.push_str("]\n");
-    let dest = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("runtime_files.rs");
-    std::fs::write(&dest, out).expect("write runtime_files.rs");
+    out
 }
 
 fn collect(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) {
