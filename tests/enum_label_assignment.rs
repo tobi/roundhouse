@@ -94,23 +94,16 @@ fn the_enum_columns_writers_map_the_label() {
     );
 }
 
-/// Schema defaults are raw storage, not user assignments. Only the supplied
-/// key is mapped; an unmapped schema default must not raise in a child writer.
+/// Schema defaults are stored values. Only supplied attributes pass
+/// through the enum writer, including in a child with a different map.
 #[test]
-fn initialize_validates_only_supplied_enum_values() {
+fn initialize_stores_the_default_and_maps_explicit_input() {
     let src = user_src();
-    let constructor = src
-        .split("  def initialize(")
-        .nth(1)
-        .expect("constructor")
-        .split("\n  def ")
-        .next()
-        .unwrap();
+    assert!(src.contains("@role = 0"), "raw schema default:\n{src}");
+    let line = line_containing(&src, "self.role = ActiveRecord.enum_int");
     assert!(
-        constructor.contains("@role = if attrs.key? :role")
-            && constructor.contains("ActiveRecord.enum_int((attrs[:role]).to_s,")
-            && !constructor.contains("(attrs[:role] || 0).to_s"),
-        "only explicit input must pass enum validation:\n{constructor}"
+        line.contains("(attrs[:role]).to_s") && line.ends_with("if attrs.key?(:role)"),
+        "only explicit input must pass through the mapping:\n{line}"
     );
 }
 
