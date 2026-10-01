@@ -91,15 +91,16 @@ fn the_enum_columns_writers_map_the_label() {
     );
 }
 
-/// `initialize` wraps the DEFAULTED value, so an absent key still takes
-/// the column default rather than being read as a label.
+/// Schema defaults are stored values. Only supplied attributes pass
+/// through the enum writer, including in a child with a different map.
 #[test]
-fn initialize_maps_outside_the_default() {
+fn initialize_stores_the_default_and_maps_explicit_input() {
     let src = user_src();
+    assert!(src.contains("@role = 0"), "raw schema default:\n{src}");
     let line = line_containing(&src, "self.role = ActiveRecord.enum_int");
     assert!(
-        line.contains("(attrs[:role] || 0).to_s"),
-        "the || default must stay INSIDE the mapping:\n{line}"
+        line.contains("(attrs[:role]).to_s") && line.ends_with("if attrs.key?(:role)"),
+        "only explicit input must pass through the mapping:\n{line}"
     );
 }
 
