@@ -1591,3 +1591,49 @@ end
         .run_test("test/models/article_inflections_test.rb")
         .assert_passes();
 }
+
+#[test]
+fn model_rest_and_block_parameters_run_with_their_source_arity() {
+    emit_and_run::real_blog()
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", r#"class Article < ApplicationRecord
+  def tagged(*labels)
+    labels.join(",")
+  end
+  def pair(first, *rest, last)
+    [first, rest.join(","), last].join("|")
+  end
+  def each_title(&blk)
+    [title, "tail"].each(&blk)
+  end
+  def forward_titles(...)
+    each_title(...)
+  end
+  def both(*args, **opts)
+    [args.join(","), opts[:tag]].join("|")
+  end
+"#)
+        .write("app/services/rest_control.rb", r#"class RestControl
+  def tagged(*labels)
+    labels.join(",")
+  end
+end
+"#)
+        .run_ruby(r#"
+article = Article.new(title: "source")
+control = RestControl.new
+raise "model rest" unless article.tagged("x", "y") == "x,y"
+raise "empty rest" unless article.tagged == ""
+raise "library control" unless control.tagged("x", "y") == article.tagged("x", "y")
+raise "post parameter" unless article.pair("head", "a", "b", "last") == "head|a,b|last"
+raise "empty post rest" unless article.pair("head", "last") == "head||last"
+seen = []
+result = article.each_title { |value| seen << value.upcase }
+raise "block values" unless seen == ["SOURCE", "TAIL"]
+raise "block return" unless result == ["source", "tail"]
+forwarded = []
+article.forward_titles { |value| forwarded << value.upcase }
+raise "forwarded block preservation" unless forwarded == seen
+raise "rest with keywords" unless article.both("x", "y", tag: "z") == "x,y|z"
+raise "empty positional rest" unless article.both(tag: "z") == "|z"
+"#).assert_passes();
+}

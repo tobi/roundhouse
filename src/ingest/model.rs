@@ -1397,8 +1397,9 @@ pub(super) fn ingest_method(
     // params (`def avatar_path(size = 100)`) carrying their default expr so
     // the emitted method reproduces the arity — dropping the optional left
     // `def avatar_path` with a body still reading `size`, an ArgumentError
-    // at every call site that passes one. Keyword/rest/block params are
-    // rarer on model methods and still fall through unrecorded.
+    // at every call site that passes one. Every parameter kind the
+    // library-class path records is recorded here too, in Ruby's
+    // declaration order, so the `def` keeps the source arity.
     let mut params: Vec<crate::dialect::Param> = Vec::new();
     let mut block_param: Option<crate::dialect::Param> = None;
     if let Some(pn) = def.parameters() {
@@ -1418,11 +1419,29 @@ pub(super) fn ingest_method(
                 ));
             }
         }
+        // `*rest`, and the required params Ruby allows after it
+        // (`def pair(first, *rest)`, `def f(*rest, last)`). Dropping
+        // the splat left `def tagged` with a body still reading
+        // `labels` — an ArgumentError at every call site that passes
+        // one, while the same method on a plain class kept it. An
+        // anonymous `*` has no name to bind and is skipped, as the
+        // library-class path skips it.
+        if let Some(rest) = pn.rest() {
+            if let Some(loc) = rest.as_rest_parameter_node().and_then(|rp| rp.name()) {
+                params.push(crate::dialect::Param::rest(Symbol::from(constant_id_str(&loc))));
+            }
+        }
+        for post in pn.posts().iter() {
+            if let Some(pp) = post.as_required_parameter_node() {
+                params.push(crate::dialect::Param::positional(Symbol::from(
+                    constant_id_str(&pp.name()),
+                )));
+            }
+        }
         // Keyword params (`def recent_threads(amount, for_user: nil)`),
         // required (`k:`) and optional (`k: default`) alike. Dropping
         // them left `def recent_threads(amount)` with a body reading
         // `for_user` — an ArgumentError at every kwarg call site.
-        // Rest/block params still fall through unrecorded.
         for kw in pn.keywords().iter() {
             if let Some(okw) = kw.as_optional_keyword_parameter_node() {
                 let default = ingest_expr(&okw.value(), file)?;
@@ -1444,16 +1463,27 @@ pub(super) fn ingest_method(
         // notification` with a body still reading `params` — every
         // caller an ArgumentError, and the forward into
         // `WebPush::Notification.new(**params, …)` a bare name.
+        //
+        // Beside a positional `*rest` the flattening does not parse
+        // (`def both(*args, options = {})`), so there the slot stays a
+        // real `**kwrest`, as the library-class path keeps it.
         if let Some(krest) = pn.keyword_rest() {
             if let Some(krp) = krest.as_keyword_rest_parameter_node() {
                 if let Some(loc) = krp.name() {
-                    let mut p = crate::dialect::Param::with_default(
-                        Symbol::from(constant_id_str(&loc)),
-                        Expr::new(
-                            Span::synthetic(),
-                            ExprNode::Hash { entries: vec![], kwargs: false },
-                        ),
-                    );
+                    let name = Symbol::from(constant_id_str(&loc));
+                    let mut p = if params.iter().any(|p| p.rest) {
+                        let mut p = crate::dialect::Param::keyword(name, None);
+                        p.rest = true;
+                        p
+                    } else {
+                        crate::dialect::Param::with_default(
+                            name,
+                            Expr::new(
+                                Span::synthetic(),
+                                ExprNode::Hash { entries: vec![], kwargs: false },
+                            ),
+                        )
+                    };
                     p.from_kwrest = true;
                     params.push(p);
                 }
@@ -1469,6 +1499,20 @@ pub(super) fn ingest_method(
             )));
         }
     }
+
+    // `&blk` rides in `MethodDef.block_param`, not the flat list, as
+    // the library-class path records it: it fills the call-site
+    // `block:` slot, and the emitter closes the `def` with `&blk` so a
+    // body that passes it on (`each(&blk)`) still binds the name.
+    // Ruby 3.4's anonymous `&` gets the same synthesized name the
+    // library-class path gives it, so bare-`&` forwarding binds.
+    block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
+        let name = block
+            .name()
+            .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
+            .unwrap_or("__blk");
+        crate::dialect::Param::positional(Symbol::from(name))
+    }).or(block_param);
 
     let body = match def.body() {
         Some(b) => ingest_expr(&b, file)?,
@@ -1489,8 +1533,8 @@ pub(super) fn ingest_method(
         // Source-defined `def` in a Rails model — Method by default.
         kind: crate::dialect::AccessorKind::Method,
         is_async: false,
-            mutates_self: false,
-            block_param,
+        mutates_self: false,
+        block_param,
     })
 }
 
