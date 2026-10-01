@@ -2016,6 +2016,20 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
         let nullable = matches!(super::ty_of_column_slot(col), Ty::Union { .. })
             && schema_default.is_none();
         let default = schema_default.unwrap_or_else(|| default_literal_for_ty(&col_ty));
+        // Defaults are stored database values, not assignments through
+        // the enum type. In particular, a base constructor must not
+        // dispatch its default through a child's different enum writer.
+        // Only explicit input goes through the public writer.
+        if crate::dialect::enum_reads_label(model, &col.name) {
+            let slot_ty = super::ty_of_column_slot(col);
+            let raw_default = if nullable { nil_lit() } else { default };
+            stmts.push(with_ty(Expr::new(Span::synthetic(), ExprNode::Assign {
+                target: LValue::Ivar { name: col_storage_name(col) },
+                value: with_ty(raw_default, slot_ty.clone()),
+            }), slot_ty));
+            stmts.push(given_value_assign(model, col, &attrs));
+            continue;
+        }
         // is_id_column reference retained as a feature flag for
         // future per-column override hooks; today every column flows
         // through the same default-lookup shape.
