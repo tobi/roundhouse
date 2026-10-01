@@ -158,11 +158,12 @@ jobs:
   # generate-fixture — they're independent (the wasm embeds the compiler;
   # the fixture is runtime input fed in the browser), so this multi-minute
   # LTO build hides behind work build-site already waits on, adding ~0 to
-  # the critical path to deploy. Rebuilds via the in-repo vendored
-  # ruby-rbs-sys (wasm/vendor/ — wasm32 build support upstream-pending as
-  # ruby/rbs#2992), so the 3.8 MB binary is NOT committed and the published
-  # demos (/playground/, /studio/) always track main. The only external
-  # need is the WASI SDK (a manual tarball, cached here).
+  # the critical path to deploy. Rebuilds via the in-repo vendored crates
+  # in wasm/vendor/ — ruby-rbs-sys (wasm32 build support upstream-pending
+  # as ruby/rbs#2992) and rubydex (32-bit fix upstream-pending as
+  # Shopify/rubydex#1059) — so the 3.8 MB binary is NOT committed and the
+  # published demos (/playground/, /studio/) always track main. The only
+  # external need is the WASI SDK (a manual tarball, cached here).
   # -------------------------------------------------------------------
   build-wasm:
     runs-on: ubuntu-latest
