@@ -29,12 +29,5 @@ opt-level = "z"
 # churn. The vendored crate is stable until #2992 publishes; then drop this
 # patch + vendor/ and depend on the published crate. Requires WASI_SDK_PATH.
 # See wasm/vendor/ruby-rbs-sys/README.md.
-#
-# Rubydex 0.2.5 asserts 64-bit struct sizes at compile time, so it does not
-# build for wasm32. This patch points at an IN-REPO copy of the published crate
-# with the fix upstream-pending as Shopify/rubydex#1059. When a release with
-# #1059 publishes, drop this line + vendor/rubydex/ and bump the root pin.
-# See wasm/vendor/rubydex/VENDORED.md.
 [patch.crates-io]
 ruby-rbs-sys = { path = "vendor/ruby-rbs-sys" }
-rubydex = { path = "vendor/rubydex" }

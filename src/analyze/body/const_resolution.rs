@@ -71,7 +71,7 @@ struct Document<'a> {
 
 impl Document<'_> {
     fn index(&self) -> LocalGraph {
-        let uri = [self.uri_prefix, self.path].concat();
+        let uri: Box<str> = [self.uri_prefix, self.path].concat().into();
         constant_graph(
             build_local_graph(uri, self.text, &self.language, IndexerBackend::RubyIndexer),
             self.text,
@@ -91,7 +91,7 @@ impl Document<'_> {
 fn constant_graph(local: LocalGraph, text: &str) -> LocalGraph {
     let (uri_id, document, definitions, strings, names, constant_references, _, _) =
         local.into_parts();
-    let document = RubydexDocument::new(document.uri().to_string(), text);
+    let document = RubydexDocument::new(document.uri().into(), text);
     let mut graph = LocalGraph::from_parts(uri_id, document, strings, names);
     for definition in definitions.into_values() {
         let keep = match &definition {
