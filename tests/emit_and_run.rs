@@ -6329,3 +6329,36 @@ raise "rest with keywords" unless article.both("x", "y", tag: "z") == "x,y|z"
 raise "empty positional rest" unless article.both(tag: "z") == "|z"
 "#).assert_passes();
 }
+
+/// Not the scaffold blog's `app/views.rb`, whose requires name views this tree does not have: an app with no views boots and answers a request (#164).
+#[test]
+fn an_app_with_no_views_boots() {
+    emit_and_run::empty_app()
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "app/controllers/widgets_controller.rb",
+            "class WidgetsController < ApplicationController\n  def index\n    head :no_content\n  end\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n")
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  root \"widgets#index\"\n  resources :widgets, only: :index\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"status, = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/widgets", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+raise "GET /widgets answered #{status}" unless status == 204
+"#,
+        )
+        .assert_passes();
+}
