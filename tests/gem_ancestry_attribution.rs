@@ -16,11 +16,15 @@ const QUARTZ_LOCK: &str =
     "GEM\n  specs:\n    quartz_serializer (1.0.0)\n\nDEPENDENCIES\n  quartz_serializer\n";
 
 fn app(resources: &str, lock: Option<&str>) -> App {
+    app_with_consumer(resources, lock, "class ArticlesController < ApplicationController\n  def show\n    render json: {article: ArticleResource.new(Article.find(params[:id])).to_h}\n  end\nend\n")
+}
+
+fn app_with_consumer(resources: &str, lock: Option<&str>, consumer: &str) -> App {
     let mut tree: HashMap<PathBuf, Vec<u8>> = [
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
         ("app/models/article.rb", "class Article < ApplicationRecord\nend\n"),
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
-        ("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n  def show\n    render json: {article: ArticleResource.new(Article.find(params[:id])).unmodeled_serializer_probe}\n  end\nend\n"),
+        ("app/controllers/articles_controller.rb", consumer),
         ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n"),
         ("config/routes.rb", "Rails.application.routes.draw do\n  resources :articles, only: :show\nend\n"),
         ("app/resources/resources.rb", resources),
@@ -56,9 +60,10 @@ fn failed_call(receiver: Ty, method: &str) -> Diagnostic {
 
 #[test]
 fn inherited_alba_call_is_attributed_without_claiming_typed_support() {
-    let mut app = app(
+    let mut app = app_with_consumer(
         "module SerializerBridge\n  include Alba::Resource\n  def local_helper; 1; end\nend\nclass ApplicationResource\n  include SerializerBridge\nend\nclass ArticleResource < ApplicationResource\nend\n",
         Some(ALBA_LOCK),
+        "class ArticlesController < ApplicationController\n  def show\n    render json: {article: ArticleResource.new(Article.find(params[:id])).unmodeled_serializer_probe}\n  end\nend\n",
     );
     Analyzer::new(&app).analyze(&mut app);
     let before = app.clone();
@@ -99,6 +104,36 @@ fn inherited_alba_call_is_attributed_without_claiming_typed_support() {
     let once = attributed.clone();
     attribute_unknown_gems(&mut attributed, &app);
     assert_eq!(attributed, once, "attribution is idempotent");
+}
+
+#[test]
+fn consumed_class_includes_use_original_literal_source_without_guessing() {
+    for (body, expected) in [
+        ("include QuartzSerializer::Resource", Severity::Info),
+        ("module QuartzSerializer; module Resource; end; end; include ::QuartzSerializer::Resource", Severity::Info),
+        ("module QuartzSerializer; module Resource; end; end; include QuartzSerializer::Resource", Severity::Error),
+        ("include build_namespace::Resource", Severity::Error),
+        ("include QuartzSerializer::Resource if enabled?", Severity::Error),
+        ("configure do; include QuartzSerializer::Resource; end", Severity::Error),
+        ("self.include QuartzSerializer::Resource", Severity::Error),
+    ] {
+        let mut app = app(&format!("class ArticleResource\n{body}\nend\n"), Some(QUARTZ_LOCK));
+        // Simulate a modeled mixin being consumed; this test isolates the
+        // original-source evidence. The actual Alba consumer above exercises
+        // the real synthesis, without mutating its inferred IR.
+        app.library_classes.iter_mut().find(|c| c.name == ClassId(Symbol::from("ArticleResource"))).unwrap().includes.clear();
+        let before = app.clone();
+        let mut diags = vec![failed_call(class("ArticleResource"), "encode_record")];
+        attribute_unknown_gems(&mut diags, &app);
+        assert_eq!(diags[0].severity, expected, "{body}: {}", diags[0].message);
+        assert_eq!(app, before);
+    }
+    // Restoring a precise source edge must not erase an ambiguous retained
+    // IR edge, whose rootedness was lost. Both kinds of evidence stay visible.
+    let app = app("class ArticleResource\n module QuartzSerializer; module Resource; end; end\n include ::QuartzSerializer::Resource\nend\n", Some(QUARTZ_LOCK));
+    let mut diags = vec![failed_call(class("ArticleResource"), "encode_record")];
+    attribute_unknown_gems(&mut diags, &app);
+    assert_eq!(diags[0].severity, Severity::Error);
 }
 
 #[test]

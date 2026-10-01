@@ -29,8 +29,55 @@ env:
   MASTODON_SHA: 163f96cee4dea23365bff9b433871e68d20d9ee7
   RUBY_BENCH_SHA: d771f81f1ce9db51376e03ca7b8e6a83160556d4
   CAMPFIRE_SHA: 90b330024dec3e757c79b6a7e6568f93da8e3148
+  WRITEBOOK_SHA: f3fadd21907ad9b18cb23800d971c2cc25045e2a
 
 jobs:
+  writebook-inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pinned Writebook source
+        run: |
+          curl -fsSL "https://codeload.github.com/basecamp/writebook/tar.gz/${WRITEBOOK_SHA}" -o /tmp/writebook.tar.gz
+          mkdir /tmp/writebook
+          tar -xzf /tmp/writebook.tar.gz -C /tmp/writebook --strip-components=1
+      - name: Build Roundhouse and run inventory
+        env:
+          WRITEBOOK_ROOT: /tmp/writebook
+          WRITEBOOK_INVENTORY_REPORT: writebook-inventory-current.json
+        run: |
+          cargo build --release --bin roundhouse
+          cargo test --test writebook --release -- --ignored --nocapture
+      - name: Save complete check report
+        if: always()
+        env:
+          WRITEBOOK_ROOT: /tmp/writebook
+        run: |
+          set +e
+          target/release/roundhouse check --continue "$WRITEBOOK_ROOT" > writebook-check.txt 2>&1
+          status=$?
+          set -e
+          cat writebook-check.txt
+          test "$(grep -c '^roundhouse-check: .* — ' writebook-check.txt)" -eq 1
+          summary=$(grep '^roundhouse-check: .* — ' writebook-check.txt)
+          pattern='^roundhouse-check: .* — ([0-9]+) parse error\(s\), ([0-9]+) error\(s\), [0-9]+ warning\(s\), [0-9]+ gap-attributed note\(s\), [0-9]+ survey gap\(s\)$'
+          [[ "$summary" =~ $pattern ]]
+          expected=0
+          if (( BASH_REMATCH[1] + BASH_REMATCH[2] > 0 )); then expected=1; fi
+          test "$status" -eq "$expected"
+      - name: Upload Writebook reports and baseline
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: writebook-inventory
+          path: |
+            writebook-check.txt
+            writebook-inventory-current.json
+            tests/fixtures/writebook-inventory.json
+
   # -------------------------------------------------------------------
   # Generate the real-blog fixture once, upload as artifact. Every
   # downstream test job downloads + extracts it — pay the Ruby/Rails
@@ -188,12 +235,34 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}/.spinel-sccache
+      SCCACHE_CACHE_SIZE: "256M"
+      # Preprocess each time: Spinel uses conditional __has_include headers.
+      SCCACHE_DIRECT: "false"
+      SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@v5
         with:
           repository: matz/spinel
           ref: master
           path: spinel-src
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+      - name: Restore Spinel compiler cache
+        # Persist only sccache's C compilation store, not build outputs.
+        # A new key saves refreshed entries as unpinned Spinel advances;
+        # sccache validates compiler, flags, source and header contents.
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: spinel-sccache-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: spinel-sccache-${{ runner.os }}-${{ runner.arch }}-
+      - name: Start sccache server
+        # Spinel's common.mk selects sccache automatically when on PATH.
+        run: sccache --start-server
       - name: make deps (fetch vendored libprism)
         run: make -C spinel-src deps
       - name: make all
@@ -239,6 +308,7 @@ jobs:
           cp -R spinel-src/lib                  spinel-dist/lib
           cp -R spinel-src/packages             spinel-dist/packages
           cp -R spinel-src/builtins             spinel-dist/builtins
+          git -C spinel-src rev-parse HEAD > spinel-dist/revision.txt
       - name: Upload spinel toolchain
         uses: actions/upload-artifact@v7
         with:
@@ -926,6 +996,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     continue-on-error: true
+    outputs:
+      artifact-id: ${{ steps.binary.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -945,17 +1017,66 @@ jobs:
           curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
           mkdir -p /tmp/campfire && tar -xzf /tmp/campfire.tar.gz -C /tmp/campfire --strip-components=1
       - name: Emit and build the comparison binary
+        id: build
         run: |
+          set -o pipefail
           cargo run --quiet --bin roundhouse -- --target spinel /tmp/campfire \
-            -o build/campfire-compare-spinel --allow-unsupported
-          make -C build/campfire-compare-spinel build
+            -o build/campfire-compare-spinel --allow-unsupported 2>&1 | tee campfire-emit.log
+          make -C build/campfire-compare-spinel build 2>&1 | tee campfire-build.log
           tar -czf campfire-compare-spinel.tar.gz -C build campfire-compare-spinel
+      # Keep the C from the failed invocation, not a second compiler run.
+      # Logs and inputs are still useful if emission failed before any C existed.
+      - name: Capture Campfire compiler failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: |
+          set +e
+          mkdir -p ci-campfire-repro/sources
+          {
+            printf 'Roundhouse: %s\nCampfire: %s\n' "$GITHUB_SHA" "$CAMPFIRE_SHA"
+            printf 'Spinel revision: '; cat spinel-dist/revision.txt
+            spinel-dist/spinel --version
+            cc --version
+            uname -a
+          } > ci-campfire-repro/versions.txt 2>&1
+          for log in campfire-emit.log campfire-build.log; do
+            [ ! -f "$log" ] || cp "$log" ci-campfire-repro/
+          done
+          for entry in main.rb boot.rb spin.toml Makefile bin app config lib runtime sig; do
+            source="build/campfire-compare-spinel/$entry"
+            [ ! -e "$source" ] || cp -R "$source" ci-campfire-repro/sources/
+          done
+          # Spinel retains failed C and names it in its diagnostic. Do not
+          # pick an unrelated file left in /tmp by an earlier compiler call.
+          generated=$(sed -n 's/^spinel: the generated C is kept at //p' campfire-build.log 2>/dev/null | tail -1)
+          if [ -n "$generated" ] && [ -f "$generated" ]; then
+            cp "$generated" ci-campfire-repro/generated.c
+          else
+            echo 'No retained C was reported; see the emission/build logs.' > ci-campfire-repro/capture.txt
+          fi
+      - name: Upload Campfire compiler failure
+        if: failure() && steps.build.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: campfire-compiler-repro
+          path: ci-campfire-repro
+          retention-days: 7
       - uses: actions/upload-artifact@v7
+        id: binary
         with:
           name: campfire-compare-spinel
           path: campfire-compare-spinel.tar.gz
           compression-level: 0
           retention-days: 1
+      - name: Report comparison availability
+        if: ${{ !cancelled() }}
+        env:
+          ARTIFACT_ID: ${{ steps.binary.outputs.artifact-id }}
+        run: |
+          if [ -n "$ARTIFACT_ID" ]; then
+            echo 'Campfire comparison binary uploaded; default, minor-gc and verify-gen comparisons can run.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No Campfire comparison binary was uploaded. The default, minor-gc and verify-gen comparisons are blocked, not passed; see the producer failure above.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # campfire-compare-spinel: the same equivalence, with the compiled
   # BINARY as the emit lane — Rails' broadcast frames vs the binary's.
@@ -1001,6 +1122,9 @@ jobs:
   campfire-compare-spinel:
     name: campfire-compare-spinel (${{ matrix.gc }})
     needs: build-campfire-compare-spinel
+    # An advisory producer failure must not become three artifact-download
+    # failures. Only the upload's artifact ID proves the binary is available.
+    if: ${{ !cancelled() && needs.build-campfire-compare-spinel.outputs.artifact-id != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     continue-on-error: true
@@ -1066,8 +1190,52 @@ jobs:
         run: gem install websocket-driver --no-document
       - name: scripts/campfire-compare --spinel ${{ matrix.flag }}
         run: scripts/campfire-compare --reuse "$PWD/build/campfire-compare-spinel" --spinel ${{ matrix.flag }} /tmp/campfire
+
+  # A different app (the model-scenario overlay), so it needs its own
+  # build, not the comparison binary. Start after the toolchain is ready
+  # instead of serializing it behind the shared build and request walk.
+  campfire-db-differential-spinel:
+    needs: build-spinel
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    services:
+      redis:
+        image: redis
+        ports: ['6379:6379']
+    env:
+      BUNDLE_PATH: vendor/bundle
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - uses: actions/download-artifact@v8
+        with:
+          name: spinel-dist
+          path: spinel-dist
+      - name: Stage spinel binaries
+        run: |
+          chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
+          echo "$PWD/spinel-dist" >> $GITHUB_PATH
+      - name: System libvips + libsqlite3-dev + libjemalloc-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
+      - name: Fetch pinned once-campfire
+        run: |
+          curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
+          mkdir -p /tmp/campfire && tar -xzf /tmp/campfire.tar.gz -C /tmp/campfire --strip-components=1
+      - name: Cache the prepared oracle
+        id: oracle
+        uses: actions/cache@v4
+        with:
+          path: build/campfire-oracle
+          key: campfire-oracle-${{ env.CAMPFIRE_SHA }}-ruby34-v1
+      - name: Prepare the Rails oracle (cache miss)
+        if: steps.oracle.outputs.cache-hit != 'true'
+        run: scripts/campfire-oracle prepare --app /tmp/campfire
       - name: scripts/campfire-db-differential --spinel
-        if: matrix.gc == 'default'
         run: scripts/campfire-db-differential --spinel /tmp/campfire
 
   campfire-conformance:
@@ -2256,8 +2424,8 @@ jobs:
           node-version: '20'
       - name: Pre-warm Playwright (chromium + system deps)
         run: |
-          cd e2e
-          npm install --no-audit --no-fund
+          cd e2e/campfire
+          npm ci --no-audit --no-fund
           "$GITHUB_WORKSPACE/scripts/ci-playwright-install"
       - name: scripts/smoke campfire
         run: scripts/smoke --tgz campfire/spinel.tgz campfire

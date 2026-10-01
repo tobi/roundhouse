@@ -38,6 +38,11 @@ reports as clean: zero errors, and every construct recognized. On such
 an app the command prints nothing and exits 0. On any other app it
 stops, and the two flags decide how.
 
+The fork currently refuses generated enum `*_before_type_cast` readers.
+Rails returns the original input after an unsaved assignment and stored data
+after persistence; the compiler has only the stored enum slot. Negative enum
+scopes are supported. Source-defined readers keep their ordinary behavior.
+
 ## Apps that aren't fully covered yet
 
 By default, ingest is strict — the first construct roundhouse does not

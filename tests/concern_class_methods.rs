@@ -332,3 +332,30 @@ fn only_the_complete_class_methods_bridge_is_consumed() {
         assert_eq!(factory.methods.iter().any(|m| m.name.as_str() == "included"), retained, "{source}");
     }
 }
+
+#[test]
+fn split_bridges_require_the_actual_nested_carrier_and_keep_other_callbacks() {
+    let carrier = "module Factory\n  module ClassMethods\n    def build(**fields)\n      new(**fields).freeze\n    end\n  end\nend\n";
+    let block_only = carrier.replace("module ClassMethods", "class_methods do");
+    let other_owner = carrier.replace("module Factory", "module OtherFactory");
+    let overridden = format!("{carrier}module Factory\n  def self.included(base)\n    puts \"registered\"\n  end\nend\n");
+    for (hook, declaration, retained) in [
+        ("base.extend(ClassMethods)", carrier, false),
+        ("base.extend(ClassMethods)\n    puts \"registered\"", carrier, true),
+        ("base.extend(OtherMethods)", carrier, true),
+        ("base.extend(ClassMethods)", block_only.as_str(), true),
+        ("base.extend(ClassMethods)", other_owner.as_str(), true),
+        ("base.extend(ClassMethods)", overridden.as_str(), true),
+    ] {
+        let bridge = format!("module Factory\n  def self.included(base)\n    {hook}\n  end\nend\n");
+        let app = ingest_app_from_tree(tree(&[
+            ("lib/factory.rb", declaration),
+            ("lib/factory_bridge.rb", &bridge),
+        ])).expect("ingest split carrier and bridge");
+        let has_hook = app.library_classes.iter()
+            .filter(|c| c.name.0.as_str() == "Factory")
+            .flat_map(|c| &c.methods)
+            .any(|m| m.name.as_str() == "included");
+        assert_eq!(has_hook, retained, "{bridge}\n{declaration}");
+    }
+}

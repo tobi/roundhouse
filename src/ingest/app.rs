@@ -23,7 +23,7 @@ use super::expr::ingest_ruby_program;
 use super::fixture::ingest_fixture_file;
 use super::jbuilder::ingest_jbuilder;
 use super::library_class::{
-    ClassKind, classify_class_file, ingest_concern_class_method_spans,
+    ClassKind, ConcernClassMethodSpans, classify_class_file, ingest_concern_class_method_spans,
     ingest_concern_filters, ingest_concern_model_items, ingest_helper_method_names,
     ingest_library_classes, ingest_rails_application_singleton_methods,
 };
@@ -357,6 +357,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // Qualified enum arrays can live in a later file (e.g. a service
     // module). Collect literal inputs before expanding any model DSL.
     let mut enum_constants = super::model::EnumConstants::default();
+    let mut enum_input_files = std::collections::HashSet::new();
     // The same pre-pass answers a second question: which classes are
     // ActiveRecord bases. A model descending through the app's own
     // abstract base was classified a library class and lost its DSL,
@@ -375,6 +376,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 .extend(super::model::ingest_table_name_prefixes(&source, &entry.display().to_string()));
             model_bases.record(&source, &mut base_pairs);
             enum_constants.record(&source, &entry.display().to_string());
+            enum_input_files.insert(entry);
         }
     }
     // An abstract base can live outside `app/models` too — in a
@@ -396,6 +398,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             model_bases.record(&source, &mut base_pairs);
             if sub != "lib" || !ignored_lib_file(&entry) {
                 enum_constants.record(&source, &entry.display().to_string());
+                enum_input_files.insert(entry);
             }
         }
     }
@@ -1536,6 +1539,7 @@ end
     // actually clears the registry and becomes `app.sources` for
     // good — runs after all of them, below.
     app.sources = super::sources::snapshot();
+    enum_constants.validate_consumed_sources(&app, &enum_input_files)?;
     keep_initializer_defined(&mut app, dir, initializer_defined);
     // Carrier provenance must not depend on where a module lives:
     // models, services, helpers and lib all use the same splice.
@@ -1555,6 +1559,9 @@ end
     // turns `Current`'s metaprogrammed surface into real methods first.
     super::current_attributes::lower_current_attributes(&mut app);
     super::thread_mattr::lower_thread_mattr(&mut app);
+    // Alba declarations become ordinary property-reading methods before
+    // inference; validate complete original resource bodies, not just IR.
+    super::alba::lower_alba_resources(&mut app)?;
     // After it, not before: `Current`'s own `delegate` reads an
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
@@ -1824,7 +1831,7 @@ fn rehome_default_fk(
 /// mean rewriting library-class emit for no behavioural gain.
 fn splice_concern_class_methods_into_includers(
     app: &mut App,
-    carriers: &[(crate::ident::ClassId, Vec<crate::span::Span>)],
+    carriers: &[ConcernClassMethodSpans],
 ) {
     use crate::dialect::{MethodReceiver, ModelBodyItem};
     use crate::ident::{ClassId, Symbol};
@@ -1836,8 +1843,14 @@ fn splice_concern_class_methods_into_includers(
     // MODEL once moved — the same lexical trap the controller splice
     // hit with lobsters' `TIME_INTERVALS`.
     let mut carried: HashMap<&ClassId, HashSet<&crate::span::Span>> = HashMap::new();
-    for (id, spans) in carriers {
-        carried.entry(id).or_default().extend(spans);
+    let nested_carriers: HashSet<&ClassId> = carriers.iter()
+        .filter(|c| c.has_nested_carrier).map(|c| &c.owner).collect();
+    let mut bridges: HashMap<&ClassId, HashSet<&crate::span::Span>> = HashMap::new();
+    for carrier in carriers {
+        carried.entry(&carrier.owner).or_default().extend(&carrier.methods);
+        if nested_carriers.contains(&carrier.owner) {
+            bridges.entry(&carrier.owner).or_default().extend(&carrier.bridges);
+        }
     }
     if carried.is_empty() {
         return;
@@ -1864,6 +1877,17 @@ fn splice_concern_class_methods_into_includers(
     }
     if class_side.is_empty() {
         return;
+    }
+
+    // A complete bridge may precede or follow the actual carrier in a
+    // different reopening. Remove only those exact defs, and only after
+    // finding registered carrier methods that this splice will copy.
+    for lc in &mut app.library_classes {
+        if class_side.get(&lc.name).is_some_and(|(methods, _)| !methods.is_empty()) {
+            if let Some(spans) = bridges.get(&lc.name) {
+                lc.methods.retain(|m| !spans.contains(&m.name_span));
+            }
+        }
     }
 
     let copies = |mut queue: Vec<ClassId>, mut taken: HashSet<Symbol>| {

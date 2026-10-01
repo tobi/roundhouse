@@ -69,6 +69,31 @@ raise "keyed pattern accepted a missing key" if HashPatternProbe.key_match({ y: 
         .assert_passes();
 }
 
+/// Alba's inherited declarations are executable property reads, not just a
+/// return-type assertion. Boot loads the generated classes without Alba.
+#[test]
+fn alba_inherited_attributes_and_one_nested_resource_run() {
+    emit_and_run::real_blog()
+        .write("app/lib/alba_resources.rb", include_str!("support/alba.rb"))
+        .write("app/controllers/alba_probes_controller.rb", r#"
+class AlbaProbesController < ApplicationController
+  def index
+    author = AlbaAuthor.new(9, "Ada")
+    article = AlbaArticle.new(7, "Syn", author)
+    render json: ArticleResource.new(article).to_h
+  end
+end
+"#)
+        .run_ruby(r#"
+expected = {"id" => 7, "title" => "Synthetic", "author" => {"id" => 9, "name" => "Ada"}}
+actual = SurveyProbe.call
+raise actual.inspect unless actual == expected
+raise "external Alba loaded" if defined?(Alba::Resource)
+puts "PASS portable Alba source-property contract"
+"#)
+        .assert_passes();
+}
+
 /// A delegated setter going from broken (`def behavior=\n  x.behavior=\n
 /// end` — a `def` with no parameter and a bare `x.y=` call, two syntax
 /// errors) to working is a claim the emitted program actually runs a
@@ -928,6 +953,89 @@ fn method_ref_block_arg_runs() {
         .assert_passes();
 }
 
+/// A clean factory call must construct the receiving T::Struct, not
+/// the concern or whichever includer was seen first. Exercise native
+/// emitted consumers as well as the objects, independently of the
+/// analyzer's inferred return types (invariant 6).
+#[test]
+fn a_shared_struct_factory_runs_for_both_includers_in_both_orders() {
+    let reading = "class Reading < T::Struct\n  include Factory\n  PREFIX = \"local:\"\n  const :label, String\nend\n";
+    let packet = "class Packet < T::Struct\n  include Factory\n  const :size, Integer\nend\n";
+    for declarations in [format!("{reading}{packet}"), format!("{packet}{reading}")] {
+        emit_and_run::real_blog()
+            .write("app/services/factory.rb", r#"module Factory
+  def self.included(base)
+    base.extend(ClassMethods)
+  end
+  module ClassMethods
+    def build(**fields)
+      new(**fields).freeze
+    end
+    def prefix
+      "old:"
+    end
+  end
+  def self.prefix
+    "initial module:"
+  end
+end
+"#)
+            // Reopening a carrier must retain build and take the newer
+            // prefix, whose default still belongs to Factory's scope.
+            .write("app/services/factory_extension.rb", r#"module Factory
+  PREFIX = "reading:"
+  module ClassMethods
+    def fixed
+      Reading.new(label: "fixed").freeze
+    end
+    def prefix(value = PREFIX)
+      value
+    end
+  end
+  def self.prefix
+    "module:"
+  end
+end
+"#)
+            .write("app/services/values.rb", &declarations)
+            .write("app/services/factory_consumer.rb", r#"class FactoryConsumer
+  def self.label
+    Reading.prefix + Reading.build(label: "sensor").label.upcase
+  end
+  def self.size
+    Packet.build(size: 7).size * 3
+  end
+end
+"#)
+            .write("app/controllers/factory_probes_controller.rb", r#"class FactoryProbesController < ApplicationController
+  def index
+    @label = Reading.build(label: "probe").label
+    @size = Packet.build(size: 7).size
+    render plain: FactoryConsumer.label
+  end
+end
+"#)
+            .run_ruby(r#"
+reading = Reading.build(label: "probe")
+packet = Packet.build(size: 7)
+raise "reading identity" unless reading.class == Reading
+raise "reading field" unless reading.label == "probe"
+raise "reading freeze" unless reading.frozen?
+raise "packet identity" unless packet.class == Packet
+raise "packet field" unless packet.size == 7
+raise "packet freeze" unless packet.frozen?
+raise "label consumer" unless FactoryConsumer.label == "reading:SENSOR"
+raise "size consumer" unless FactoryConsumer.size == 21
+raise "module singleton" unless Factory.prefix == "module:"
+fixed = Packet.fixed
+raise "fixed-other identity" unless fixed.class == Reading
+raise "fixed-other field" unless fixed.label == "fixed"
+raise "fixed-other freeze" unless fixed.frozen?
+"#)
+            .assert_passes();
+    }
+}
+
 /// A literal table override must reach the emitted row readers and SQL,
 /// not merely quiet the analyzer. Two differently named models share the
 /// real articles table via string/symbol declarations; writes through either
@@ -1069,89 +1177,6 @@ fn a_collection_render_with_a_reserved_word_as_local_runs() {
     run.assert_passes();
 }
 
-/// A clean factory call must construct the receiving T::Struct, not
-/// the concern or whichever includer was seen first. Exercise native
-/// emitted consumers as well as the objects, independently of the
-/// analyzer's inferred return types (invariant 6).
-#[test]
-fn a_shared_struct_factory_runs_for_both_includers_in_both_orders() {
-    let reading = "class Reading < T::Struct\n  include Factory\n  PREFIX = \"local:\"\n  const :label, String\nend\n";
-    let packet = "class Packet < T::Struct\n  include Factory\n  const :size, Integer\nend\n";
-    for declarations in [format!("{reading}{packet}"), format!("{packet}{reading}")] {
-        emit_and_run::real_blog()
-            .write("app/services/factory.rb", r#"module Factory
-  def self.included(base)
-    base.extend(ClassMethods)
-  end
-  module ClassMethods
-    def build(**fields)
-      new(**fields).freeze
-    end
-    def prefix
-      "old:"
-    end
-  end
-  def self.prefix
-    "initial module:"
-  end
-end
-"#)
-            // Reopening a carrier must retain build and take the newer
-            // prefix, whose default still belongs to Factory's scope.
-            .write("app/services/factory_extension.rb", r#"module Factory
-  PREFIX = "reading:"
-  module ClassMethods
-    def fixed
-      Reading.new(label: "fixed").freeze
-    end
-    def prefix(value = PREFIX)
-      value
-    end
-  end
-  def self.prefix
-    "module:"
-  end
-end
-"#)
-            .write("app/services/values.rb", &declarations)
-            .write("app/services/factory_consumer.rb", r#"class FactoryConsumer
-  def self.label
-    Reading.prefix + Reading.build(label: "sensor").label.upcase
-  end
-  def self.size
-    Packet.build(size: 7).size * 3
-  end
-end
-"#)
-            .write("app/controllers/factory_probes_controller.rb", r#"class FactoryProbesController < ApplicationController
-  def index
-    @label = Reading.build(label: "probe").label
-    @size = Packet.build(size: 7).size
-    render plain: FactoryConsumer.label
-  end
-end
-"#)
-            .run_ruby(r#"
-reading = Reading.build(label: "probe")
-packet = Packet.build(size: 7)
-raise "reading identity" unless reading.class == Reading
-raise "reading field" unless reading.label == "probe"
-raise "reading freeze" unless reading.frozen?
-raise "packet identity" unless packet.class == Packet
-raise "packet field" unless packet.size == 7
-raise "packet freeze" unless packet.frozen?
-raise "label consumer" unless FactoryConsumer.label == "reading:SENSOR"
-raise "size consumer" unless FactoryConsumer.size == 21
-raise "module singleton" unless Factory.prefix == "module:"
-fixed = Packet.fixed
-raise "fixed-other identity" unless fixed.class == Reading
-raise "fixed-other field" unless fixed.label == "fixed"
-raise "fixed-other freeze" unless fixed.frozen?
-"#)
-            .assert_passes();
-    }
-}
-
 #[test]
 fn a_shared_factory_respects_an_overridden_constructor() {
     emit_and_run::real_blog()
@@ -1236,6 +1261,39 @@ end
         .assert_passes();
 }
 
+/// Negative enum scopes query the stored values, with prefix options respected.
+#[test]
+fn an_enum_negative_scope_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"state\", default: 0, null: false\n    t.string \"tone\"",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  enum :state, { draft: 0, published: 1 }\n  enum :tone, { quiet: \"q\", loud: \"l\" }, prefix: true",
+        )
+        .write(
+            "test/models/article_enum_scope_test.rb",
+            r#"require "test_helper"
+
+class ArticleEnumScopeTest < ActiveSupport::TestCase
+  test "negative scopes" do
+    article = Article.create!(title: "Scopes", body: "A body long enough to validate.", state: :published, tone: :loud)
+    assert_equal 1, Article.not_draft.where(id: article.id).count
+    assert_equal 0, Article.not_published.where(id: article.id).count
+    assert_equal 0, Article.not_tone_loud.where(id: article.id).count
+  end
+
+end
+"#,
+        )
+        .run_test("test/models/article_enum_scope_test.rb")
+        .assert_passes();
+}
+
 /// Not a NoMethodError: `read_attribute`/`write_attribute` are a model's `[]`/`[]=`, inside the model and on a record alike.
 #[test]
 fn read_and_write_attribute_reach_the_column() {
@@ -1273,6 +1331,49 @@ end
 "#,
         )
         .run_test("test/models/article_attribute_test.rb")
+        .assert_passes();
+}
+
+/// A schema-less json/jsonb column is decoded at the public attribute
+/// boundary and encoded again on assignment. In particular, the three
+/// Rails spellings (`record.data`, `record[:data]`, and
+/// `read_attribute(:data)`) must not expose SQLite's serialized text.
+#[test]
+fn json_columns_round_trip_decoded_values() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.json \"metadata\"",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n\n  def metadata_names\n    read_attribute(:metadata).map { |entry| entry[\"name\"] }\n  end",
+        )
+        .write(
+            "test/models/article_json_column_test.rb",
+            r#"require "test_helper"
+
+class ArticleJsonColumnTest < ActiveSupport::TestCase
+  test "json values are decoded on every public read and encoded on write" do
+    value = [{ "name" => "Ada", "enabled" => true }]
+    article = Article.create!(title: "JSON", body: "A body long enough to validate.", metadata: value)
+    article = Article.find(article.id)
+
+    assert_equal value, article.metadata
+    assert_equal value, article[:metadata]
+    assert_equal value, article.attributes["metadata"]
+    assert_equal ["Ada"], article.metadata_names
+
+    article.write_attribute(:metadata, { "name" => "Grace", "enabled" => false })
+    article.save!
+    assert_equal({ "name" => "Grace", "enabled" => false }, Article.find(article.id).metadata)
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_json_column_test.rb")
         .assert_passes();
 }
 
@@ -1635,5 +1736,75 @@ article.forward_titles { |value| forwarded << value.upcase }
 raise "forwarded block preservation" unless forwarded == seen
 raise "rest with keywords" unless article.both("x", "y", tag: "z") == "x,y|z"
 raise "empty positional rest" unless article.both(tag: "z") == "|z"
+"#).assert_passes();
+}
+
+/// The exact inclusion bridge and its carrier can be in different
+/// reopenings. Consuming the bridge must follow the carrier's identity,
+/// not whether both declarations happened to share a source file.
+#[test]
+fn a_reopened_factory_carrier_runs_with_its_bridge_in_either_file_order() {
+    for (bridge, carrier) in [
+        ("app/services/factory.rb", "app/services/factory_extension.rb"),
+        ("app/services/factory_bridge.rb", "app/services/factory.rb"),
+    ] {
+        emit_and_run::real_blog()
+            .write(bridge, r#"module Factory
+  def self.included(base)
+    base.extend(ClassMethods)
+  end
+end
+"#)
+            .write(carrier, r#"module Factory
+  module ClassMethods
+    def build(**fields)
+      new(**fields).freeze
+    end
+  end
+end
+"#)
+            .write("app/services/values.rb", r#"class Reading < T::Struct
+  include Factory
+  const :label, String
+end
+class Packet < T::Struct
+  include Factory
+  const :size, Integer
+end
+"#)
+            .write("app/services/split_factory_consumer.rb", r#"class SplitFactoryConsumer
+  def self.label
+    Reading.build(label: "split").label.upcase
+  end
+  def self.size
+    Packet.build(size: 11).size * 3
+  end
+end
+"#)
+            .run_ruby(r#"
+reading = Reading.build(label: "split")
+packet = Packet.build(size: 11)
+raise "split reading identity" unless reading.class == Reading
+raise "split reading field" unless reading.label == "split"
+raise "split reading freeze" unless reading.frozen?
+raise "split packet identity" unless packet.class == Packet
+raise "split packet field" unless packet.size == 11
+raise "split packet freeze" unless packet.frozen?
+raise "split label consumer" unless SplitFactoryConsumer.label == "SPLIT"
+raise "split size consumer" unless SplitFactoryConsumer.size == 33
+"#)
+            .assert_passes();
+    }
+}
+
+#[test]
+fn alba_proven_readonly_association_runs_without_a_redundant_nil_guard() {
+    let source = include_str!("support/alba.rb")
+        .replace("@author || raise(\"author required\")", "@author");
+    emit_and_run::real_blog()
+        .write("app/lib/alba_resources.rb", &source)
+        .run_ruby(r#"
+expected = {"id" => 7, "title" => "Synthetic", "author" => {"id" => 9, "name" => "Ada"}}
+raise "readonly association" unless SurveyProbe.call == expected
 "#).assert_passes();
 }
