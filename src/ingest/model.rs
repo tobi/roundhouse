@@ -1441,7 +1441,7 @@ pub(super) fn ingest_method(
             .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
             .unwrap_or("__blk");
         crate::dialect::Param::positional(Symbol::from(name))
-    });
+    }).or(block_param);
 
     let body = match def.body() {
         Some(b) => ingest_expr(&b, file)?,
