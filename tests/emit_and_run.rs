@@ -3513,6 +3513,7 @@ class ConcernEnumInheritanceTest < ActiveSupport::TestCase
   end
 
   test "a child Concern keeps its own asymmetric enum mapping" do
+    assert_nil SpecialArticle.new.state
     article = SpecialArticle.create!(title: "Override", body: "Long enough body", state: :shipped)
     reloaded = SpecialArticle.find(article.id)
     assert_equal "shipped", reloaded.state
