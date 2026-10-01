@@ -1919,6 +1919,30 @@ raise "GET /widgets answered #{status}" unless status == 204
         .assert_passes();
 }
 
+#[test]
+fn duplicate_route_only_options_use_the_last_value_at_runtime() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "resources :articles do",
+            "resources :articles, only: [], only: [:index, :show, :new, :create, :edit, :update, :destroy] do",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn duplicate_route_except_options_use_the_last_value_at_runtime() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "resources :articles do",
+            "resources :articles, except: [:show], except: [] do",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
 /// Not `user || raise NotFound` (a syntax error) or `a && self.x = v && b` (assigns `v && b`): a command or a method assignment as an `&&`/`||` operand keeps its parentheses.
 #[test]
 fn a_command_operand_of_a_boolean_operator_keeps_its_parentheses() {
