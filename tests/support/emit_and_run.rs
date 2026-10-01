@@ -61,6 +61,14 @@ pub fn real_blog() -> Overlay {
     Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), edits: Vec::new() }
 }
 
+/// Start from an empty tree and `write` the app file by file, for a
+/// shape the blog cannot be edited into, such as an app with no views.
+pub fn empty_app() -> Overlay {
+    let base = scratch_dir();
+    std::fs::create_dir_all(&base).expect("mkdir");
+    Overlay { base, edits: Vec::new() }
+}
+
 pub struct Overlay {
     base: PathBuf,
     edits: Vec<Edit>,
