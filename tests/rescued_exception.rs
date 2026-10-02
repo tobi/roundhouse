@@ -40,23 +40,27 @@ fn service(rescue_line: &str, body: &str) -> String {
 }
 
 #[test]
-fn a_gem_error_keeps_its_own_methods() {
+fn an_undeclared_gem_error_reports_the_constant_without_binding_cascades() {
     let src = service(
         "rescue Stripe::CardError => e",
         "    e.response\n    e.status\n    e.http_body.to_s\n    e.message.upcase",
     );
     let err = check(&[("app/models/application_record.rb", RECORD), ("app/models/charger.rb", &src)]);
-    assert!(err.contains(" 0 error(s)"), "{err}");
+    assert!(err.contains("constant not supported (all targets): Stripe::CardError"), "{err}");
+    assert!(!err.contains("send_dispatch_failed"), "{err}");
+    assert!(err.contains(" 1 error(s)"), "{err}");
 }
 
 #[test]
-fn a_union_with_a_gem_error_answers_the_exception_surface() {
+fn a_union_with_an_undeclared_gem_error_keeps_the_constant_error() {
     let src = service(
         "rescue ArgumentError, Stripe::CardError => e",
         "    e.message.upcase\n    e.cause",
     );
     let err = check(&[("app/models/application_record.rb", RECORD), ("app/models/charger.rb", &src)]);
-    assert!(err.contains(" 0 error(s)"), "{err}");
+    assert!(err.contains("constant not supported (all targets): Stripe::CardError"), "{err}");
+    assert!(!err.contains("send_dispatch_failed"), "{err}");
+    assert!(err.contains(" 1 error(s)"), "{err}");
 }
 
 /// `cause` is the exception being handled when this one was raised, or

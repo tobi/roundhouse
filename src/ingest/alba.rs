@@ -542,6 +542,9 @@ fn synthesize_methods(class: &mut LibraryClass, fields: &[Field], span: Span) ->
         });
     }
     fn mark(expr: &mut Expr, span: Span) {
+        if matches!(&*expr.node, crate::ExprNode::Const { .. }) {
+            expr.decisions |= crate::expr::GENERATED_CONST_REF;
+        }
         expr.span = span;
         expr.node.for_each_child_mut(&mut |child| mark(child, span));
     }

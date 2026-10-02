@@ -11,12 +11,12 @@ use rubydex::indexing::local_graph::LocalGraph;
 use rubydex::indexing::{IndexerBackend, LanguageId, build_local_graph};
 use rubydex::model::built_in::BUILT_IN_URI;
 use rubydex::model::declaration::Declaration;
-use rubydex::model::document::Document as RubydexDocument;
 use rubydex::model::definitions::Definition;
+use rubydex::model::document::Document as RubydexDocument;
 use rubydex::model::graph::Graph;
 use rubydex::model::identity_maps::IdentityHashMap;
-use rubydex::model::name::ParentScope;
 use rubydex::model::ids::{DeclarationId, UriId};
+use rubydex::model::name::ParentScope;
 use rubydex::resolution::Resolver;
 
 use crate::ident::{ClassId, Symbol};
@@ -28,7 +28,7 @@ use crate::span::{FileId, SourceFile, Span};
 const CORE_RBS: &str = "\
 class Numeric < Object\nend\n\
 class Integer < Numeric\nend\n\
-class Float < Numeric\nend\n\
+class Float < Numeric\n  INFINITY: Float\n  NAN: Float\n  EPSILON: Float\n  MAX: Float\n  MIN: Float\nend\n\
 class String < Object\nend\n\
 class Array < Object\nend\n\
 class Hash < Object\nend\n\
@@ -44,8 +44,15 @@ const CORE_URI: &str = "roundhouse-core:rbs";
 const RUNTIME_URI_PREFIX: &str = "roundhouse-runtime:";
 
 pub(super) enum ResolvedConstant {
-    Namespace { class: Arc<ClassId>, runtime: bool },
-    Value(DeclarationId),
+    Namespace {
+        class: Arc<ClassId>,
+        runtime: bool,
+    },
+    Value {
+        id: DeclarationId,
+        name: Arc<ClassId>,
+        builtin_float: bool,
+    },
 }
 
 /// Rubydex answers for one source file.
@@ -62,6 +69,20 @@ pub(crate) struct ConstResolver {
     /// Indexed by `FileId - 1`. `None` marks a source that Rubydex did
     /// not index, such as an ERB template.
     files: Vec<Option<FileAnswers>>,
+    source_fingerprints: Vec<u64>,
+}
+
+fn source_fingerprints(sources: &[SourceFile]) -> Vec<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    sources
+        .iter()
+        .map(|source| {
+            let mut hash = DefaultHasher::new();
+            source.path.hash(&mut hash);
+            source.text.hash(&mut hash);
+            hash.finish()
+        })
+        .collect()
 }
 
 fn is_indexed(source: &SourceFile) -> bool {
@@ -117,7 +138,10 @@ fn constant_graph(local: LocalGraph, text: &str) -> LocalGraph {
     }
     for reference in constant_references.into_values() {
         let singleton_receiver = matches!(
-            graph.names().get(reference.name_id()).map(|name| name.parent_scope()),
+            graph
+                .names()
+                .get(reference.name_id())
+                .map(|name| name.parent_scope()),
             Some(ParentScope::Attached(_))
         );
         if !singleton_receiver {
@@ -162,7 +186,9 @@ fn index_documents(documents: &[Document<'_>]) -> Graph {
                 .spawn_scoped(scope, move || {
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(document) = documents.get(index) else { break };
+                        let Some(document) = documents.get(index) else {
+                            break;
+                        };
                         if sender.send((index, document.index())).is_err() {
                             break;
                         }
@@ -237,7 +263,10 @@ impl ConstResolver {
         crate::timings::phase("rubydex: resolve", || Resolver::new(&mut graph).resolve());
         let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
         drop(graph);
-        Self { files }
+        Self {
+            files,
+            source_fingerprints: source_fingerprints(sources),
+        }
     }
 
     fn file(&self, file: FileId) -> Option<&FileAnswers> {
@@ -247,6 +276,12 @@ impl ConstResolver {
 
     pub(super) fn has_source_file(&self, file: FileId) -> bool {
         self.file(file).is_some()
+    }
+
+    pub(super) fn has_registered_source(&self, file: FileId) -> bool {
+        file.0
+            .checked_sub(1)
+            .is_some_and(|index| (index as usize) < self.files.len())
     }
 
     /// IR spans cover the entire `A::B::C` path. Rubydex records the
@@ -259,7 +294,10 @@ impl ConstResolver {
     ) -> Option<Option<&ResolvedConstant>> {
         let length = u32::try_from(path.last()?.as_str().len()).ok()?;
         let start = span.end.checked_sub(length)?;
-        self.file(span.file)?.references.get(&start).map(Option::as_ref)
+        self.file(span.file)?
+            .references
+            .get(&start)
+            .map(Option::as_ref)
     }
 
     /// The declaration that a constant assignment defines. The IR keeps
@@ -273,7 +311,9 @@ impl ConstResolver {
             return None;
         }
         let constants = &self.file(value.file)?.constants;
-        let index = constants.partition_point(|(end, ..)| *end <= value.start).checked_sub(1)?;
+        let index = constants
+            .partition_point(|(end, ..)| *end <= value.start)
+            .checked_sub(1)?;
         let (_, defined, id) = &constants[index];
         (defined.as_ref() == name).then_some(*id)
     }
@@ -286,11 +326,11 @@ pub struct PreparedConstResolver(Option<Arc<ConstResolver>>);
 
 impl PreparedConstResolver {
     /// The answers that ingest prepared, if they cover these sources.
-    /// No pass edits `App::sources` after ingest, so a matching count
-    /// means the same sources. Other apps get new answers.
+    /// File IDs encode registration order. A changed path, text or order
+    /// invalidates the prepared answers, even when the count is unchanged.
     pub(crate) fn for_sources(&self, sources: &[SourceFile]) -> Arc<ConstResolver> {
         match &self.0 {
-            Some(resolver) if resolver.files.len() == sources.len() => {
+            Some(resolver) if resolver.source_fingerprints == source_fingerprints(sources) => {
                 Arc::clone(resolver)
             }
             _ => Arc::new(ConstResolver::from_app_sources(sources)),
@@ -360,18 +400,25 @@ fn index_sources(sources: &[SourceFile]) -> Graph {
         text: CORE_RBS,
         language: LanguageId::Rbs,
     }];
-    documents.extend(crate::runtime_files::ruby_sources().map(|(path, text)| Document {
-        uri_prefix: RUNTIME_URI_PREFIX,
-        path,
-        text,
-        language: LanguageId::Ruby,
-    }));
-    documents.extend(sources.iter().filter(|source| is_indexed(source)).map(|source| Document {
-        uri_prefix: "",
-        path: &source.path,
-        text: &source.text,
-        language: LanguageId::Ruby,
-    }));
+    documents.extend(
+        crate::runtime_files::ruby_sources().map(|(path, text)| Document {
+            uri_prefix: RUNTIME_URI_PREFIX,
+            path,
+            text,
+            language: LanguageId::Ruby,
+        }),
+    );
+    documents.extend(
+        sources
+            .iter()
+            .filter(|source| is_indexed(source))
+            .map(|source| Document {
+                uri_prefix: "",
+                path: &source.path,
+                text: &source.text,
+                language: LanguageId::Ruby,
+            }),
+    );
     index_documents(&documents)
 }
 
@@ -393,7 +440,9 @@ fn collect_answers(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnsw
         chunks
             .into_iter()
             .flat_map(|chunk| {
-                chunk.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                chunk
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
             .collect()
     })
@@ -431,7 +480,9 @@ fn answer_file(
         // so it starts at the same offset as the `A` reference. Only a
         // reference whose span is exactly its written name belongs to
         // that offset.
-        let written = source.text.get(offset.start() as usize..offset.end() as usize);
+        let written = source
+            .text
+            .get(offset.start() as usize..offset.end() as usize);
         let name = graph
             .names()
             .get(reference.name_id())
@@ -455,7 +506,26 @@ fn answer_file(
                         runtime: *runtime,
                     }
                 } else {
-                    ResolvedConstant::Value(id)
+                    let name = declaration.name();
+                    let builtin_float = matches!(
+                        name,
+                        "Float::INFINITY"
+                            | "Float::NAN"
+                            | "Float::EPSILON"
+                            | "Float::MAX"
+                            | "Float::MIN"
+                    ) && declaration.definitions().iter().all(|id| {
+                        graph
+                            .definitions()
+                            .get(id)
+                            .and_then(|definition| graph.documents().get(definition.uri_id()))
+                            .is_some_and(|document| document.uri() == CORE_URI)
+                    });
+                    ResolvedConstant::Value {
+                        id,
+                        name: Arc::new(ClassId(Symbol::from(name))),
+                        builtin_float,
+                    }
                 }
             });
         match answers.references.entry(offset.start()) {
@@ -476,12 +546,98 @@ fn answer_file(
             Some(Definition::ConstantAlias(it)) => (it.name_id(), it.offset()),
             _ => continue,
         };
-        let name = graph.names().get(name_id).and_then(|name| graph.strings().get(name.str()));
+        let name = graph
+            .names()
+            .get(name_id)
+            .and_then(|name| graph.strings().get(name.str()));
         let id = definition.and_then(|definition| graph.definition_to_declaration_id(definition));
         if let (Some(name), Some(id)) = (name, id) {
-            answers.constants.push((offset.end(), name.as_str().into(), *id));
+            answers
+                .constants
+                .push((offset.end(), name.as_str().into(), *id));
         }
     }
     answers.constants.sort_unstable_by_key(|(end, ..)| *end);
     answers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(path: &str, name: &str) -> SourceFile {
+        SourceFile {
+            path: path.into(),
+            text: format!("class {name}; end; {name}"),
+        }
+    }
+    fn resolved_name(
+        resolver: &ConstResolver,
+        sources: &[SourceFile],
+        index: usize,
+        name: &str,
+    ) -> String {
+        let text = &sources[index].text;
+        let start = text.rfind(name).unwrap() as u32;
+        let span = Span {
+            file: FileId(index as u32 + 1),
+            start,
+            end: start + name.len() as u32,
+        };
+        match resolver.reference(span, &[Symbol::from(name)]) {
+            Some(Some(ResolvedConstant::Namespace { class, .. })) => class.0.to_string(),
+            _ => panic!("source reference must be indexed at its original FileId"),
+        }
+    }
+
+    #[test]
+    fn missing_documents_and_missing_source_answers_are_not_generated_ir() {
+        use super::super::{BodyTyper, ClassInfo, Ctx};
+        use crate::{Expr, ExprNode};
+        let sources = vec![source("app/services/first.rb", "First")];
+        let resolver = Arc::new(ConstResolver::from_app_sources(&sources));
+        let classes = HashMap::from([(ClassId(Symbol::from("Object")), ClassInfo::default())]);
+        let typer = BodyTyper::new(&classes).with_const_resolver(resolver);
+        let make = |file| {
+            Expr::new(
+                Span {
+                    file: FileId(file),
+                    start: 0,
+                    end: 6,
+                },
+                ExprNode::Const {
+                    path: vec![Symbol::from("Object")],
+                },
+            )
+        };
+        for file in [1, 99] {
+            let mut expr = make(file);
+            typer.analyze_expr(&mut expr, &Ctx::default());
+            assert!(
+                expr.diagnostic.is_some(),
+                "source FileId({file}) cannot use a generated fallback"
+            );
+        }
+        let mut generated = make(99);
+        generated.decisions |= crate::expr::GENERATED_CONST_REF;
+        typer.analyze_expr(&mut generated, &Ctx::default());
+        assert!(generated.diagnostic.is_none());
+        assert!(matches!(generated.ty, Some(crate::ty::Ty::Class { .. })));
+    }
+
+    #[test]
+    fn prepared_answers_reject_same_count_source_changes_and_reordering() {
+        let mut sources = vec![
+            source("app/services/first.rb", "First"),
+            source("components/payments/lib/second.rb", "Second"),
+        ];
+        let prepared = ConstResolverTask::start(Arc::new(sources.clone())).finish();
+        sources[0] = source("app/services/first.rb", "Third");
+        let changed = prepared.for_sources(&sources);
+        assert_eq!(resolved_name(&changed, &sources, 0, "Third"), "Third");
+        sources.swap(0, 1);
+        let reordered = prepared.for_sources(&sources);
+        assert_eq!(resolved_name(&reordered, &sources, 0, "Second"), "Second");
+        assert_eq!(resolved_name(&reordered, &sources, 1, "Third"), "Third");
+    }
 }

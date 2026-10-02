@@ -9,9 +9,12 @@
 //! `CurrencyDb.load[code]` were reported as unknown methods on `YamlDb`.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static RUN: AtomicUsize = AtomicUsize::new(0);
 
 fn check(files: &[(&str, &str)]) -> String {
-    let dir = std::env::temp_dir().join(format!("rh_class_side_new_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rh_class_side_new_{}_{}", std::process::id(), RUN.fetch_add(1, Ordering::SeqCst)));
     let _ = std::fs::remove_dir_all(&dir);
     for (path, src) in files {
         let full = dir.join(path);

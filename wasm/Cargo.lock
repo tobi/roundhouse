@@ -796,7 +796,7 @@ dependencies = [
 [[package]]
 name = "rubydex"
 version = "0.4.1"
-source = "git+https://github.com/Shopify/rubydex?branch=main#d8ff47595223571588ae40cb748f43cef6a9dfaf"
+source = "git+https://github.com/Shopify/rubydex?rev=d8ff47595223571588ae40cb748f43cef6a9dfaf#d8ff47595223571588ae40cb748f43cef6a9dfaf"
 dependencies = [
  "bitflags 2.11.1",
  "bytecount",

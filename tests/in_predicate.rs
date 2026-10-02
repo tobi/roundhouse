@@ -65,5 +65,5 @@ fn an_app_defining_its_own_in_predicate_stands_the_pass_down() {
         "app/models/thing.rb",
         "class Thing < ApplicationRecord\n  def in?(other)\n    false\n  end\nend\n",
     )]);
-    assert!(src.contains(".in?(ALLOWED)"), "{src}");
+    assert!(src.contains(".in?(Post::ALLOWED)"), "{src}");
 }

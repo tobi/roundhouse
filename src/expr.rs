@@ -21,6 +21,9 @@ use crate::ty::Ty;
 /// The source reference names a modeled class or module. The Ruby emitter
 /// uses its resolved `Ty::Class` when it changes lexical nesting.
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
+/// A generated constant may borrow a source span for diagnostics/layout;
+/// that position is not a written Ruby constant reference to index.
+pub const GENERATED_CONST_REF: u64 = 1 << 3;
 
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
@@ -154,6 +157,9 @@ impl Expr {
     /// threading a span argument through every small IR constructor.
     pub fn inherit_span(&mut self, enclosing: Span) {
         if self.span.is_synthetic() {
+            if matches!(&*self.node, ExprNode::Const { .. }) {
+                self.decisions |= GENERATED_CONST_REF;
+            }
             self.span = enclosing;
         }
         let here = self.span;
