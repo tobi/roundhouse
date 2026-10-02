@@ -99,6 +99,11 @@ rather than dropping the callback or evaluating its producer per item.
 Existing literal blocks, local block variables and bound-method
 references retain their target-specific support and limitations.
 
+The fork currently refuses generated enum `*_before_type_cast` readers.
+Rails returns the original input after an unsaved assignment and stored data
+after persistence; the compiler has only the stored enum slot. Negative enum
+scopes are supported. Source-defined readers keep their ordinary behavior.
+
 ## Apps that aren't fully covered yet
 
 By default, ingest is strict — the first construct roundhouse does not
