@@ -57,11 +57,22 @@ thread_local! {
 struct Registry {
     files: Vec<SourceFile>,
     by_path: HashMap<String, FileId>,
+    /// Files already drained this ingest. Ids keep counting past them,
+    /// so a pass that synthesizes source after the main drain (the
+    /// `delegate` expansion) hands out ids a second drain can append.
+    drained: u32,
 }
 
 /// Clear the registry for a fresh whole-app ingest.
 pub fn reset() {
     SOURCES.with(|s| *s.borrow_mut() = Registry::default());
+}
+
+/// Guard the positional Rubydex answers in release as well as debug builds.
+/// Length alone does not protect FileIds against replacement or reordering.
+pub(super) fn assert_snapshot_matches(snapshot: &[SourceFile], drained: &[SourceFile]) {
+    assert!(snapshot == drained,
+        "source identities changed after the Rubydex snapshot; snapshot after the complete source walk");
 }
 
 /// Record a source file and return its `FileId` (1-based). Idempotent
@@ -86,7 +97,7 @@ pub fn register(path: &str, text: &str) -> FileId {
             path: path.to_string(),
             text: text.to_string(),
         });
-        let id = FileId(reg.files.len() as u32);
+        let id = FileId(reg.drained + reg.files.len() as u32);
         reg.by_path.insert(path.to_string(), id);
         id
     })
@@ -134,17 +145,19 @@ pub fn path_of(id: FileId) -> Option<String> {
         let reg = s.borrow();
         (id.0 as usize)
             .checked_sub(1)
+            .and_then(|i| i.checked_sub(reg.drained as usize))
             .and_then(|i| reg.files.get(i))
             .map(|f| f.path.clone())
     })
 }
 
-/// Move the registered files out (ids stay valid as indices + 1) and
-/// clear the registry.
+/// Move the registered files out and clear the registry. Ids stay valid
+/// as indices + 1 into the concatenation of every drain since [`reset`].
 pub fn drain() -> Vec<SourceFile> {
     SOURCES.with(|s| {
         let mut reg = s.borrow_mut();
         reg.by_path.clear();
+        reg.drained += reg.files.len() as u32;
         std::mem::take(&mut reg.files)
     })
 }
@@ -198,6 +211,18 @@ mod tests {
     }
 
     #[test]
+    fn ids_keep_counting_past_a_drain() {
+        reset();
+        register("a.rb", "1");
+        let first = drain();
+        let late = register("late.rb", "2");
+        assert_eq!(late, FileId(2));
+        assert_eq!(path_of(late).as_deref(), Some("late.rb"));
+        let all: Vec<_> = first.into_iter().chain(drain()).collect();
+        assert_eq!(all[late.0 as usize - 1].path, "late.rb");
+    }
+
+    #[test]
     fn a_bracketed_label_is_refused_a_real_id() {
         reset();
         assert_eq!(register("<delegate>", "class X\nend\n"), FileId(0));
@@ -234,5 +259,34 @@ mod tests {
         assert_eq!(b, FileId(2));
         let files = drain();
         assert_eq!(files.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod rubydex_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn rubydex_snapshot_rejects_late_real_source_in_release_too() {
+        reset();
+        register("app/services/first.rb", "class First; end");
+        let before = snapshot();
+        register("components/payments/test/test_helper.rb", "class Late; end");
+        let after = drain();
+        assert!(std::panic::catch_unwind(|| assert_snapshot_matches(&before, &after)).is_err());
+        reset();
+    }
+
+    #[test]
+    fn rubydex_snapshot_preserves_ids_through_generated_passes() {
+        reset();
+        let id = register("components/payments/lib/probe.rb", "class Probe; end");
+        let before = snapshot();
+        assert_eq!(register("<delegate>", "class Generated; end"), FileId(0));
+        assert_eq!(register("components/payments/lib/probe.rb", "ignored"), id);
+        let after = drain();
+        assert_snapshot_matches(&before, &after);
+        assert_eq!(after[id.0 as usize - 1].path, before[id.0 as usize - 1].path);
+        reset();
     }
 }

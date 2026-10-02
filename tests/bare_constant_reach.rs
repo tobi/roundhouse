@@ -46,7 +46,7 @@ fn diagnostics(extra: &[(&str, &str)], body: &str) -> Vec<String> {
     Analyzer::new(&app).analyze(&mut app);
     diagnose(&app)
         .iter()
-        .filter(|d| d.code() == "send_dispatch_failed")
+        .filter(|d| matches!(d.code(), "send_dispatch_failed" | "unsupported"))
         .map(|d| d.message.clone())
         .collect()
 }
@@ -62,7 +62,7 @@ fn a_bare_name_is_not_captured_by_a_nested_app_class_of_that_name() {
     // level's, not that class -- and `track` is not its method either.
     let found = diagnostics(&[LISTENER], "    @a = Monorail.track");
     assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0].contains("`Monorail`") || found[0].ends_with(" on Monorail"), "{found:?}");
+    assert!(found[0].contains("constant not supported (all targets): Monorail"), "{found:?}");
     assert!(!found[0].contains("Apps::Listeners"), "{found:?}");
 }
 

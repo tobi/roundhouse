@@ -77,7 +77,7 @@ registries:
   Roundhouse keeps compact answers keyed by source position and
   releases the Rubydex graph before its typing passes. A read that
   resolves to a class keeps the qualified class path in the IR, so the
-  read names the same class after ingest copies a concern method into
+  read names the same class or value after ingest copies a concern method into
   another class.
   `Analyzer::build_constant_registry` infers each constant's value
   type and stores it under the Rubydex declaration ID of its source
@@ -85,11 +85,23 @@ registries:
   constant that ingest moves into a class keeps its top-level ID. The
   rounds continue until no value changes, so a chain such as `B = A`
   resolves at any depth. A cycle stays unresolved.
+  Source snapshots and drains must preserve paths, text and order;
+  release builds enforce this identity and reject late registrations.
+  Prepared answers are reused only for the same ordered source contents.
+  Generated constants borrowing a real span carry an explicit origin bit;
+  missing Ruby documents or missing source-position answers cannot use
+  that fallback. Normal ingest persists `source_index_required`, and
+  clearing its source table triggers `source_index_missing`. Standalone
+  hand-built IR apps with no sources use exact modeled dispatch instead;
+  this API mode does not certify source indexing.
   Views and generated expressions have no Rubydex answer. A bare name
   there uses the typed local scope. A qualified name uses only the
   value declared at that full name.
 - The analyzer reports an error for an unresolved source constant.
-  It does not select another class by a matching name suffix.
+  This includes executable library methods, parameter defaults and
+  constant initializers; an unresolved constant cannot check clean and
+  emit an unsupported raise. It does not select another class by a matching
+  name suffix.
   `parse_module_constants` types literal constants in framework Ruby.
 
 Other inference gaps leave `Ty::Var(n)` or RBS `Ty::Untyped`.
