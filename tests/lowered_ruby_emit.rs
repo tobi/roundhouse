@@ -2242,7 +2242,7 @@ fn integer_durations_rewrite_to_duration_calls() {
         "numeric-literal duration rewrites; got:\n{src}",
     );
     assert!(
-        src.contains("ActiveSupport::Duration.days(WINDOW).ago"),
+        src.contains("ActiveSupport::Duration.days(User::WINDOW).ago"),
         "plural duration rewrites even for an (untyped) constant receiver; got:\n{src}",
     );
     assert!(

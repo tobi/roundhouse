@@ -1197,11 +1197,15 @@ end
         }
     }
 
-    if vfs.is_dir(&models_dir) {
-        let files = read_rb_files(vfs, &models_dir)?;
-        app.generated_helper_methods =
-            super::generated_helpers::ingest_generated_helpers(&app, vfs, dir, &files);
+    let mut model_files = Vec::new();
+    for root in &roots {
+        let models_dir = dir.join(root).join("models");
+        if vfs.is_dir(&models_dir) {
+            model_files.extend(read_rb_files(vfs, &models_dir)?);
+        }
     }
+    app.generated_helper_methods =
+        super::generated_helpers::ingest_generated_helpers(&app, vfs, dir, &model_files);
 
     let routes_path = dir.join("config/routes.rb");
     if vfs.exists(&routes_path) {
@@ -1725,11 +1729,8 @@ end
     // this is the same real-file list that Rubydex indexes, and its
     // answers use these `FileId`s.
     app.sources = super::sources::drain();
-    debug_assert_eq!(
-        app.sources.len(),
-        sources.len(),
-        "a pass registered a source after Rubydex took its snapshot"
-    );
+    super::sources::assert_snapshot_matches(&sources, &app.sources);
+    app.source_index_required = true;
     drop(sources);
     splice_concerns_into_controllers(&mut app);
     // After the splice: an action a concern provides is not implicit.
@@ -1767,18 +1768,17 @@ end
     // splices — and `ActionText::RichText` has to be in `app.models`
     // before anything downstream enumerates models.
     crate::lower::rich_text::synthesize_record_model(&mut app);
-    app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,
     // and reuses the prepared resolver rather than rebuilding it.
     super::concern_accessors::validate(&mut app, &concern_class_method_spans, &framework_shadow_scopes)?;
 
     collect_binary_assets(vfs, dir, &mut app);
-
-    debug_assert!(
-        super::sources::drain().is_empty(),
-        "a pass registered a source after ingest drained the registry"
-    );
+    // Generated re-ingest labels never register real sources. No later
+    // pass may append source-backed FileIds beyond the indexed snapshot.
+    let late_sources = super::sources::drain();
+    super::sources::assert_snapshot_matches(&[], &late_sources);
+    app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     Ok(app)
 }
 

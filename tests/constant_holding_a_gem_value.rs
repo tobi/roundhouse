@@ -1,15 +1,6 @@
-//! A constant that HOLDS a gem value is a value, not a class name.
-//!
-//! `MIN_PRICE = Money.new(1, "USD")` reads as `Class { Money }` (the type
-//! does not tell a class object from an instance), and `Money` is a gem
-//! class the app never registered. Sends on a value of an unregistered
-//! class are an unmodelled gem boundary and answer untyped; sends on a
-//! WRITTEN class name (`Money.zero`) are not, because the app named the
-//! class and the class is missing. The typer told them apart by "is the
-//! receiver a Const", so `MIN_PRICE.currency` and `MIN_PRICE.value` were
-//! reported as unknown methods of `Money`. A class object is written as
-//! the class it is, so the check is now whether the written name is the
-//! class's own.
+//! A source constant holding a value from an undeclared gem remains
+//! unsupported. It must not become a phantom class or turn its readers
+//! into clean support without a declaration and runtime implementation.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,10 +28,12 @@ fn check(files: &[(&str, &str)]) -> String {
 const RECORD: &str = "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n";
 
 #[test]
-fn a_constant_holding_a_gem_value_is_a_gem_boundary() {
+fn a_value_from_an_undeclared_gem_constant_is_unsupported() {
     let model = "class Widget < ApplicationRecord\n  MIN_PRICE = Money.new(1, \"USD\")\n\n  def price\n    MIN_PRICE.currency\n    MIN_PRICE.value.positive?\n    Widget::MIN_PRICE.value\n  end\nend\n";
     let err = check(&[("app/models/application_record.rb", RECORD), ("app/models/widget.rb", model)]);
-    assert!(err.contains(" 0 error(s)"), "{err}");
+    assert!(err.contains("error[unsupported]"), "{err}");
+    assert!(err.contains("Widget::MIN_PRICE"), "{err}");
+    assert!(!err.contains("send_dispatch_failed"), "{err}");
 }
 
 /// A written class name is still the class object: the gem class is
@@ -50,4 +43,5 @@ fn a_written_class_name_is_still_a_class_object() {
     let model = "class Widget < ApplicationRecord\n  def price\n    Money.no_such_class_method\n  end\nend\n";
     let err = check(&[("app/models/application_record.rb", RECORD), ("app/models/widget.rb", model)]);
     assert!(!err.contains("panicked"), "{err}");
+    assert!(err.contains("constant not supported (all targets): Money"), "{err}");
 }

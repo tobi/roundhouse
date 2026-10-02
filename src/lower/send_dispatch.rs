@@ -793,19 +793,25 @@ impl HashProviders {
     }
 }
 
+// Match complete source-resolved names, never a last-segment alias.
+fn constant_key(path: &[Symbol]) -> String {
+    path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::")
+        .trim_start_matches("::").to_string()
+}
+
 fn collect_hash_providers(app: &App) -> HashProviders {
     let mut by_class_method = HashMap::new();
-    let mut register = |class: &str, consts: &HashMap<&str, &Expr>, name: &Symbol, body: &Expr| {
+    let mut register = |class: &str, consts: &HashMap<String, &Expr>, name: &Symbol, body: &Expr| {
         if let Some(keysets) = hash_return_key_sets(body, consts) {
             by_class_method.insert((Symbol::from(class), name.clone()), keysets);
         }
     };
     for lc in &app.library_classes {
         // Constants visible to this class's method bodies.
-        let consts: HashMap<&str, &Expr> = lc
+        let consts: HashMap<String, &Expr> = lc
             .constants
             .iter()
-            .map(|(n, e)| (n.as_str(), e))
+            .flat_map(|(n, e)| [(n.as_str().to_string(), e), (format!("{}::{n}", lc.name.0), e)])
             .collect();
         for m in &lc.methods {
             register(lc.name.0.as_str(), &consts, &m.name, &m.body);
@@ -813,8 +819,8 @@ fn collect_hash_providers(app: &App) -> HashProviders {
     }
     for model in &app.models {
         let constants = super::model_to_library::collect_model_constants(model);
-        let consts: HashMap<&str, &Expr> =
-            constants.iter().map(|(n, e)| (n.as_str(), e)).collect();
+        let consts: HashMap<String, &Expr> =
+            constants.iter().flat_map(|(n, e)| [(n.as_str().to_string(), e), (format!("{}::{n}", model.name.0), e)]).collect();
         for item in &model.body {
             if let ModelBodyItem::Method { method, .. } = item {
                 register(model.name.0.as_str(), &consts, &method.name, &method.body);
@@ -956,7 +962,7 @@ fn walk_provider_origins(
 /// value is provably a string set in *every* returned literal survive.
 fn hash_return_key_sets(
     body: &Expr,
-    consts: &HashMap<&str, &Expr>,
+    consts: &HashMap<String, &Expr>,
 ) -> Option<HashMap<Symbol, BTreeSet<String>>> {
     let mut literals: Vec<&Expr> = Vec::new();
     collect_return_positions(body, &mut literals)?;
@@ -972,8 +978,8 @@ fn hash_return_key_sets(
         // A tail naming a hash CONSTANT answers that constant's literal —
         // lobsters' `time_interval` returns `PLACEHOLDER` on bad input.
         let lit: &Expr = match &*lit.node {
-            ExprNode::Const { path } if path.len() == 1 => {
-                unwrap_freeze(consts.get(path[0].as_str())?)
+            ExprNode::Const { path } => {
+                unwrap_freeze(consts.get(&constant_key(path))?)
             }
             _ => lit,
         };
@@ -1066,7 +1072,7 @@ fn collect_early_returns<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) -> bool {
 /// no write at all (a parameter).
 fn string_values_in(
     e: &Expr,
-    consts: &HashMap<&str, &Expr>,
+    consts: &HashMap<String, &Expr>,
     body: &Expr,
     depth: usize,
 ) -> Option<BTreeSet<String>> {
@@ -1109,7 +1115,7 @@ fn string_values_in(
 fn slot_values(
     v: &Expr,
     i: usize,
-    consts: &HashMap<&str, &Expr>,
+    consts: &HashMap<String, &Expr>,
     body: &Expr,
     depth: usize,
 ) -> Option<BTreeSet<String>> {
@@ -1151,17 +1157,14 @@ fn visit_local_writes<'e>(e: &'e Expr, name: &Symbol, f: &mut dyn FnMut(LocalWri
     e.node.for_each_child(&mut |c| visit_local_writes(c, name, f));
 }
 
-fn string_values_const(e: &Expr, consts: &HashMap<&str, &Expr>) -> Option<BTreeSet<String>> {
+fn string_values_const(e: &Expr, consts: &HashMap<String, &Expr>) -> Option<BTreeSet<String>> {
     match &*e.node {
         ExprNode::Lit { value: Literal::Str { value } } => {
             Some(std::iter::once(value.clone()).collect())
         }
         ExprNode::Send { recv: Some(r), method, .. } if method.as_str() == "[]" => {
             let ExprNode::Const { path } = &*r.node else { return None };
-            if path.len() != 1 {
-                return None;
-            }
-            let cval = consts.get(path[0].as_str())?;
+            let cval = consts.get(&constant_key(path))?;
             let hash = unwrap_freeze(cval);
             let ExprNode::Hash { entries, .. } = &*hash.node else { return None };
             let mut out = BTreeSet::new();

@@ -248,3 +248,20 @@ fn an_absolute_nested_constant_keeps_its_root_and_resolves_its_owner() {
         .expect("ingest");
     assert_eq!(roundhouse::emit::ruby::emit_expr(&expr), "::Core::StageEnum::Drafting");
 }
+
+#[test]
+fn ingested_source_apps_refuse_ir_only_mode_after_source_table_loss() {
+    let app = app_with("    @value = Core::StageEnum::Drafting");
+    assert!(app.source_index_required);
+    assert!(!app.sources.is_empty());
+    // The contract survives IR serialization; the prepared cache need not.
+    let serialized = serde_json::to_string(&app).unwrap();
+    let mut restored: roundhouse::App = serde_json::from_str(&serialized).unwrap();
+    restored.sources.clear();
+    let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        roundhouse::analyze::Analyzer::new(&restored);
+    })).expect_err("a source app must not become an IR-only API app");
+    let message = refusal.downcast_ref::<String>().map(String::as_str)
+        .or_else(|| refusal.downcast_ref::<&str>().copied()).unwrap();
+    assert!(message.contains("source_index_missing"), "{message}");
+}

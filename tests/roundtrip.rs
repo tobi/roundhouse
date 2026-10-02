@@ -166,6 +166,7 @@ fn tiny_blog_round_trips() {
         sources: vec![],
         // Derived from `sources` and `serde(skip)`, like `binary_assets`.
         const_resolver: Default::default(),
+        source_index_required: false,
         root: String::new(),
         app_roots: vec!["app".to_string()],
     };

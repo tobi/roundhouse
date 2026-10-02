@@ -246,6 +246,10 @@ roundhouse does not model it)* means the receiver comes from a gem the
 census lists as unknown. Skip these on a first read. They exist so the
 error count above means "findings", not "shadows of gaps".
 
+Unresolved source constants keep their error severity even when the
+gem census identifies a likely owner: their emitted expression is a
+refusal stub. Gem context is added without certifying runtime support.
+
 **The survey report** — printed only with `--continue`: every construct
 ingest skipped, bucketed by kind, most frequent first, with the files
 it occurred in. This is roundhouse's own to-do list for your app.
