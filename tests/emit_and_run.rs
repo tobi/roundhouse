@@ -2133,3 +2133,36 @@ end
         .run_ruby("raise 'qualified lowered constants' unless CollectionConstants.values == ['bb', true]")
         .assert_passes();
 }
+
+#[test]
+fn typed_instance_keywords_bind_values_and_keep_positional_hashes() {
+    emit_and_run::real_blog()
+        .write("app/services/keyword_fetcher.rb", r##"
+class KeywordFetcher
+  def fetch(url, ip: url.upcase)
+    "#{url}@#{ip}"
+  end
+
+  def merge(url, opts = {})
+    "#{url}#{opts}"
+  end
+end
+"##)
+        .write("app/services/keyword_locator.rb", r#"
+class KeywordLocator
+  def locate(url)
+    KeywordFetcher.new.fetch(url, ip: "192.0.2.1")
+  end
+
+  def merged(url)
+    KeywordFetcher.new.merge(url, opts: 1)
+  end
+end
+"#)
+        .run_ruby(r#"
+locator = KeywordLocator.new
+raise "keyword bound to hash" unless locator.locate("host") == "host@192.0.2.1"
+raise "positional hash rewritten" unless locator.merged("host") == 'host{opts: 1}'
+"#)
+        .assert_passes();
+}
