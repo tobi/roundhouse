@@ -38,10 +38,9 @@
 //! took for `to: redirect(…)`: a hole nobody can see is how a gap
 //! stays open.
 //!
-//! Direct receiverless `include` calls are also reported: Writebook's
-//! `:active_record` hook installs `ActionText::HasMarkdown` this way,
-//! without reopening a class. Reporting does not install the mixin or
-//! execute the hook. This is not an exhaustive ledger of hook bodies;
+//! Direct receiverless `include` calls with literal module names are carried
+//! for known framework hooks. Other include shapes are reported without
+//! executing the hook. This is not an exhaustive ledger of hook bodies;
 //! nested/conditional calls and other executable statements remain gaps.
 
 use ruby_prism::Node;
@@ -95,19 +94,8 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
                 if include.receiver().is_some() || constant_id_str(&include.name()) != "include" {
                     continue;
                 }
-                let loc = include.location();
-                let declaration = String::from_utf8_lossy(loc.as_slice());
-                survey::record(&IngestError::Unsupported {
-                    file: file.into(),
-                    message: format!(
-                        "`ActiveSupport.on_load(:{hook})` contains `{declaration}`, which is not carried: \
-                         load-hook mixin installation is unsupported"
-                    ),
-                });
-                // Class-method macros may still expand at ingest
-                // (`App.load_hook_class_macros`). Mixin instance
-                // methods stay uninstalled — that is the gap this
-                // survey line names.
+                // Class-method macros are indexed independently of mixin carrying
+                // (`App.load_hook_class_macros`), including carried literal hooks.
                 if hook == "active_record" {
                     for arg in include.arguments().iter().flat_map(|a| a.arguments().iter()) {
                         if let Some(path) = constant_path_of(&arg) {
@@ -118,6 +106,24 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
                         }
                     }
                 }
+                let carried = hook_class(&hook).is_some()
+                    && include.arguments().is_some_and(|args| {
+                        args.arguments().iter().next().is_some()
+                            && args.arguments().iter().all(|arg| constant_path_of(&arg).is_some())
+                    });
+                if carried {
+                    continue;
+                }
+                let loc = include.location();
+                let declaration = String::from_utf8_lossy(loc.as_slice());
+                survey::record(&IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!(
+                        "`ActiveSupport.on_load(:{hook})` contains `{declaration}`, which is not carried: \
+                         load-hook mixin installation is unsupported"
+                    ),
+                });
+
             }
         }
 
@@ -181,10 +187,8 @@ fn carry_hook_includes(body: Node<'_>, hook: &str, file: &str, app: &mut App) {
     if mixins.is_empty() {
         return;
     }
-    let Some(class) = hook_class(hook) else {
-        not_carried(file, hook, &format!("(include {})", mixins.join(", ")));
-        return;
-    };
+    // Unsupported direct includes were reported at their original byte spans.
+    let Some(class) = hook_class(hook) else { return };
     let source = format!("class {class}\n  include {}\nend\n", mixins.join(", "));
     match super::library_class::ingest_library_classes(source.as_bytes(), file) {
         Ok(classes) => app.library_classes.extend(classes),
