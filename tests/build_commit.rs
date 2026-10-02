@@ -26,6 +26,8 @@ fn run(dir: &Path, program: &str, args: &[&str], commit: Option<&str>) -> String
         "GIT_COMMON_DIR",
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "ROUNDHOUSE_COMMIT",
     ] {
         cmd.env_remove(key);

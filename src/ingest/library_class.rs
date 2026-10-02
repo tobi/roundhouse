@@ -484,6 +484,8 @@ fn synth_sorbet_enum_methods(owner: &ClassId, members: &[SorbetEnumMember]) -> V
         name: Symbol::from(name),
         receiver,
         params,
+        unsupported_formals: None,
+        has_anonymous_block: false,
         body,
         signature: None,
         effects: EffectSet::default(),
@@ -818,6 +820,8 @@ fn synth_sorbet_struct_methods(
         name: Symbol::from("initialize"),
         receiver: MethodReceiver::Instance,
         params,
+        unsupported_formals: None,
+        has_anonymous_block: false,
         body: Expr::new(Span::synthetic(), ExprNode::Seq { exprs: assigns }),
         signature: None,
         effects: EffectSet::default(),
@@ -895,6 +899,8 @@ fn synth_struct_equality(owner: &ClassId, members: &[SorbetStructMember]) -> Met
         name: Symbol::from("=="),
         receiver: MethodReceiver::Instance,
         params: vec![Param::positional(Symbol::from("other"))],
+        unsupported_formals: None,
+        has_anonymous_block: false,
         body: condition,
         signature: None,
         effects: EffectSet::default(),
@@ -993,6 +999,8 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         name: Symbol::from("initialize"),
         receiver: MethodReceiver::Instance,
         params,
+        unsupported_formals: None,
+        has_anonymous_block: false,
         body: Expr::new(Span::synthetic(), ExprNode::Seq { exprs: assigns }),
         signature: None,
         effects: EffectSet::default(),
@@ -1709,6 +1717,8 @@ pub(crate) fn synth_attr_reader(owner: &ClassId, name: &Symbol, receiver: Method
         name: name.clone(),
         receiver,
         params: Vec::new(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
         body,
         signature: None,
         effects: EffectSet::default(),
@@ -1767,6 +1777,8 @@ pub(crate) fn synth_attr_writer(owner: &ClassId, name: &Symbol, receiver: Method
         name: setter_name,
         receiver,
         params: vec![Param::positional(value_param)],
+        unsupported_formals: None,
+        has_anonymous_block: false,
         body,
         signature: None,
         effects: EffectSet::default(),
@@ -1785,6 +1797,7 @@ pub(super) fn ingest_library_method(
 ) -> IngestResult<crate::dialect::MethodDef> {
     use crate::dialect::{MethodDef, MethodReceiver};
 
+    let formals = super::forwarding::parse(def);
     let name = Symbol::from(constant_id_str(&def.name()));
     let receiver = if def.receiver().is_some() {
         MethodReceiver::Class
@@ -1852,6 +1865,10 @@ pub(super) fn ingest_library_method(
         // repairs the call, and the marks are the only record that
         // these slots were not positional in the source.
         let keeps_keywords = params.iter().any(|p| p.rest)
+            // Nameless `**` must keep the adjacent keyword group too:
+            // a flattened optional would otherwise bind its default
+            // while the keyword disappears into this rest slot.
+            || formals.anonymous == Some(super::forwarding::AnonymousFormal::KeywordRest)
             || pn
                 .keywords()
                 .iter()
@@ -1907,11 +1924,6 @@ pub(super) fn ingest_library_method(
                 }
             }
         }
-        // `def f(...)`: the forwarded positionals, keywords riding in them
-        // as a trailing Hash (see the `*args, **opts` note below).
-        if super::util::has_forwarding_parameter(&pn) {
-            params.push(Param::rest(Symbol::from(super::util::FORWARDED_REST)));
-        }
         if let Some(krest) = pn.keyword_rest() {
             if let Some(krp) = krest.as_keyword_rest_parameter_node() {
                 if let Some(loc) = krp.name() {
@@ -1923,25 +1935,14 @@ pub(super) fn ingest_library_method(
                         // campfire's `avatar_tag(user, **options)` is
                         // called with one argument from the message row,
                         // the user list and the sidebar.
-                        let beside_positional_rest = params.iter().any(|p| p.rest && !p.keyword);
-                        if keeps_keywords && !beside_positional_rest {
+                        if keeps_keywords {
                             // The keyword group is kept in this def, so
                             // `**rest` stays a keyword-rest: flattened to
                             // `rest = {}` after a `name:` it does not parse
-                            // (`def call(server_context:, arguments = {})`).
+                            // and dropping it beside `*args` changes the
+                            // rest array even when the keyword-rest is unread.
                             let mut p = Param::keyword(Symbol::from(s), None);
                             p.rest = true;
-                            params.push(p);
-                        } else if beside_positional_rest {
-                            // Beside a positional `*rest` the caller's
-                            // keywords already land in the rest, so the
-                            // slot is marked and dropped below unless the
-                            // body reads it (tests/initializer_defined_constants).
-                            // When it is read, `(*args, opts = {})` does
-                            // not parse, so it stays a real `**kwrest`.
-                            let mut p = Param::keyword(Symbol::from(s), None);
-                            p.rest = true;
-                            p.from_kwrest = true;
                             params.push(p);
                         } else {
                             let mut p = Param::with_default(
@@ -1974,12 +1975,6 @@ pub(super) fn ingest_library_method(
                 // name so body-side bare-`&` forwarding (`__blk`) binds.
                 .unwrap_or("__blk");
             Param::positional(Symbol::from(name))
-        })
-        // `def f(...)` forwards its block under the same binding.
-        .or_else(|| {
-            def.parameters().filter(super::util::has_forwarding_parameter).map(|_| {
-                Param::positional(Symbol::from(super::util::FORWARDED_BLOCK))
-            })
         });
 
     let body = match def.body() {
@@ -1987,23 +1982,15 @@ pub(super) fn ingest_library_method(
         None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
     };
 
-    // `def f(*args, **opts)` — the `**opts` flattening above (a trailing
-    // `opts = {}`) cannot follow a rest param: `(*args, opts = {})` does
-    // not parse. With a rest param present a caller's keywords already
-    // land in it as a trailing Hash, so when the body never reads the
-    // kwrest the slot carries nothing and is dropped. Lobsters'
-    // `Telebugs` no-ops (`def self.user *args, **kwargs; end`) are the
-    // shape. A body that does read it keeps the slot, as a real
-    // `**kwrest` (see above).
-    if params.iter().any(|p| p.rest) {
-        params.retain(|p| !p.from_kwrest || expr_reads_local(&body, &p.name));
-    }
+    params.extend(formals.anonymous.map(super::forwarding::AnonymousFormal::into_param));
 
     Ok(MethodDef {
         name_span: super::util::def_name_span(def, file),
         name,
         receiver,
         params,
+        unsupported_formals: formals.unsupported,
+        has_anonymous_block: formals.has_anonymous_block,
         body,
         signature: None,
         effects: crate::effect::EffectSet::default(),
@@ -2782,29 +2769,6 @@ pub(super) fn expand_props_bases(app: &mut crate::App) {
         synthesized.append(&mut lc.methods);
         lc.methods = synthesized;
     }
-}
-
-/// Does `expr` read the local `name` anywhere (a bare identifier ingests
-/// as a `Var`, or as a receiverless zero-arg `Send` when ingest could not
-/// tell it was a local)?
-fn expr_reads_local(expr: &Expr, name: &Symbol) -> bool {
-    let hit = match &*expr.node {
-        ExprNode::Var { name: n, .. } => n == name,
-        ExprNode::Send { recv: None, method, args, block: None, .. } => {
-            method == name && args.is_empty()
-        }
-        _ => false,
-    };
-    if hit {
-        return true;
-    }
-    let mut found = false;
-    expr.node.for_each_child(&mut |c| {
-        if !found && expr_reads_local(c, name) {
-            found = true;
-        }
-    });
-    found
 }
 
 /// Ruby reserved words: a parameter with one of these names is only

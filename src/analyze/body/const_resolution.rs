@@ -5,6 +5,7 @@
 //! by Rubydex declaration IDs.
 
 use std::collections::{HashMap, hash_map::Entry};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use rubydex::indexing::local_graph::LocalGraph;
@@ -21,6 +22,7 @@ use rubydex::resolution::Resolver;
 
 use crate::ident::{ClassId, Symbol};
 use crate::span::{FileId, SourceFile, Span};
+use crate::ty::Ty;
 
 // Rubydex's minimal built-ins stop at Object/Module/Class. These are
 // Ruby core classes already modeled by Roundhouse's primitive dispatch,
@@ -44,15 +46,8 @@ const CORE_URI: &str = "roundhouse-core:rbs";
 const RUNTIME_URI_PREFIX: &str = "roundhouse-runtime:";
 
 pub(super) enum ResolvedConstant {
-    Namespace {
-        class: Arc<ClassId>,
-        runtime: bool,
-    },
-    Value {
-        id: DeclarationId,
-        name: Arc<ClassId>,
-        builtin_float: bool,
-    },
+    Namespace { class: Arc<ClassId>, runtime: bool },
+    Value { declaration: DeclarationId, name: Arc<ClassId>, runtime: Option<Arc<Ty>> },
 }
 
 /// Rubydex answers for one source file.
@@ -69,24 +64,23 @@ pub(crate) struct ConstResolver {
     /// Indexed by `FileId - 1`. `None` marks a source that Rubydex did
     /// not index, such as an ERB template.
     files: Vec<Option<FileAnswers>>,
-    source_fingerprints: Vec<u64>,
-}
-
-fn source_fingerprints(sources: &[SourceFile]) -> Vec<u64> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    sources
-        .iter()
-        .map(|source| {
-            let mut hash = DefaultHasher::new();
-            source.path.hash(&mut hash);
-            source.text.hash(&mut hash);
-            hash.finish()
-        })
-        .collect()
+    /// Includes paths, full text and order because answers use file IDs
+    /// and byte offsets. Retain no second copy of the source snapshot.
+    source_fingerprint: u64,
 }
 
 fn is_indexed(source: &SourceFile) -> bool {
     source.path.ends_with(".rb")
+}
+
+fn source_fingerprint(sources: &[SourceFile]) -> u64 {
+    let mut hash = DefaultHasher::new();
+    sources.len().hash(&mut hash);
+    for source in sources {
+        source.path.hash(&mut hash);
+        source.text.hash(&mut hash);
+    }
+    hash.finish()
 }
 
 /// One Rubydex input document. The indexing thread builds its URI.
@@ -254,6 +248,35 @@ fn is_assigned_value(graph: &Graph, declaration: &Declaration) -> bool {
     assigned
 }
 
+/// Literal runtime values come from the same embedded implementations
+/// the name graph indexes. Keep their full owners, not suffix aliases,
+/// and share types between references instead of copying their trees.
+fn runtime_value_types() -> &'static HashMap<String, Arc<Ty>> {
+    static VALUES: std::sync::OnceLock<HashMap<String, Arc<Ty>>> = std::sync::OnceLock::new();
+    VALUES.get_or_init(|| {
+        let mut values: HashMap<String, Arc<Ty>> = HashMap::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        for (_, text) in crate::runtime_files::ruby_sources() {
+            let (_, owners) = crate::runtime_src::parse_module_constant_tables(text, true);
+            for (owner, constants) in owners {
+                for (name, ty) in constants {
+                    let name = format!("{}::{}", owner.0.as_str(), name.as_str());
+                    if ambiguous.contains(&name) {
+                        continue;
+                    }
+                    if values.get(&name).is_some_and(|previous| **previous != ty) {
+                        values.remove(&name);
+                        ambiguous.insert(name);
+                    } else {
+                        values.insert(name, Arc::new(ty));
+                    }
+                }
+            }
+        }
+        values
+    })
+}
+
 impl ConstResolver {
     /// Index real Ruby app sources with their original 1-based file IDs.
     pub(crate) fn from_app_sources(sources: &[SourceFile]) -> Self {
@@ -263,10 +286,7 @@ impl ConstResolver {
         crate::timings::phase("rubydex: resolve", || Resolver::new(&mut graph).resolve());
         let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
         drop(graph);
-        Self {
-            files,
-            source_fingerprints: source_fingerprints(sources),
-        }
+        Self { files, source_fingerprint: source_fingerprint(sources) }
     }
 
     fn file(&self, file: FileId) -> Option<&FileAnswers> {
@@ -326,11 +346,11 @@ pub struct PreparedConstResolver(Option<Arc<ConstResolver>>);
 
 impl PreparedConstResolver {
     /// The answers that ingest prepared, if they cover these sources.
-    /// File IDs encode registration order. A changed path, text or order
-    /// invalidates the prepared answers, even when the count is unchanged.
+    /// Cloning an app retains the cache, but callers can edit its public
+    /// sources. Rebuild when paths, text or file order have changed.
     pub(crate) fn for_sources(&self, sources: &[SourceFile]) -> Arc<ConstResolver> {
         match &self.0 {
-            Some(resolver) if resolver.source_fingerprints == source_fingerprints(sources) => {
+            Some(resolver) if resolver.source_fingerprint == source_fingerprint(sources) => {
                 Arc::clone(resolver)
             }
             _ => Arc::new(ConstResolver::from_app_sources(sources)),
@@ -506,26 +526,21 @@ fn answer_file(
                         runtime: *runtime,
                     }
                 } else {
-                    let name = declaration.name();
-                    let builtin_float = matches!(
-                        name,
-                        "Float::INFINITY"
-                            | "Float::NAN"
-                            | "Float::EPSILON"
-                            | "Float::MAX"
-                            | "Float::MIN"
-                    ) && declaration.definitions().iter().all(|id| {
-                        graph
-                            .definitions()
-                            .get(id)
-                            .and_then(|definition| graph.documents().get(definition.uri_id()))
-                            .is_some_and(|document| document.uri() == CORE_URI)
+                    // An app write to the same declaration must never
+                    // borrow the runtime's previous literal type.
+                    let app_write = declaration.definitions().iter().any(|id| {
+                        graph.definitions().get(id).is_some_and(|definition| {
+                            matches!(definition, Definition::Constant(_) | Definition::ConstantAlias(_))
+                                && graph.documents().get(definition.uri_id()).is_some_and(|document| {
+                                    document.uri() != CORE_URI && document.uri() != BUILT_IN_URI && !document.uri().starts_with(RUNTIME_URI_PREFIX)
+                                })
+                        })
                     });
-                    ResolvedConstant::Value {
-                        id,
-                        name: Arc::new(ClassId(Symbol::from(name))),
-                        builtin_float,
-                    }
+                    let builtin_float = matches!(declaration.name(), "Float::INFINITY" | "Float::NAN" | "Float::EPSILON" | "Float::MAX" | "Float::MIN") && declaration.definitions().iter().all(|id| graph.definitions().get(id).and_then(|definition| graph.documents().get(definition.uri_id())).is_some_and(|document| document.uri() == CORE_URI));
+                    let runtime = (!app_write && is_runtime_declaration(graph, declaration))
+                        .then(|| if builtin_float { Some(Arc::new(Ty::Float)) } else { runtime_value_types().get(declaration.name()).cloned() })
+                        .flatten();
+                    ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(declaration.name()))), runtime }
                 }
             });
         match answers.references.entry(offset.start()) {
@@ -639,5 +654,48 @@ mod tests {
         let reordered = prepared.for_sources(&sources);
         assert_eq!(resolved_name(&reordered, &sources, 0, "Second"), "Second");
         assert_eq!(resolved_name(&reordered, &sources, 1, "Third"), "Third");
+    }
+
+    #[test]
+    fn prepared_answers_require_the_same_paths_text_and_file_order() {
+        let mut sources = vec![
+            SourceFile {
+                path: "first.rb".into(),
+                text: "module Alpha\n  class Widget; end\n  def self.value; Widget; end\nend\n".into(),
+            },
+            SourceFile {
+                path: "other.rb".into(),
+                text: "module Other\n  class Widget; end\n  def self.value; Widget; end\nend\n".into(),
+            },
+        ];
+        let snapshot = sources.clone();
+        let prepared = ConstResolverTask::start(Arc::new(snapshot.clone())).finish();
+        let original = prepared.for_sources(&sources);
+        assert!(Arc::ptr_eq(&original, &prepared.clone().for_sources(&sources)));
+        let resolved = |resolver: &ConstResolver, source: &SourceFile| {
+            let start = source.text.rfind("Widget").unwrap() as u32;
+            let span = Span { file: FileId(1), start, end: start + 6 };
+            match resolver.reference(span, &[Symbol::new("Widget")]) {
+                Some(Some(ResolvedConstant::Namespace { class, .. })) => class.0.as_str().to_owned(),
+                _ => panic!("expected a resolved Widget"),
+            }
+        };
+        assert_eq!(resolved(&original, &sources[0]), "Alpha::Widget");
+
+        // Same source count, byte length and reference offset, different binding.
+        sources[0].text = sources[0].text.replace("Alpha", "Bravo");
+        let changed = prepared.clone().for_sources(&sources);
+        assert_eq!(resolved(&changed, &sources[0]), "Bravo::Widget");
+        assert!(!Arc::ptr_eq(&original, &changed));
+
+        // FileId(1) must follow input order, not the cached first file.
+        sources = snapshot.clone();
+        sources.swap(0, 1);
+        assert_eq!(resolved(&prepared.for_sources(&sources), &sources[0]), "Other::Widget");
+
+        // A path-only change can make the same text non-indexed.
+        sources = snapshot;
+        sources[0].path = "first.md".into();
+        assert!(!prepared.for_sources(&sources).has_source_file(FileId(1)));
     }
 }

@@ -32,10 +32,18 @@ pub struct Signatures {
 
 /// Parse RBS source and extract method signatures.
 pub fn parse_signatures(source: &str) -> Result<Signatures, String> {
+    parse_signatures_with_aliases(source, &AliasTable::new())
+}
+
+/// Inline comments inherit already-resolved aliases from their lexical scope.
+pub(crate) fn parse_signatures_with_aliases(
+    source: &str,
+    outer: &AliasTable,
+) -> Result<Signatures, String> {
     let signature = parse(source)?;
     let mut out = Signatures::default();
     let decls: Vec<Node<'_>> = signature.declarations().iter().collect();
-    let top_aliases = resolve_aliases(&decls, None, &AliasTable::new());
+    let top_aliases = resolve_aliases(&decls, None, outer);
 
     for decl in decls {
         match decl {
@@ -643,6 +651,7 @@ fn is_builtin_class_name(name: &str) -> bool {
             | "Float"
             | "String"
             | "Symbol"
+            | "Date"
             | "TrueClass"
             | "FalseClass"
             | "NilClass"
@@ -778,10 +787,8 @@ fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
         // declared stays an unread signature, as it always was.
         Node::AliasType(alias) => {
             let written = declared_name(&alias.name());
-            let bare = alias.name().name().as_str().to_string();
             ctx.aliases
                 .get(&written)
-                .or_else(|| ctx.aliases.get(&bare))
                 .cloned()
                 .ok_or_else(|| format!("unresolved RBS type alias: {written}"))
         }
@@ -859,7 +866,7 @@ pub(crate) fn intersection_ty(members: Vec<Ty>) -> Ty {
 /// in passes until one makes no progress; what is still unread then
 /// (a cycle, an unsupported type) is left out, and a signature that
 /// uses it stays unread exactly as before.
-fn resolve_aliases(members: &[Node<'_>], scope: Option<&str>, outer: &AliasTable) -> AliasTable {
+pub(crate) fn resolve_aliases(members: &[Node<'_>], scope: Option<&str>, outer: &AliasTable) -> AliasTable {
     let mut table = outer.clone();
     let mut pending: Vec<(String, Node<'_>)> = members
         .iter()
@@ -868,6 +875,12 @@ fn resolve_aliases(members: &[Node<'_>], scope: Option<&str>, outer: &AliasTable
             _ => None,
         })
         .collect();
+    // Local names shadow outer ones even before they resolve. Otherwise
+    // a forward reference can bind to the outer alias, or an unread local
+    // declaration can silently fall back to a different outer type.
+    for (name, _) in &pending {
+        table.remove(name);
+    }
     while !pending.is_empty() {
         let before = pending.len();
         pending.retain(|(name, node)| {
@@ -932,6 +945,7 @@ fn map_class_instance(name: &str, args: Vec<Ty>) -> Ty {
         ("Float", []) => Ty::Float,
         ("String", []) => Ty::Str,
         ("Symbol", []) => Ty::Sym,
+        ("Date", []) => Ty::Date,
         ("TrueClass" | "FalseClass", []) => Ty::Bool,
         ("NilClass", []) => Ty::Nil,
         ("Array", [elem]) => Ty::Array {
@@ -1022,6 +1036,7 @@ pub fn print_ty(ty: &Ty) -> String {
         Ty::Bool => "bool".to_string(),
         Ty::Str => "String".to_string(),
         Ty::Sym => "Symbol".to_string(),
+        Ty::Date => "Date".to_string(),
         Ty::Time => "Time".to_string(),
         Ty::Nil => "nil".to_string(),
         Ty::Array { elem } => format!("Array[{}]", print_ty(elem)),

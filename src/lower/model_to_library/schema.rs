@@ -39,17 +39,19 @@ pub(super) fn push_schema_methods(
     // AT THE IR LEVEL: the stored ISO-8601 text lives in a `<col>_raw`
     // String accessor pair (an ordinary field on every target), and the
     // public `<col>` reader is a computed getter parsing that text into
-    // a native `Time`. Every synthesized internal reference (hydration,
+    // a native Date or Time. Every synthesized internal reference (hydration,
     // predicate, attributes, `[]`/`[]=`, fill_timestamps, `_adapter_*`)
     // targets `<col>_raw` — so per-target emitters render what they see
     // instead of each re-deriving a storage/accessor redirect. The
-    // public `<col>=` writer normalizes through the `format_db_time`
-    // intrinsic (the write-side sibling of `parse_db_time`/`db_now`,
-    // native in every target runtime); hydration keeps writing stored
-    // text via `<col>_raw=` directly.
+    // public `<col>=` writer normalizes through the column's selected
+    // format intrinsic; hydration writes stored text via `<col>_raw=`
+    // directly. Date seams are native-Ruby-only for now.
     let mut demanded: Option<std::collections::HashSet<Symbol>> = None;
     for col in &table.columns {
         methods.push(synth_attr_reader(owner, col, model));
+        if model.enums.contains_key(&col.name) {
+            methods.push(synth_enum_storage_writer(owner, col));
+        }
         if is_temporal_col(col) {
             methods.push(synth_raw_reader(owner, col));
             // Rails-parity Time-accepting writer (lobsters' ban flow:
@@ -150,6 +152,8 @@ pub(super) fn push_schema_methods(
         ("_table_sql", crate::naming::sql_ident(model.table.0.as_str())),
     ] {
         methods.push(MethodDef {
+            unsupported_formals: None,
+            has_anonymous_block: false,
             name_span: crate::span::Span::synthetic(),
             name: Symbol::from(name),
             receiver: MethodReceiver::Class,
@@ -170,12 +174,107 @@ pub(super) fn push_schema_methods(
     // else and no target pays a per-model method for the common case.
     if let Some(pk) = &model.primary_key {
         methods.push(MethodDef {
+            unsupported_formals: None,
+            has_anonymous_block: false,
             name_span: crate::span::Span::synthetic(),
             name: Symbol::from("primary_key"),
             receiver: MethodReceiver::Class,
             params: Vec::new(),
             body: lit_str(pk.as_str().to_string()),
             signature: Some(fn_sig(vec![], Ty::Str)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(owner.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
+    }
+
+    // String/UUID keys must not use Base's Integer finder cast. Derive
+    // this from the key column, not an example value or the caller's ID.
+    let key_name = model.primary_key.as_ref().map_or("id", |k| k.as_str());
+    if table.columns.iter().any(|c| c.name.as_str() == key_name && ty_of_column(&c.col_type) == Ty::Str) {
+        methods.push(MethodDef {
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name: Symbol::from("_string_primary_key"),
+            receiver: MethodReceiver::Class,
+            params: vec![],
+            body: with_ty(Expr::new(Span::synthetic(), ExprNode::Lit {
+                value: Literal::Bool { value: true },
+            }), Ty::Bool),
+            signature: Some(fn_sig(vec![], Ty::Bool)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(owner.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
+    }
+
+    // def self._conflict_predicate(columns) — the predicate of the
+    // unique index `upsert_all(unique_by:)` names, else "". `columns` is
+    // the target's column names, sorted and joined with ", ". Like
+    // Rails' `InsertAll`, the target is the first unique index by name
+    // with those columns, in any order, and a partial one adds its
+    // `WHERE`, without which SQLite matches no partial index. Emitted
+    // only when some target has a predicate; the runtime's default
+    // answers "" for everyone else. The predicate is the one the SQLite
+    // DDL renders.
+    let mut unique: Vec<&crate::schema::Index> = table.indexes.iter().filter(|i| i.unique).collect();
+    unique.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    let mut targets: Vec<(String, Option<String>)> = Vec::new();
+    for i in unique {
+        let mut cols: Vec<&str> = i.columns.iter().map(|c| c.as_str()).collect();
+        cols.sort_unstable();
+        let cols = cols.join(", ");
+        if targets.iter().any(|(c, _)| *c == cols) {
+            continue;
+        }
+        let predicate = crate::emit::shared::schema_sql::Dialect::Sqlite
+            .index_predicate(table, i)
+            .map(str::to_string);
+        targets.push((cols, predicate));
+    }
+    let partial: Vec<(String, String)> =
+        targets.into_iter().filter_map(|(cols, p)| p.map(|p| (cols, p))).collect();
+    if !partial.is_empty() {
+        let columns = Symbol::from("columns");
+        let mut body = lit_str(String::new());
+        for (cols, predicate) in partial.into_iter().rev() {
+            let cond = with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(var_ref(columns.clone())),
+                        method: Symbol::from("=="),
+                        args: vec![lit_str(cols)],
+                        block: None,
+                        parenthesized: false,
+                    },
+                ),
+                Ty::Bool,
+            );
+            body = with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If { cond, then_branch: lit_str(predicate), else_branch: body },
+                ),
+                Ty::Str,
+            );
+        }
+        methods.push(MethodDef {
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from("_conflict_predicate"),
+            receiver: MethodReceiver::Class,
+            params: vec![Param::positional(columns.clone())],
+            body,
+            signature: Some(fn_sig(vec![(columns, Ty::Str)], Ty::Str)),
             effects: EffectSet::default(),
             enclosing_class: Some(owner.0.clone()),
             kind: AccessorKind::Method,
@@ -201,6 +300,8 @@ pub(super) fn push_schema_methods(
         Ty::Array { elem: Box::new(Ty::Sym) },
     );
     methods.push(MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("schema_columns"),
         receiver: MethodReceiver::Class,
@@ -215,8 +316,8 @@ pub(super) fn push_schema_methods(
             block_param: None,
     });
 
-    // def self.schema_time_columns — the temporal subset of the above.
-    // JSON serialization is the consumer: Rails renders a temporal
+    // def self.schema_time_columns — the timestamp subset of the above.
+    // JSON serialization is the consumer: Rails renders a timestamp
     // attribute as ISO8601-with-offset while every other column renders
     // as its raw value, and the `[]` indexer hands back the STORED text
     // for both. Only the schema knows which is which, so the fact is
@@ -228,7 +329,7 @@ pub(super) fn push_schema_methods(
                 elements: table
                     .columns
                     .iter()
-                    .filter(|c| is_temporal_col(c))
+                    .filter(|c| matches!(c.col_type, crate::schema::ColumnType::DateTime | crate::schema::ColumnType::Time))
                     .map(|c| lit_sym(c.name.clone()))
                     .collect(),
                 style: ArrayStyle::Brackets,
@@ -237,6 +338,8 @@ pub(super) fn push_schema_methods(
         Ty::Array { elem: Box::new(Ty::Sym) },
     );
     methods.push(MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("schema_time_columns"),
         receiver: MethodReceiver::Class,
@@ -265,7 +368,7 @@ pub(super) fn push_schema_methods(
     // (typed slots from the schema), output is the persisted model. No
     // Hash flowing through. Pattern (b) from the handoff: separate
     // class-method factories rather than overloaded initialize.
-    methods.push(synth_from_row(owner, table, model_declares_after_initialize(model)));
+    methods.push(synth_from_row(owner, table, model));
 
     // def self.from_stmt(stmt); instance = new; instance.<col> = Db.column_*(stmt, i); ...; mark_persisted!; instance; end
     //
@@ -278,7 +381,7 @@ pub(super) fn push_schema_methods(
     // column in that order (`ColumnSpec::All`). The Arel visitor only
     // routes `All`-projection hydrate sites here; a future `Named`
     // (partial/reordered) projection stays on its own inline path.
-    methods.push(synth_from_stmt(owner, table, model_declares_after_initialize(model)));
+    methods.push(synth_from_stmt(owner, table, model));
 
     // (No per-model `assign_from_row`: `Base#reload` dispatches to the
     // synthesized `_adapter_reload`, which re-reads the row off a
@@ -528,6 +631,8 @@ fn synth_fill_timestamps(owner: &ClassId, table: &Table) -> Option<MethodDef> {
     }
 
     Some(MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("fill_timestamps"),
         receiver: MethodReceiver::Instance,
@@ -608,6 +713,8 @@ fn synth_column_predicate(owner: &ClassId, col: &Column) -> MethodDef {
         _ => not_nil(col, &slot_ty),
     };
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from(format!("{}?", col.name.as_str())),
         receiver: MethodReceiver::Instance,
@@ -650,6 +757,26 @@ pub fn col_storage_name(col: &Column) -> Symbol {
 /// (`<col>=`, or `<col>_raw=` for a temporal column).
 fn col_storage_setter(col: &Column) -> Symbol {
     Symbol::from(format!("{}=", col_storage_name(col).as_str()))
+}
+
+/// Hydration is a storage write, not a user enum assignment. Unknown stored
+/// values remain intact and the enum reader answers nil for them.
+fn hydration_setter(model: &Model, col: &Column) -> Symbol {
+    if model.enums.contains_key(&col.name) {
+        enum_storage_writer(col)
+    } else {
+        col_storage_setter(col)
+    }
+}
+
+pub(crate) fn enum_storage_writer(col: &Column) -> Symbol {
+    Symbol::from(format!("_write_{}_raw", col.name.as_str()))
+}
+
+/// Fixture omissions are schema row data, not enum DSL defaults for `new`.
+pub(crate) fn schema_storage_default(col: &Column) -> Expr {
+    schema_default_literal(col)
+        .unwrap_or_else(|| default_literal_for_ty(&super::ty_of_column_slot(col)))
 }
 
 /// Storage setter for a field known only by name (permit lists). Falls
@@ -798,23 +925,19 @@ fn and_bool(left: Expr, right: Expr) -> Expr {
 
 fn synth_attr_reader(owner: &ClassId, col: &Column, model: &Model) -> MethodDef {
     // Temporal columns store ISO-8601 TEXT (`ty_of_column` → Str) but
-    // read back as a real `Time`: the reader parses the stored text so
-    // `record.created_at` is a native `Time` for callers / analyze /
-    // Rails-canonical JSON. This is the shared, all-target home of what
-    // used to be Ruby's emit-only `apply_datetime_lowering`. Each backend
-    // renders `parse_db_time` (a stored-text→Time intrinsic) natively; a
-    // target that hasn't wired one yet surfaces the honest not-supported
-    // gap on this reader's `Ty::Time` return type.
+    // read back as Date or Time. This shared lowering selects the
+    // native seam; the target boundary rejects unsupported Date seams
+    // before an emitter can silently substitute a timestamp carrier.
     let (body, ret_ty) = if let Some(label) = enum_label_read(model, col) {
         (label, Ty::Union { variants: vec![Ty::Str, Ty::Nil] })
     } else if is_temporal_col(col) {
         // Nilable: a stored value can be absent (NULL / unset), so the
-        // parse short-circuits to nil. `Time?` is the honest static type
+        // parse short-circuits to nil. Date?/Time? is the honest static type
         // and matches what a strict-null target infers from the nilable
         // storage ivar.
         (
             temporal_reader_body(col),
-            Ty::Union { variants: vec![Ty::Time, Ty::Nil] },
+            Ty::Union { variants: vec![temporal_seam(col).0, Ty::Nil] },
         )
     } else if is_generic_json_col(col, model) {
         (json_reader_body(col), Ty::Untyped)
@@ -831,6 +954,8 @@ fn synth_attr_reader(owner: &ClassId, col: &Column, model: &Model) -> MethodDef 
         )
     };
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: col.name.clone(),
         receiver: MethodReceiver::Instance,
@@ -898,8 +1023,7 @@ fn json_dump_value(col: &Column, value: Expr) -> Expr {
     )
 }
 
-/// True for a Date/DateTime/Time column — a stored-text column whose
-/// reader parses to a native `Time`.
+/// True for a stored-text column with native Date or Time accessors.
 fn is_temporal_col(col: &Column) -> bool {
     matches!(
         col.col_type,
@@ -909,13 +1033,20 @@ fn is_temporal_col(col: &Column) -> bool {
     )
 }
 
-/// `ActiveSupport.parse_db_time(@col_raw)` — reader body for a temporal
-/// column. `parse_db_time` is nil-safe (nil / empty stored value → nil)
-/// and reads a zone-less stored value as UTC, so no explicit `&&` guard
-/// is needed — this renders cleanly on strict-null targets, where a
-/// guard would force a nil-raising `.not_nil!`. Typed `Time | Nil`.
-/// Every target (Ruby included) renders this same shape; each maps
-/// `parse_db_time` to its native parse.
+/// One authority for the logical value, parser and formatter. Storage
+/// stays String. The legacy hand-written Ruby accessor path uses this
+/// too; it must not independently decide that a Date is a timestamp.
+pub(crate) fn temporal_seam(col: &Column) -> (Ty, &'static str, &'static str) {
+    if col.col_type == crate::schema::ColumnType::Date {
+        (Ty::Date, "parse_db_date", "format_db_date")
+    } else {
+        (Ty::Time, "parse_db_time", "format_db_time")
+    }
+}
+
+/// Nil-safe native Date/Time parsing over the raw storage text. Dates
+/// have no zone; timestamps read zone-less storage as UTC. Backends
+/// without the selected native seam must report unsupported.
 fn temporal_reader_body(col: &Column) -> Expr {
     let ivar = with_ty(
         Expr::new(Span::synthetic(), ExprNode::Ivar { name: col_storage_name(col) }),
@@ -929,13 +1060,13 @@ fn temporal_reader_body(col: &Column) -> Expr {
                     Span::synthetic(),
                     ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] },
                 )),
-                method: Symbol::from("parse_db_time"),
+                method: Symbol::from(temporal_seam(col).1),
                 args: vec![ivar],
                 block: None,
                 parenthesized: true,
             },
         ),
-        Ty::Union { variants: vec![Ty::Time, Ty::Nil] },
+        Ty::Union { variants: vec![temporal_seam(col).0, Ty::Nil] },
     )
 }
 
@@ -953,6 +1084,8 @@ fn synth_raw_reader(owner: &ClassId, col: &Column) -> MethodDef {
         Ty::Str,
     );
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name,
         receiver: MethodReceiver::Instance,
@@ -971,6 +1104,9 @@ fn synth_raw_reader(owner: &ClassId, col: &Column) -> MethodDef {
 /// `def <col>=(value)` — the Rails-parity PUBLIC writer for a temporal
 /// column: normalize the value to canonical storage text and store it
 /// through the raw field.
+///
+/// Date uses `format_db_date`: YYYY-MM-DD with no zone or clock.
+/// The timestamp example and strict-target behavior below stay Time-only.
 ///
 ///   def banned_at=(value)
 ///     self.banned_at_raw = ActiveSupport.format_db_time(value)
@@ -1006,11 +1142,11 @@ fn synth_temporal_writer(owner: &ClassId, col: &Column) -> MethodDef {
     let value_param = Symbol::from("value");
     let (value_ty, text_ty) = if col.nullable {
         (
-            Ty::Union { variants: vec![Ty::Time, Ty::Nil] },
+            Ty::Union { variants: vec![temporal_seam(col).0, Ty::Nil] },
             Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
         )
     } else {
-        (Ty::Time, Ty::Str)
+        (temporal_seam(col).0, Ty::Str)
     };
     let normalize = with_ty(
         Expr::new(
@@ -1020,7 +1156,7 @@ fn synth_temporal_writer(owner: &ClassId, col: &Column) -> MethodDef {
                     Span::synthetic(),
                     ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] },
                 )),
-                method: Symbol::from("format_db_time"),
+                method: Symbol::from(temporal_seam(col).2),
                 args: vec![with_ty(var_ref(value_param.clone()), value_ty.clone())],
                 block: None,
                 parenthesized: true,
@@ -1042,6 +1178,8 @@ fn synth_temporal_writer(owner: &ClassId, col: &Column) -> MethodDef {
         text_ty,
     );
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from(format!("{}=", col.name.as_str())),
         receiver: MethodReceiver::Instance,
@@ -1065,6 +1203,8 @@ fn synth_key_alias_reader(owner: &ClassId, key: &Column) -> MethodDef {
         key_ty.clone(),
     );
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("id"),
         receiver: MethodReceiver::Instance,
@@ -1093,6 +1233,8 @@ fn synth_key_alias_writer(owner: &ClassId, key: &Column) -> MethodDef {
         key_ty.clone(),
     );
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("id="),
         receiver: MethodReceiver::Instance,
@@ -1135,6 +1277,8 @@ fn synth_attr_writer(owner: &ClassId, col: &Column, model: &Model) -> MethodDef 
         col_ty.clone(),
     );
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: col_storage_setter(col),
         receiver: MethodReceiver::Instance,
@@ -1147,6 +1291,33 @@ fn synth_attr_writer(owner: &ClassId, col: &Column, model: &Model) -> MethodDef 
         is_async: false,
             mutates_self: false,
             block_param: None,
+    }
+}
+
+/// Internal enum hydration accepts the typed DB slot without assignment
+/// validation. This is a method, not an additional public attribute/field.
+fn synth_enum_storage_writer(owner: &ClassId, col: &Column) -> MethodDef {
+    let value = Symbol::from("value");
+    let slot_ty = super::ty_of_column_slot(col);
+    let assign = Expr::new(Span::synthetic(), ExprNode::Assign {
+        target: LValue::Ivar { name: col_storage_name(col) },
+        value: with_ty(var_ref(value.clone()), slot_ty.clone()),
+    });
+    MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name: enum_storage_writer(col),
+        receiver: MethodReceiver::Instance,
+        params: vec![Param::positional(value.clone())],
+        body: seq(vec![assign, nil_lit()]),
+        signature: Some(fn_sig(vec![(value, slot_ty)], Ty::Nil)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: true,
+        block_param: None,
     }
 }
 
@@ -1240,6 +1411,8 @@ fn synth_instantiate(owner: &ClassId, fire_after_initialize: bool) -> MethodDef 
     // narrowing happens in the body.
     let row_ty = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) };
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("instantiate"),
         receiver: MethodReceiver::Class,
@@ -1344,6 +1517,8 @@ pub(super) fn push_from_params_method(
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
     let params_ty = Ty::Class { id: params_class_id.clone(), args: vec![] };
     methods.push(MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name,
         receiver: MethodReceiver::Class,
@@ -1443,6 +1618,8 @@ pub(super) fn push_create_from_params_method(
 
     let params_ty = Ty::Class { id: params_class_id.clone(), args: vec![] };
     methods.push(MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name,
         receiver: MethodReceiver::Class,
@@ -1489,7 +1666,7 @@ fn hydrate_new_args(fire_after_initialize: bool) -> Vec<Expr> {
     if fire_after_initialize { vec![hydrate_attrs_const()] } else { Vec::new() }
 }
 
-fn synth_from_row(owner: &ClassId, table: &Table, fire_after_initialize: bool) -> MethodDef {
+fn synth_from_row(owner: &ClassId, table: &Table, model: &Model) -> MethodDef {
     let row = Symbol::from("row");
     let instance = Symbol::from("instance");
     let row_class = row_class_id(owner);
@@ -1499,7 +1676,7 @@ fn synth_from_row(owner: &ClassId, table: &Table, fire_after_initialize: bool) -
         ExprNode::Send {
             recv: Some(class_const(owner)),
             method: Symbol::from("new"),
-            args: hydrate_new_args(fire_after_initialize),
+            args: hydrate_new_args(model_declares_after_initialize(model)),
             block: None,
             parenthesized: true,
         },
@@ -1548,7 +1725,7 @@ fn synth_from_row(owner: &ClassId, table: &Table, fire_after_initialize: bool) -
             Span::synthetic(),
             ExprNode::Send {
                 recv: Some(var_ref(instance.clone())),
-                method: col_storage_setter(col),
+                method: hydration_setter(model, col),
                 args: vec![cast_field],
                 block: None,
                 parenthesized: false,
@@ -1594,6 +1771,8 @@ fn synth_from_row(owner: &ClassId, table: &Table, fire_after_initialize: bool) -
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
     let row_ty = Ty::Class { id: row_class, args: vec![] };
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("from_row"),
         receiver: MethodReceiver::Class,
@@ -1617,7 +1796,8 @@ fn synth_from_row(owner: &ClassId, table: &Table, fire_after_initialize: bool) -
 /// No `Cast` wrapping (unlike `from_row`): `column_*` returns the exact
 /// non-nilable scalar each setter expects, so the types line up
 /// directly. Marks the instance persisted before returning it.
-fn synth_from_stmt(owner: &ClassId, table: &Table, fire_after_initialize: bool) -> MethodDef {
+fn synth_from_stmt(owner: &ClassId, table: &Table, model: &Model) -> MethodDef {
+    let fire_after_initialize = model_declares_after_initialize(model);
     let stmt = Symbol::from("stmt");
     let instance = Symbol::from("instance");
     let db = ClassId(Symbol::from("Db"));
@@ -1662,7 +1842,7 @@ fn synth_from_stmt(owner: &ClassId, table: &Table, fire_after_initialize: bool) 
             Span::synthetic(),
             ExprNode::Send {
                 recv: Some(var_ref(instance.clone())),
-                method: col_storage_setter(col),
+                method: hydration_setter(model, col),
                 args: vec![read_call],
                 block: None,
                 parenthesized: false,
@@ -1716,6 +1896,8 @@ fn synth_from_stmt(owner: &ClassId, table: &Table, fire_after_initialize: bool) 
 
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("from_stmt"),
         receiver: MethodReceiver::Class,
@@ -1820,6 +2002,8 @@ fn synth_column_prev_was(owner: &ClassId, col: &Column) -> MethodDef {
         },
     );
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: prev_was_name(col),
         receiver: MethodReceiver::Instance,
@@ -1914,6 +2098,8 @@ fn synth_column_delegate(
         },
     );
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name,
         receiver: MethodReceiver::Instance,
@@ -1989,6 +2175,8 @@ fn synth_column_dirty_pred(owner: &ClassId, col: &Column, name: Symbol) -> Metho
         },
     );
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name,
         receiver: MethodReceiver::Instance,
@@ -2083,7 +2271,7 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
     let attrs = Symbol::from("attrs");
 
     let mut stmts: Vec<Expr> = Vec::new();
-    // super() — calls ActiveRecord::Base#initialize.
+    // Do not forward explicit attrs to a parent's possibly different enum mapping.
     stmts.push(Expr::new(
         Span::synthetic(),
         ExprNode::Super { args: Some(Vec::new()) },
@@ -2145,7 +2333,7 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
                 target: LValue::Ivar { name: col_storage_name(col) },
                 value: with_ty(raw_default, slot_ty.clone()),
             }), slot_ty));
-            stmts.push(given_value_assign(model, col, &attrs));
+            stmts.push(given_value_assign(col, &attrs, enum_label_cast(model, col, lookup.clone()).unwrap_or_else(|| Expr::new(Span::synthetic(), ExprNode::Cast { value: lookup, target_ty: super::ty_of_column_slot(col) }))));
             continue;
         }
         // is_id_column reference retained as a feature flag for
@@ -2153,8 +2341,35 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
         // through the same default-lookup shape.
         let _ = is_id_column(&col.name);
 
+        if model.enums.contains_key(&col.name) {
+            let slot_ty = super::ty_of_column_slot(col);
+            let default = if nullable { nil_lit() } else { default };
+            let provided = bool_send(var_ref(attrs.clone()), "key?", lit_sym(col.name.clone()));
+            let value = with_ty(Expr::new(Span::synthetic(), ExprNode::If {
+                cond: provided,
+                then_branch: enum_label_cast(model, col, lookup.clone()).unwrap_or_else(|| {
+                    Expr::new(Span::synthetic(), ExprNode::Cast {
+                        value: lookup, target_ty: slot_ty.clone(),
+                    })
+                }),
+                else_branch: default,
+            }), slot_ty.clone());
+            // Flat ivar initialization survives strict constructor extraction
+            // and cannot virtually dispatch a parent's default to a child writer.
+            stmts.push(Expr::new(Span::synthetic(), ExprNode::Assign {
+                target: LValue::Ivar { name: col_storage_name(col) }, value,
+            }));
+            // Only explicitly supplied values reach the public writer. Keep
+            // its existing normalized-input dispatch, never validate defaults.
+            stmts.push(given_value_assign(col, &attrs,
+                with_ty(Expr::new(Span::synthetic(), ExprNode::Ivar {
+                    name: col_storage_name(col),
+                }), slot_ty)));
+            continue;
+        }
+
         if is_temporal_col(col) {
-            // Temporal columns: callers pass native `Time` values
+            // Temporal columns: callers pass native Date or Time values
             // (`Username.create!(created_at: user.created_at)` in
             // lobsters), so the attrs value can't be stuffed into the
             // raw ISO-text slot directly. First the STANDARD
@@ -2162,7 +2377,7 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
             // exact pre-existing shape every target compiles (a Time
             // value transiently lands in the raw slot; nothing reads
             // between the two statements) — then a nil-guarded
-            // normalize through the `format_db_time` intrinsic, the
+            // normalize through the selected format intrinsic, the
             // same funnel `synth_temporal_writer` uses, called
             // directly because several emitters render the public
             // `<col>=` MethodDef without a property-setter
@@ -2201,7 +2416,7 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
             // unwraps it to the inner value.
             let time_value = Expr::new(
                 Span::synthetic(),
-                ExprNode::Cast { value: lookup.clone(), target_ty: Ty::Time },
+                ExprNode::Cast { value: lookup.clone(), target_ty: temporal_seam(col).0 },
             );
             let normalized = with_ty(
                 Expr::new(
@@ -2211,7 +2426,7 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
                             Span::synthetic(),
                             ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] },
                         )),
-                        method: Symbol::from("format_db_time"),
+                        method: Symbol::from(temporal_seam(col).2),
                         args: vec![time_value],
                         block: None,
                         parenthesized: true,
@@ -2234,6 +2449,7 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
             // A has_json column: `new(settings: { … })` is Rails'
             // `settings=`, the per-key cast-and-merge — through the
             // seam, over the `|| <default>` a NOT NULL column keeps.
+            let given = lookup.clone();
             let json_assign = crate::lower::has_json::column_assign(
                 model,
                 &col.name,
@@ -2345,7 +2561,10 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
                 },
             ));
             if overrides_schema_default(model, col) && json_assign_is_none {
-                stmts.push(given_value_assign(model, col, &attrs));
+                let given = Expr::new(Span::synthetic(), ExprNode::Cast {
+                    value: given, target_ty: super::ty_of_column_slot(col),
+                });
+                stmts.push(given_value_assign(col, &attrs, given));
             }
         }
     }
@@ -2643,15 +2862,15 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
     let attrs_ty = Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) };
     let signature = Ty::Fn {
         params: vec![crate::ty::Param {
-            name: attrs.clone(),
-            ty: attrs_ty,
-            kind: crate::ty::ParamKind::Optional,
+            name: attrs.clone(), ty: attrs_ty, kind: crate::ty::ParamKind::Optional,
         }],
         block: None,
         ret: Box::new(Ty::Nil),
         effects: EffectSet::default(),
     };
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("initialize"),
         receiver: MethodReceiver::Instance,
@@ -2714,6 +2933,8 @@ fn synth_attributes(owner: &ClassId, table: &Table, model: &Model) -> MethodDef 
     );
 
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("attributes"),
         receiver: MethodReceiver::Instance,
@@ -2733,8 +2954,10 @@ fn synth_index_read(owner: &ClassId, table: &Table, model: &Model) -> MethodDef 
     let name = Symbol::from("name");
 
     // Patterns match the PUBLIC column symbol; bodies read the storage
-    // ivar (`@col_raw` for temporal) — `record[:created_at]` yields the
-    // stored text, same as `attributes`. JSON columns are the exception: a
+    // ivar (`@col_raw` for timestamps). Date instead uses its native
+    // reader, matching literal-key analysis and Rails' []/read_attribute.
+    // `attributes` and the raw Date reader still expose stored text.
+    // JSON columns are another exception: a
     // `has_json` declaration builds its typed Hash from the flat readers; a
     // schema-less column decodes through `JsonColumn.load`.
     let arms: Vec<crate::expr::Arm> = table
@@ -2754,6 +2977,7 @@ fn synth_index_read(owner: &ClassId, table: &Table, model: &Model) -> MethodDef 
             // `&self`.
             body: crate::lower::has_json::column_hash_read(model, &c.name)
                 .or_else(|| enum_label_read(model, c))
+                .or_else(|| (c.col_type == crate::schema::ColumnType::Date).then(|| temporal_reader_body(c)))
                 .or_else(|| is_generic_json_col(c, model).then(|| json_reader_body(c)))
                 .unwrap_or_else(|| {
                 let read = Expr::new(
@@ -2780,6 +3004,8 @@ fn synth_index_read(owner: &ClassId, table: &Table, model: &Model) -> MethodDef 
     );
 
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("[]"),
         receiver: MethodReceiver::Instance,
@@ -3046,6 +3272,8 @@ fn synth_index_write(owner: &ClassId, table: &Table, model: &Model) -> MethodDef
     };
 
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("[]="),
         receiver: MethodReceiver::Instance,
@@ -3086,21 +3314,7 @@ fn overrides_schema_default(model: &Model, col: &Column) -> bool {
 }
 
 // Not a new shape: the same `attrs.key?` guarded write `synth_update_hash` emits, which every target already compiles.
-fn given_value_assign(model: &Model, col: &Column, attrs: &Symbol) -> Expr {
-    let lookup = Expr::new(
-        Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(var_ref(attrs.clone())),
-            method: Symbol::from("[]"),
-            args: vec![lit_sym(col.name.clone())],
-            block: None,
-            parenthesized: false,
-        },
-    );
-    let slot_ty = super::ty_of_column_slot(col);
-    let value = enum_label_cast(model, col, lookup.clone()).unwrap_or_else(|| {
-        Expr::new(Span::synthetic(), ExprNode::Cast { value: lookup, target_ty: slot_ty })
-    });
+fn given_value_assign(col: &Column, attrs: &Symbol, value: Expr) -> Expr {
     let assign = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
@@ -3341,6 +3555,8 @@ fn synth_update_typed(
     let params_ty = Ty::Class { id: params_class_id.clone(), args: vec![] };
     let ret_ty = if bang { Ty::Class { id: owner.clone(), args: vec![] } } else { Ty::Bool };
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name,
         receiver: MethodReceiver::Instance,
@@ -3492,7 +3708,7 @@ fn synth_update_hash(
             // line (`if a: if b: …`), which is a syntax error.
             let time_value = Expr::new(
                 Span::synthetic(),
-                ExprNode::Cast { value: lookup(&col.name), target_ty: Ty::Time },
+                ExprNode::Cast { value: lookup(&col.name), target_ty: temporal_seam(col).0 },
             );
             let normalized = with_ty(
                 Expr::new(
@@ -3502,7 +3718,7 @@ fn synth_update_hash(
                             Span::synthetic(),
                             ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] },
                         )),
-                        method: Symbol::from("format_db_time"),
+                        method: Symbol::from(temporal_seam(col).2),
                         args: vec![time_value],
                         block: None,
                         parenthesized: true,
@@ -3643,6 +3859,8 @@ fn synth_update_hash(
     let attrs_ty = Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) };
     let ret_ty = if bang { Ty::Class { id: owner.clone(), args: vec![] } } else { Ty::Bool };
     MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from(if bang { "update!" } else { "update" }),
         receiver: MethodReceiver::Instance,

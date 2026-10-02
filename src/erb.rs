@@ -423,13 +423,10 @@ pub(crate) fn is_block_expr(code: &str) -> bool {
 /// scanned for, because a `#` opens a comment only outside a string,
 /// regexp or interpolation (`"#{x}"`, `?#`).
 fn strip_trailing_comment(code: &str) -> &str {
-    // Only a `#` that is not `#{` / `#@` / `#$` can start a comment.
     let bytes = code.as_bytes();
-    let may_comment = bytes
-        .iter()
-        .enumerate()
-        .any(|(i, &b)| b == b'#' && !matches!(bytes.get(i + 1), Some(b'{' | b'@' | b'$')));
-    if !may_comment {
+    // Interpolation-like prefixes only interpolate in suitable literals.
+    // Outside one they start comments; let Prism distinguish the contexts.
+    if !bytes.contains(&b'#') {
         return code;
     }
     let result = ruby_prism::parse(bytes);
@@ -708,6 +705,20 @@ mod tests {
         let out = compile_erb("Total: <%= count %>\n");
         assert!(out.contains(r#"_buf = _buf + "Total: ""#));
         assert!(out.contains("_buf = _buf + (count).to_s"));
+    }
+
+    #[test]
+    fn prism_identifies_comment_prefixes_that_resemble_interpolation() {
+        assert_eq!(strip_trailing_comment("end #@note"), "end");
+        assert_eq!(strip_trailing_comment("end #$note"), "end");
+        assert_eq!(strip_trailing_comment("end #{note}"), "end");
+    }
+
+    #[test]
+    fn interpolation_like_hashes_inside_literals_are_not_comments() {
+        for code in [r#""value #{@note} #$global #{local}""#, r#"/#{pattern}/"#] {
+            assert_eq!(strip_trailing_comment(code), code);
+        }
     }
 
     #[test]

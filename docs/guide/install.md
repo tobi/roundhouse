@@ -77,7 +77,7 @@ bindings with bindgen, which loads clang's own resource headers.
 Then either install straight from the repository:
 
 ```sh
-cargo install --git https://github.com/rubys/roundhouse --bin roundhouse
+cargo install --locked --git https://github.com/rubys/roundhouse --bin roundhouse
 roundhouse --version
 ```
 

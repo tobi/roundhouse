@@ -372,10 +372,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let c = n.as_call_node().unwrap();
             let method = constant_id_str(&c.name()).to_string();
             let args: Vec<Expr> = if let Some(a) = c.arguments() {
-                a.arguments()
-                    .iter()
-                    .map(|arg| ingest_expr(&arg, file))
-                    .collect::<IngestResult<_>>()?
+                ingest_forwardable_arguments(&a, file)?
             } else {
                 vec![]
             };
@@ -400,21 +397,6 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             };
             let block = match c.block() {
                 Some(block_node) => ingest_call_block(&block_node, file, &method)?,
-                // `foo(...)` passes the caller's block on too: `...` is
-                // `*rest, **kw, &blk`, and the def side bound `blk` to the
-                // same `__blk` an anonymous `&` gets.
-                None if c.arguments().is_some_and(|a| {
-                    a.arguments().iter().any(|x| x.as_forwarding_arguments_node().is_some())
-                }) =>
-                {
-                    Some(Expr::new(
-                        Span::synthetic(),
-                        ExprNode::Var {
-                            id: crate::ident::VarId(0),
-                            name: Symbol::from(super::util::FORWARDED_BLOCK),
-                        },
-                    ))
-                }
                 None => None,
             };
             // Two shapes a paren-less call can't hold once lowered, both
@@ -504,9 +486,15 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 && block.is_none()
                 && recv.is_some()
                 && args.len() == 1
+                && !matches!(&*args[0].node, ExprNode::ForwardArgs)
             {
                 let r = recv.unwrap();
                 let mut defaults = args.into_iter().next().unwrap();
+                // The rewritten receiver is the value, not a call-argument
+                // keyword marker. Keep the existing reverse-merge semantics.
+                if let ExprNode::KeywordSplat { value } = &mut *defaults.node {
+                    defaults = std::mem::replace(value, nil_expr());
+                }
                 // `reverse_merge(a: 1, b: 2)` — the trailing kwargs parsed
                 // as a bare (`kwargs: true`) Hash; as the `.merge`
                 // RECEIVER it must render braced (`{ a: 1 }.merge(...)`),
@@ -536,10 +524,17 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 && block.is_none()
                 && recv.is_some()
                 && args.len() == 1
-                && matches!(&*args[0].node, ExprNode::Hash { .. })
+                && match &*args[0].node {
+                    ExprNode::Hash { .. } => true,
+                    ExprNode::KeywordSplat { value } => matches!(&*value.node, ExprNode::Hash { .. }),
+                    _ => false,
+                }
             {
                 let r = recv.unwrap();
-                let cond = args.into_iter().next().unwrap();
+                let mut cond = args.into_iter().next().unwrap();
+                if let ExprNode::KeywordSplat { value } = &mut *cond.node {
+                    cond = std::mem::replace(value, nil_expr());
+                }
                 let where_call = Expr::new(
                     span,
                     ExprNode::Send {
@@ -1408,11 +1403,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // `super(args)` / `super()` — args = Some(vec).
             let s = n.as_super_node().unwrap();
             let args = match s.arguments() {
-                Some(a) => a
-                    .arguments()
-                    .iter()
-                    .map(|arg| ingest_expr(&arg, file))
-                    .collect::<IngestResult<Vec<_>>>()?,
+                Some(a) => ingest_forwardable_arguments(&a, file)?,
                 None => vec![],
             };
             ExprNode::Super { args: Some(args) }
@@ -1887,19 +1878,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             };
             ExprNode::Splat { value }
         }
-        // `...` in an argument list (`def m(...) = foo(...)`): the forwarded
-        // positionals, spread. Keywords ride in them as a trailing Hash, the
-        // convention `*args, **opts` already follows; the block is passed
-        // on by the enclosing call (see its `block` above).
-        n if n.as_forwarding_arguments_node().is_some() => ExprNode::Splat {
-            value: Expr::new(
-                span,
-                ExprNode::Var {
-                    id: crate::ident::VarId(0),
-                    name: Symbol::from(super::util::FORWARDED_REST),
-                },
-            ),
-        },
+        n if n.as_forwarding_arguments_node().is_some() => ExprNode::ForwardArgs,
         n if n.as_multi_write_node().is_some() => {
             // Handled out-of-line: `ingest_expr_strict` recurses once per
             // expression-nesting level, so its stack frame is on the hot
@@ -2153,6 +2132,39 @@ fn detect_leading_guard<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     Some(if_node.predicate())
 }
 
+/// The argument-list walk is adapted from Tim Tischler's F7 commit
+/// 013588ec. Preserve the marker instead of erasing keyword identity
+/// into a positional hash and synthesizing three user-visible bindings.
+fn ingest_forwardable_arguments(
+    a: &ruby_prism::ArgumentsNode<'_>,
+    file: &str,
+) -> IngestResult<Vec<Expr>> {
+    let mut args = Vec::new();
+    for arg in a.arguments().iter() {
+        if arg.as_forwarding_arguments_node().is_some() {
+            let loc = arg.location();
+            args.push(Expr::new(Span {
+                file: super::sources::file_id(file),
+                start: loc.start_offset() as u32,
+                end: loc.end_offset() as u32,
+            }, ExprNode::ForwardArgs));
+        } else {
+            let value = ingest_expr(&arg, file)?;
+            // Only a CALL's KeywordHashNode owns this fact. `{**h}`
+            // remains an ordinary positional hash/merge expression.
+            let has_keyword_splat = arg.as_keyword_hash_node().is_some_and(|hash| {
+                hash.elements().iter().any(|e| e.as_assoc_splat_node().is_some())
+            });
+            args.push(if has_keyword_splat {
+                Expr::new(value.span, ExprNode::KeywordSplat { value })
+            } else {
+                value
+            });
+        }
+    }
+    Ok(args)
+}
+
 /// Ingest a `CallNode`'s block — the `do |...| ... end` or `{ |...| ... }`
 /// attached to a method call. Represented as a `Lambda` expression.
 /// Returns `None` for block-argument nodes (`&block`) which aren't closures.
@@ -2308,15 +2320,7 @@ fn ingest_call_block(
                     ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
                 )));
             }
-            // Any other `&expr` — `&method(:foo)`, `&@callback`,
-            // `&SORT_ORDERS[key]`, `&record.block`, `&->(x) { … }` — is
-            // a proc-valued EXPRESSION handed to the callee as its
-            // block. Ruby evaluates it once, converts it with
-            // `to_proc`, and passes the result; the Proc-forward slot
-            // (see the `&local_var` case above) carries exactly that,
-            // whatever the expression is. Refusing these dropped the
-            // whole file's ingest for `instance_exec(&SORT_ORDERS[k])`,
-            // `map(&method(:one))` and the like.
+            // Any other proc-valued expression is evaluated once and passed as the block.
             return Ok(Some(ingest_expr(&expr, file)?));
         }
         // Ruby 3.4 anonymous block forwarding (`fetch(key, &)`) —
@@ -2478,6 +2482,7 @@ fn nil_expr() -> Expr {
 fn starts_with_brace_literal(e: &Expr) -> bool {
     match &*e.node {
         ExprNode::Hash { kwargs, .. } => !*kwargs,
+        ExprNode::KeywordSplat { value } => starts_with_brace_literal(value),
         ExprNode::Send { recv: Some(recv), .. } => starts_with_brace_literal(recv),
         _ => false,
     }

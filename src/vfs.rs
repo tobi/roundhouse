@@ -28,6 +28,9 @@ pub trait Vfs {
     fn canonical(&self, _path: &Path) -> Option<PathBuf> {
         None
     }
+
+    /// Return whether `path` is a symbolic link, without following it.
+    fn is_symlink(&self, path: &Path) -> bool;
 }
 
 /// Real-filesystem-backed `Vfs`. Used by the CLI and tests.
@@ -72,6 +75,10 @@ impl Vfs for FsVfs {
 
     fn canonical(&self, path: &Path) -> Option<PathBuf> {
         std::fs::canonicalize(path).ok()
+    }
+
+    fn is_symlink(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
     }
 }
 
@@ -139,5 +146,10 @@ impl Vfs for MapVfs {
         self.files
             .keys()
             .any(|f| f.starts_with(path) && f != path)
+    }
+
+    fn is_symlink(&self, _path: &Path) -> bool {
+        // A flat map of file contents has no symbolic links.
+        false
     }
 }

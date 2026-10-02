@@ -803,6 +803,8 @@ pub(super) fn expand_enum_decl(
                 name: Symbol::from(name),
                 receiver: MethodReceiver::Instance,
                 params: Vec::new(),
+                unsupported_formals: None,
+                has_anonymous_block: false,
                 block_param: None,
                 body,
                 signature: None,
@@ -897,6 +899,8 @@ if generate.instance_methods {
             name: Symbol::from(crate::naming::pluralize_snake(&column)),
             receiver: MethodReceiver::Class,
             params: Vec::new(),
+            unsupported_formals: None,
+            has_anonymous_block: false,
             block_param: None,
             body: mapping_hash,
             signature: None,
@@ -1313,6 +1317,7 @@ pub(super) fn ingest_method(
 ) -> IngestResult<crate::dialect::MethodDef> {
     use crate::dialect::{MethodDef, MethodReceiver};
 
+    let formals = super::forwarding::parse(def);
     let name = Symbol::from(constant_id_str(&def.name()));
     // `def self.foo` / `def Post.foo` have explicit receivers; plain `def foo`
     // is an instance method.
@@ -1330,7 +1335,6 @@ pub(super) fn ingest_method(
     // library-class path records is recorded here too, in Ruby's
     // declaration order, so the `def` keeps the source arity.
     let mut params: Vec<crate::dialect::Param> = Vec::new();
-    let mut block_param: Option<crate::dialect::Param> = None;
     if let Some(pn) = def.parameters() {
         for req in pn.requireds().iter() {
             if let Some(rp) = req.as_required_parameter_node() {
@@ -1418,15 +1422,7 @@ pub(super) fn ingest_method(
                 }
             }
         }
-        // `def m(...)`: `*rest, **kw, &blk` under names the body's
-        // `foo(...)` forwards. Keywords ride in the rest as a trailing
-        // Hash, as they do for `*args, **opts`.
-        if super::util::has_forwarding_parameter(&pn) {
-            params.push(crate::dialect::Param::rest(Symbol::from(super::util::FORWARDED_REST)));
-            block_param = Some(crate::dialect::Param::positional(Symbol::from(
-                super::util::FORWARDED_BLOCK,
-            )));
-        }
+
     }
 
     // `&blk` rides in `MethodDef.block_param`, not the flat list, as
@@ -1435,13 +1431,18 @@ pub(super) fn ingest_method(
     // body that passes it on (`each(&blk)`) still binds the name.
     // Ruby 3.4's anonymous `&` gets the same synthesized name the
     // library-class path gives it, so bare-`&` forwarding binds.
-    block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
+    let block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
         let name = block
             .name()
             .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
             .unwrap_or("__blk");
         crate::dialect::Param::positional(Symbol::from(name))
-    }).or(block_param);
+    });
+
+    // Only full `...` or nameless `**` enters this canonical seam.
+    // Named rest/keyword-rest above and the separate block slot stay
+    // source-owned; no forwarding packet is expanded into local names.
+    params.extend(formals.anonymous.map(super::forwarding::AnonymousFormal::into_param));
 
     let body = match def.body() {
         Some(b) => ingest_expr(&b, file)?,
@@ -1453,6 +1454,8 @@ pub(super) fn ingest_method(
         name,
         receiver,
         params,
+        unsupported_formals: formals.unsupported,
+        has_anonymous_block: formals.has_anonymous_block,
         body,
         signature: None,
         effects: EffectSet::pure(),
@@ -2176,7 +2179,8 @@ fn ty_of_column(t: &ColumnType) -> Ty {
         ColumnType::Float | ColumnType::Decimal { .. } => Ty::Float,
         ColumnType::String { .. } | ColumnType::Text => Ty::Str,
         ColumnType::Boolean => Ty::Bool,
-        ColumnType::Date | ColumnType::DateTime | ColumnType::Time => Ty::Time,
+        ColumnType::Date => Ty::Date,
+        ColumnType::DateTime | ColumnType::Time => Ty::Time,
         ColumnType::Binary => Ty::Str,
         // Rails exposes a schema-less JSON value here: it may be an
         // Array, Hash, scalar, or nil, so neither String nor one fixed

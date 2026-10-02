@@ -72,6 +72,8 @@ fn module_singleton_shape() {
         args: vec![],
     };
     let reader = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("adapter"),
         receiver: MethodReceiver::Class,
@@ -95,6 +97,8 @@ fn module_singleton_shape() {
     };
     // `def self.adapter=(value); @adapter = value; end`.
     let writer = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("adapter="),
         receiver: MethodReceiver::Class,
@@ -232,6 +236,8 @@ fn module_singleton_does_not_fire_on_plain_class() {
         args: vec![],
     };
     let reader = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("adapter"),
         receiver: MethodReceiver::Instance,
@@ -314,6 +320,8 @@ fn raise_panic_peephole() {
         },
     );
     let fail_method = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("fail!"),
         receiver: MethodReceiver::Instance,
@@ -352,6 +360,8 @@ fn raise_panic_peephole() {
         },
     );
     let abort_method = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("abort_with"),
         receiver: MethodReceiver::Instance,
@@ -458,6 +468,8 @@ fn time_now_utc_iso8601_peephole() {
         },
     );
     let stamp = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("stamp"),
         receiver: MethodReceiver::Instance,
@@ -536,6 +548,8 @@ fn include_array_recv_routes_to_slices_contains() {
         },
     );
     let probe = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("has_col?"),
         receiver: MethodReceiver::Instance,
@@ -612,6 +626,8 @@ fn negative_index_rewrites_to_len_minus_n() {
         },
     );
     let last_method = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("tail"),
         receiver: MethodReceiver::Instance,
@@ -706,6 +722,8 @@ fn class_reflection_rewrites() {
         },
     );
     let lookup_cols = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("lookup_cols"),
         receiver: MethodReceiver::Instance,
@@ -741,6 +759,8 @@ fn class_reflection_rewrites() {
         },
     );
     let lookup_name = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("lookup_name"),
         receiver: MethodReceiver::Instance,
@@ -775,6 +795,8 @@ fn class_reflection_rewrites() {
         },
     );
     let diag = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("diag"),
         receiver: MethodReceiver::Class,
@@ -847,6 +869,8 @@ fn class_reflection_rewrites() {
 fn bare_new_in_class_method_resolves_to_constructor() {
     // `def self.create(attrs); new(attrs); end`
     let create = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("create"),
         receiver: MethodReceiver::Class,
@@ -923,6 +947,8 @@ fn bare_new_in_class_method_resolves_to_constructor() {
 #[test]
 fn implicit_self_method_call_resolution() {
     let status_reader = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("status"),
         receiver: MethodReceiver::Instance,
@@ -947,6 +973,8 @@ fn implicit_self_method_call_resolution() {
     // `def notify; end` — no-op real method. Becomes
     // `func (self *Worker) notify() {}` in emit.
     let notify = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("notify"),
         receiver: MethodReceiver::Instance,
@@ -1000,6 +1028,8 @@ fn implicit_self_method_call_resolution() {
         ExprNode::Var { id: VarId(0), name: Symbol::from("s") },
     );
     let tick = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("tick"),
         receiver: MethodReceiver::Instance,
@@ -1100,6 +1130,8 @@ fn each_array_block_shape() {
         },
     );
     let method = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("traverse"),
         receiver: MethodReceiver::Instance,
@@ -1182,6 +1214,8 @@ fn each_hash_block_shape() {
         },
     );
     let method = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("traverse"),
         receiver: MethodReceiver::Instance,
@@ -1261,6 +1295,8 @@ fn map_array_block_shape() {
         },
     );
     let method = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("doubled"),
         receiver: MethodReceiver::Instance,
@@ -1335,6 +1371,8 @@ fn map_array_block_shape() {
 #[test]
 fn empty_body_with_nonvoid_return_synthesizes_zero_value() {
     let make_method = |name: &str, body: Expr, ret: Ty| MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from(name),
         receiver: MethodReceiver::Instance,
@@ -1442,6 +1480,8 @@ fn typed_empty_literals_back_propagate() {
     // signature returns `Array[String]`. The literal's `.ty` carries
     // the elem; emit must produce `[]string{}` (not `[]interface{}{}`).
     let errors = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("errors"),
         receiver: MethodReceiver::Instance,
@@ -1463,6 +1503,8 @@ fn typed_empty_literals_back_propagate() {
     // `def lookup; {}; end` — same shape for Hash, against return
     // `Hash[String, String]`. Emit must produce `map[string]string{}`.
     let lookup = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("lookup"),
         receiver: MethodReceiver::Instance,
@@ -1754,6 +1796,8 @@ fn nil_check_to_comma_ok_rewrites_pair() {
     let body_seq = Expr::new(span, ExprNode::Seq { exprs: vec![assign, if_expr] });
 
     let method = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("f"),
         receiver: MethodReceiver::Instance,
@@ -1843,6 +1887,8 @@ fn nil_check_to_comma_ok_skips_non_hash_receiver() {
     let body_seq = Expr::new(span, ExprNode::Seq { exprs: vec![assign, if_expr] });
 
     let method = MethodDef {
+        unsupported_formals: None,
+        has_anonymous_block: false,
         name_span: roundhouse::span::Span::synthetic(),
         name: Symbol::from("f"),
         receiver: MethodReceiver::Instance,

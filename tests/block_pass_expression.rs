@@ -96,3 +96,34 @@ end
     let result = std::process::Command::new("ruby").args(["-e", &script]).output().unwrap();
     assert!(result.status.success(), "{}\n{script}", String::from_utf8_lossy(&result.stderr));
 }
+
+#[test]
+fn native_projects_reject_arbitrary_forwarded_procs_before_emission() {
+    use roundhouse::diagnostic::Severity;
+    use roundhouse::emit::diagnostics::scope;
+    use roundhouse::project::{BuildTarget, target_files};
+
+    for (path, source) in [
+        ("db/seeds.rb", "[1, 2].map(&@callback)\n[1, 2].map(&compute(3))\n"),
+        ("app/helpers/filter.rb", "class Filter\n  def run\n    [1, 2].map(&@callback)\n    [1, 2].map(&compute(3))\n  end\nend\n"),
+        ("app/views/articles/index.html.erb", "<%= [1, 2].map(&@callback) %><%= [1, 2].map(&compute(3)) %>"),
+        ("test/models/article_test.rb", "class ArticleTest < ActiveSupport::TestCase\n  test \"forwarding\" do\n    [1, 2].map(&@callback)\n    [1, 2].map(&compute(3))\n  end\nend\n"),
+    ] {
+        let tree = [
+            ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+            (path, source),
+        ].into_iter().map(|(p, s)| (PathBuf::from(p), s.as_bytes().to_vec())).collect();
+        let app = ingest_app_from_tree(tree).expect("forwarding source must ingest");
+        for target in [BuildTarget::Rust, BuildTarget::Crystal, BuildTarget::Go,
+            BuildTarget::Python, BuildTarget::Kotlin, BuildTarget::Swift, BuildTarget::Elixir] {
+            let (result, diagnostics) = scope(|| target_files(&app, std::path::Path::new("not-a-fixture"), target));
+            assert!(result.is_err(), "{} must reject {path} before generating incorrect code", target.as_str());
+            assert_eq!(diagnostics.len(), 2, "{target:?}: {diagnostics:?}");
+            for diagnostic in diagnostics {
+                assert_eq!(diagnostic.severity, Severity::Error);
+                assert!(diagnostic.message.contains("forwarded_proc"), "{diagnostic:?}");
+                assert!(!diagnostic.span.is_synthetic(), "forwarding must retain its source location");
+            }
+        }
+    }
+}

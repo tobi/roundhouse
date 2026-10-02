@@ -57,8 +57,9 @@ fn sorbet_generics_and_boolean_in_a_comment_signature_are_the_types_they_name() 
     []
   end
 
-  def use
-    totals([], {}, true).size.bogus_from_return
+  #: (T::Array[Line], T::Hash[Symbol, Line], T::Boolean) -> void
+  def use(lines, by_key, flag)
+    totals(lines, by_key, flag).size.bogus_from_return
   end
 end
 "#,

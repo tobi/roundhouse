@@ -56,7 +56,7 @@ pub fn ingest_sorbet_declarations(
         None,
         false,
         &HashMap::new(),
-        &[],
+        &HashMap::new(),
         &mut out,
         &mut abstracts,
         &mut sides,
@@ -94,7 +94,7 @@ fn walk(
     scope: Option<&str>,
     in_singleton_class: bool,
     aliases: &HashMap<String, Ty>,
-    rbs_aliases: &[(String, String)],
+    rbs_aliases: &crate::rbs::AliasTable,
     out: &mut HashMap<ClassId, HashMap<Symbol, Ty>>,
     abstracts: &mut HashMap<ClassId, std::collections::HashSet<Symbol>>,
     sides: &mut MethodSides,
@@ -845,7 +845,8 @@ fn named_ty(name: &str) -> Ty {
         "Symbol" => Ty::Sym,
         "TrueClass" | "FalseClass" => Ty::Bool,
         "NilClass" => Ty::Nil,
-        "Time" | "Date" | "DateTime" | "ActiveSupport::TimeWithZone" => Ty::Time,
+        "Date" => Ty::Date,
+        "Time" | "DateTime" | "ActiveSupport::TimeWithZone" => Ty::Time,
         _ => Ty::Class { id: ClassId(Symbol::new(name)), args: Vec::new() },
     }
 }
@@ -874,20 +875,19 @@ fn rbs_comment_signature(
     source: &[u8],
     def: &ruby_prism::DefNode<'_>,
     in_singleton_class: bool,
-    rbs_aliases: &[(String, String)],
+    rbs_aliases: &crate::rbs::AliasTable,
 ) -> Option<Ty> {
     let text = rbs_comment_text(source, def.location().start_offset())?;
     // A `#: type name = ...` comment is a declaration, not a signature.
     if text.starts_with("type ") {
         return None;
     }
-    let declarations = referenced_alias_declarations(&text, rbs_aliases);
-    let wrapped = format!("class X\n{declarations}  def m: {text}\nend\n");
-    let sigs = crate::rbs::parse_signatures(&wrapped).ok()?;
+    let receiver = if in_singleton_class || def.receiver().is_some() { "self." } else { "" };
+    let wrapped = format!("class X\n  def {receiver}m: {text}\nend\n");
+    let sigs = crate::rbs::parse_signatures_with_aliases(&wrapped, rbs_aliases).ok()?;
     let Ty::Fn { params: declared, block, ret, effects } = sigs.methods.into_iter().next()?.1 else {
         return None;
     };
-    let _ = in_singleton_class;
     let (declared_block, declared): (Vec<Param>, Vec<Param>) =
         declared.into_iter().partition(|p| matches!(p.kind, ParamKind::Block));
     let def_params = match def.parameters() {
@@ -905,16 +905,29 @@ fn rbs_comment_signature(
     if def_params.len() != declared.len() {
         return None;
     }
+    let mut declared: Vec<Option<Param>> = declared.into_iter().map(Some).collect();
+    let mut next_positional = 0;
     let mut params = Vec::new();
-    for ((name, kind), decl) in def_params.into_iter().zip(declared) {
+    for (name, kind) in def_params {
+        let index = if matches!(kind, ParamKind::Keyword { .. }) {
+            declared.iter().position(|candidate| candidate.as_ref().is_some_and(|param| {
+                matches!(param.kind, ParamKind::Keyword { .. }) && param.name.as_str() == name
+            }))?
+        } else {
+            let index = (next_positional..declared.len()).find(|&index| {
+                declared[index].as_ref().is_some_and(|param| !matches!(param.kind, ParamKind::Keyword { .. }))
+            })?;
+            next_positional = index + 1;
+            index
+        };
+        let decl = declared[index].take()?;
         if *kind != decl.kind {
             return None;
         }
-        // Keywords are named by the RBS itself; they must agree.
-        if matches!(kind, ParamKind::Keyword { .. }) && decl.name.as_str() != name {
-            return None;
-        }
         params.push(Param { name: Symbol::new(name), ty: decl.ty, kind: kind.clone() });
+    }
+    if declared.into_iter().any(|param| param.is_some()) {
+        return None;
     }
     if let Some((name, _)) = def_block {
         let ty = declared_block.into_iter().next().map(|p| p.ty).unwrap_or(Ty::Untyped);
@@ -929,17 +942,17 @@ fn rbs_comment_signature(
 ///
 /// Sorbet's RBS comments spell a type alias as a comment in the body
 /// (`#: type object_type = ::User`, continued with `#|`) and refer to
-/// it by name from any signature below. The text is kept as written and
-/// handed to the RBS reader with the signature, which is what knows
-/// how to read it. Nested class and module bodies are skipped: an alias
+/// it by name from any signature below. Resolve each scope before walking
+/// nested bodies so an inherited alias keeps its original dependencies
+/// even when a child shadows one. Nested class and module bodies are skipped: an alias
 /// declared there is not visible here.
 fn scoped_rbs_aliases(
     source: &[u8],
     body: ruby_prism::Location<'_>,
     statements: &[Node<'_>],
-    outer: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = outer.to_vec();
+    outer: &crate::rbs::AliasTable,
+) -> crate::rbs::AliasTable {
+    let mut out = outer.clone();
     let Ok(text) = std::str::from_utf8(source) else { return out };
     let nested: Vec<(usize, usize)> = statements
         .iter()
@@ -971,6 +984,7 @@ fn scoped_rbs_aliases(
         }
     }
     declarations.extend(current);
+    let mut local: Vec<(String, String)> = Vec::new();
     for declaration in declarations {
         let name: String = declaration["type ".len()..]
             .trim_start()
@@ -980,38 +994,17 @@ fn scoped_rbs_aliases(
         if name.is_empty() {
             continue;
         }
-        out.retain(|(existing, _)| *existing != name);
-        out.push((name, declaration));
+        out.remove(&name);
+        local.retain(|(existing, _)| *existing != name);
+        local.push((name, declaration));
     }
-    out
-}
-
-/// The alias declarations `text` needs, as RBS lines for the wrapper
-/// class: the ones it names, and the ones those name in turn. Only
-/// those, so an alias this reader cannot parse cannot take down a
-/// signature that never mentions it.
-fn referenced_alias_declarations(text: &str, aliases: &[(String, String)]) -> String {
-    let mut needed: Vec<usize> = Vec::new();
-    let mut frontier: Vec<&str> = vec![text];
-    while let Some(haystack) = frontier.pop() {
-        for (index, (name, declaration)) in aliases.iter().enumerate() {
-            if !needed.contains(&index) && mentions_word(haystack, name) {
-                needed.push(index);
-                frontier.push(declaration);
-            }
-        }
-    }
-    needed.sort_unstable();
-    needed.iter().map(|i| format!("  {}\n", aliases[*i].1)).collect()
-}
-
-fn mentions_word(haystack: &str, word: &str) -> bool {
-    haystack.match_indices(word).any(|(at, _)| {
-        let before = haystack[..at].chars().next_back();
-        let after = haystack[at + word.len()..].chars().next();
-        let is_word = |c: char| c.is_alphanumeric() || c == '_';
-        !before.is_some_and(is_word) && !after.is_some_and(is_word)
-    })
+    // Parse independently: a malformed unused declaration must not discard
+    // valid aliases or signatures elsewhere in the same body.
+    let parsed: Vec<_> = local.iter()
+        .filter_map(|(_, declaration)| ruby_rbs::node::parse(declaration).ok())
+        .collect();
+    let members: Vec<_> = parsed.iter().flat_map(|s| s.declarations().iter()).collect();
+    crate::rbs::resolve_aliases(&members, None, &out)
 }
 
 /// The signature text of the `#:` / `#|` comment lines directly above

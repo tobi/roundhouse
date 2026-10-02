@@ -77,7 +77,10 @@ fn line_containing(src: &str, needle: &str) -> String {
 fn the_enum_columns_writers_map_the_label() {
     let src = user_src();
     for (site, needle) in [
-        ("update", "self.role = ActiveRecord.enum_int((attrs[:role]).to_s,"),
+        (
+            "update",
+            "self.role = ActiveRecord.enum_int((attrs[:role]).to_s,",
+        ),
         ("[]=", "@role = ActiveRecord.enum_int((value).to_s,"),
     ] {
         assert!(

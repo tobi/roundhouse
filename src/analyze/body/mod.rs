@@ -396,13 +396,13 @@ impl<'a> BodyTyper<'a> {
                             unknown()
                         }
                     }
-                    Some(Some(ResolvedConstant::Value { id, name, builtin_float })) => {
-                        // Value reads move with Concern methods, too. Keep
-                        // their resolved namespace while preserving aliases.
-                        qualify_resolved_path(path, name);
-                        self.typed_constants.and_then(|values| values.get(id)).cloned()
-                            .unwrap_or_else(|| if *builtin_float { Ty::Float } else { unknown() })
-                    }
+                    Some(Some(ResolvedConstant::Value { declaration, name, runtime })) => {
+    // Concern splices retain the resolved value owner as well as its type.
+    qualify_resolved_path(path, name);
+    self.typed_constants.and_then(|values| values.get(declaration)).cloned()
+        .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()))
+        .unwrap_or_else(unknown)
+}
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
                     Some(None) => exact_modeled_class(path),
@@ -1092,7 +1092,13 @@ impl<'a> BodyTyper<'a> {
                 {
                     return t;
                 }
-                let answered = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
+let answered = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
+// Application overrides win before Kernel.Array's container fallback.
+if recv.is_none() && method.as_str() == "Array" && args.len() == 1
+    && block.is_none() && matches!(answered, Ty::Var { .. })
+{
+    return Ty::Array { elem: Box::new(unknown()) };
+}
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only, like
                 // the gradual escape below.
@@ -1705,7 +1711,9 @@ impl<'a> BodyTyper<'a> {
                 Ty::Bottom
             }
 
-            ExprNode::Splat { value } => {
+            ExprNode::ForwardArgs => Ty::Untyped,
+
+            ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
                 // Splat propagates the inner expression's type
                 // unchanged; the splat itself is a structural marker
                 // for the surrounding Send/Array, not a transform.
@@ -2235,6 +2243,29 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn kernel_array_does_not_capture_inherited_or_included_app_methods() {
+        let owner = ClassId(Symbol::from("Owner"));
+        let child = ClassId(Symbol::from("Child"));
+        for included in [false, true] {
+            let mut classes = empty_classes();
+            let mut info = ClassInfo::default();
+            info.instance_methods.insert(Symbol::from("Array"), Ty::Str);
+            classes.insert(owner.clone(), info);
+            let mut info = ClassInfo::default();
+            if included {
+                info.includes.push(owner.clone());
+            } else {
+                info.parent = Some(owner.clone());
+            }
+            classes.insert(child.clone(), info);
+            let mut ctx = Ctx::default();
+            ctx.self_ty = Some(Ty::Class { id: child.clone(), args: vec![] });
+            let mut expr = send(None, "Array", vec![nil_lit()]);
+            assert_eq!(BodyTyper::new(&classes).analyze_expr(&mut expr, &ctx), Ty::Str);
+        }
+    }
 
     #[test]
     fn if_nil_narrows_variable_to_nil_in_then_branch() {
@@ -3308,6 +3339,40 @@ mod tests {
         };
         assert_eq!(spines, 1, "hash spines must merge, got {via_nil_first:?}");
     }
+
+    #[test]
+    fn concrete_value_shapes_are_truthy_for_boolean_operators() {
+        let values = [
+            Ty::Date,
+            Ty::Tuple { elems: vec![Ty::Int] },
+            Ty::Record { row: Row::default() },
+            Ty::Fn {
+                params: Vec::new(), block: None, ret: Box::new(Ty::Str),
+                effects: crate::effect::EffectSet::pure(),
+            },
+        ];
+        for left in values {
+            assert!(never_falsy(&left), "{left:?} must short-circuit `||`");
+            assert_eq!(falsy_part(&left), None, "{left:?} must yield the right arm of `&&`");
+        }
+    }
+
+    #[test]
+    fn nil_arms_of_concrete_value_unions_remain_falsy() {
+        for truthy in [
+            Ty::Date,
+            Ty::Tuple { elems: vec![Ty::Int] },
+            Ty::Record { row: Row::default() },
+            Ty::Fn {
+                params: Vec::new(), block: None, ret: Box::new(Ty::Str),
+                effects: crate::effect::EffectSet::pure(),
+            },
+        ] {
+            let left = Ty::Union { variants: vec![truthy, Ty::Nil] };
+            assert!(!never_falsy(&left), "{left:?} must not always short-circuit `||`");
+            assert_eq!(falsy_part(&left), Some(Ty::Nil), "{left:?} must retain nil for `&&`");
+        }
+    }
 }
 
 /// The arms of `ty` a falsy value can come from -- `nil`, `false`, and
@@ -3343,11 +3408,15 @@ fn never_falsy(ty: &Ty) -> bool {
         | Ty::Float
         | Ty::Str
         | Ty::Sym
+        | Ty::Date
         | Ty::Time
         | Ty::Array { .. }
         | Ty::Hash { .. }
+        | Ty::Tuple { .. }
+        | Ty::Record { .. }
         | Ty::Relation { .. }
-        | Ty::Class { .. } => true,
+        | Ty::Class { .. }
+        | Ty::Fn { .. } => true,
         // `Bool` is the whole point of the exclusion — it is the one
         // scalar that carries `false`.
         Ty::Union { variants } => variants.iter().all(never_falsy),
