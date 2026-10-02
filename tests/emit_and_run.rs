@@ -5914,3 +5914,17 @@ raise "nested members changed" unless ContainerNarrowingProbe.nested_members == 
 "#)
         .assert_passes();
 }
+
+#[path = "support/rails_root_join.rs"]
+mod rails_root_join;
+
+/// `Pathname#join` takes any number of parts, and an app writes
+/// `Rails.root.join("source", "posts")` as often as the one-part form.
+/// `check` is clean on the call, so the emitted `Rails::AppPath#join`
+/// must accept every part, or none, and join them like Pathname does.
+#[test]
+fn rails_root_join_takes_any_number_of_parts() {
+    let run = rails_root_join::overlay().run_ruby(rails_root_join::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("Rails.root.join contract passed"));
+}
