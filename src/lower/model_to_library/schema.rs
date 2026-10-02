@@ -50,9 +50,6 @@ pub(super) fn push_schema_methods(
     let mut demanded: Option<std::collections::HashSet<Symbol>> = None;
     for col in &table.columns {
         methods.push(synth_attr_reader(owner, col, model));
-        if model.enums.contains_key(&col.name) {
-            methods.push(synth_before_type_cast(owner, col));
-        }
         if is_temporal_col(col) {
             methods.push(synth_raw_reader(owner, col));
             // Rails-parity Time-accepting writer (lobsters' ban flow:
@@ -899,25 +896,6 @@ fn json_dump_value(col: &Column, value: Expr) -> Expr {
         ),
         super::ty_of_column_slot(col),
     )
-}
-
-// Not the assigned input: Rails answers the label an unsaved write was given, but a saved or loaded record answers the stored value, which is what this holds.
-fn synth_before_type_cast(owner: &ClassId, col: &Column) -> MethodDef {
-    let slot = super::ty_of_column_slot(col);
-    MethodDef {
-        name_span: crate::span::Span::synthetic(),
-        name: Symbol::from(format!("{}_before_type_cast", col.name.as_str())),
-        receiver: MethodReceiver::Instance,
-        params: Vec::new(),
-        body: with_ty(Expr::new(Span::synthetic(), ExprNode::Ivar { name: col_storage_name(col) }), slot.clone()),
-        signature: Some(fn_sig(vec![], slot)),
-        effects: EffectSet::default(),
-        enclosing_class: Some(owner.0.clone()),
-        kind: AccessorKind::Method,
-        is_async: false,
-        mutates_self: false,
-        block_param: None,
-    }
 }
 
 /// True for a Date/DateTime/Time column — a stored-text column whose
