@@ -1,4 +1,5 @@
-//! Load-hook mixin installation is a reported gap, not Markdown support.
+//! Known literal load-hook mixins are carried; unsupported hooks and
+//! dynamic includes remain reported gaps. This does not model Markdown DSLs.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ fn tree(hooks: &str) -> HashMap<PathBuf, Vec<u8>> {
 }
 
 #[test]
-fn direct_includes_name_the_hook_and_source_without_installing_anything() {
+fn direct_includes_report_only_uncarried_hook_shapes() {
     // First hook is Writebook's installer, verbatim. Later hooks prove
     // that a literal-name-only recognizer cannot silently skip other shapes.
     let files = tree(
@@ -42,9 +43,8 @@ end
     let gaps = survey::drain();
     let mut surveyed = result.expect("survey ingest");
     let messages: Vec<_> = gaps.iter().map(ToString::to_string).collect();
-    assert_eq!(messages.len(), 3, "one gap per include: {messages:?}");
+    assert_eq!(messages.len(), 2, "one gap per uncarried include: {messages:?}");
     for (hook, include) in [
-        ("active_record", "include ActionText::HasMarkdown"),
         ("action_text_markdown", "include First, Second"),
         (
             "action_text_markdown",
@@ -63,6 +63,9 @@ end
         );
     }
     assert_eq!(surveyed, strict, "reporting must not change ingested IR");
+    assert!(surveyed.library_classes.iter().any(|class|
+        class.name.0.as_str() == "ActiveRecord::Base"
+            && class.includes.iter().any(|id| id.0.as_str() == "ActionText::HasMarkdown")));
     let page = surveyed
         .models
         .iter()
@@ -170,8 +173,8 @@ fn binary_encoded_source_uses_original_byte_locations_before_lossy_display() {
     let surveyed = result.expect("survey binary-source ingest");
     assert_eq!(surveyed, strict, "a ledger cannot change binary-source IR");
     let messages: Vec<_> = gaps.iter().map(ToString::to_string).collect();
-    assert_eq!(messages.len(), 2, "{messages:?}");
-    for (message, declaration) in messages.iter().zip(["include First", "include \"�\""]) {
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    for (message, declaration) in messages.iter().zip(["include \"�\""]) {
         assert!(message.contains(&format!("`{declaration}`")), "{message}");
         assert!(message.contains("on_load(:active_record)"), "{message}");
         assert!(message.contains("lib/rails_ext/hooks.rb"), "{message}");
@@ -179,7 +182,7 @@ fn binary_encoded_source_uses_original_byte_locations_before_lossy_display() {
 }
 
 #[test]
-fn emitted_app_does_not_gain_methods_from_a_dropped_installer_or_string_class_eval() {
+fn emitted_app_carries_the_literal_mixin_without_inventing_markdown_methods() {
     // This is a negative execution check. The provider is a minimal
     // string-eval macro, not a replacement implementation of Writebook.
     let run = emit_and_run::real_blog()
@@ -206,7 +209,7 @@ page = Page.new
   raise "invented Markdown method #{name}" if page.respond_to?(name, true)
 end
 [page, Article.new].each do |owner|
-  raise "dropped hook installed mixin on #{owner.class}" if owner.respond_to?(:markdown_installer_marker, true)
+  raise "literal hook lost mixin on #{owner.class}" unless owner.markdown_installer_marker == 37
 end
 [:with_markdown_body, :with_markdown_body_and_embeds].each do |name|
   raise "invented preload scope #{name}" if Page.respond_to?(name, true)
