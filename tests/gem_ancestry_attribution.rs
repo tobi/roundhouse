@@ -64,32 +64,33 @@ fn failed_call(receiver: Ty, method: &str) -> Diagnostic {
 
 #[test]
 fn inherited_alba_call_is_attributed_without_claiming_typed_support() {
-    // The bounded declaration contract now models to_h, not serialize. Keep
-    // a real source consumer of an unmodeled method to test attribution.
     let mut app = app_with_consumer(
-        "class ApplicationResource\n  include Alba::Resource\nend\nclass ArticleResource < ApplicationResource\n  attributes :id, :title\nend\n",
+        "module SerializerBridge\n  include Alba::Resource\n  def local_helper; 1; end\nend\nclass ApplicationResource\n  include SerializerBridge\nend\nclass ArticleResource < ApplicationResource\nend\n",
         Some(ALBA_LOCK),
-        "class ArticlesController < ApplicationController\n  def show\n    render json: {article: ArticleResource.new(Article.find(params[:id])).serialize}\n  end\nend\n",
+        "class ArticlesController < ApplicationController\n  def show\n    render json: {article: ArticleResource.new(Article.find(params[:id])).unmodeled_serializer_probe}\n  end\nend\n",
     );
     Analyzer::new(&app).analyze(&mut app);
     let before = app.clone();
     let raw = diagnose(&app);
-    let index = raw
-        .iter()
-        .position(|d| {
-            matches!(&d.kind,
-                DiagnosticKind::SendDispatchFailed { method, recv_ty }
-                    if method.as_str() == "serialize" && *recv_ty == class("ArticleResource")
-            )
-        })
-        .expect("raw analysis must still fail to resolve serialize");
-    assert_eq!(raw[index].severity, Severity::Error);
+    // A retained local bridge exercises transitive gem ancestry, while the
+    // synthetic method remains unresolved by ordinary dispatch analysis.
+    let index = raw.iter().position(|d| matches!(&d.kind,
+        DiagnosticKind::SendDispatchFailed { method, recv_ty }
+        if method.as_str() == "unmodeled_serializer_probe" && *recv_ty == class("ArticleResource")
+    )).expect(&format!("unresolved source call: {raw:?}"));
     let mut attributed = raw.clone();
+    let original = attributed[index].clone();
+    assert_eq!(original.severity, Severity::Error);
+    assert!(!original.span.is_synthetic());
+    let source = &app.sources[original.span.file.0 as usize - 1];
+    assert!(source.path.ends_with("articles_controller.rb"));
+    assert!(source.text[original.span.start as usize..original.span.end as usize]
+        .contains("unmodeled_serializer_probe"));
     attribute_unknown_gems(&mut attributed, &app);
     let note = &attributed[index];
     assert_eq!(note.severity, Severity::Info, "{}", note.message);
-    assert_eq!(note.span, raw[index].span);
-    assert_eq!(note.kind, raw[index].kind);
+    assert_eq!(note.span, original.span);
+    assert_eq!(note.kind, original.kind);
     assert!(note.message.contains("the `alba` gem"), "{}", note.message);
     assert!(note.message.contains("Alba::Resource"), "{}", note.message);
     assert!(
@@ -103,7 +104,7 @@ fn inherited_alba_call_is_attributed_without_claiming_typed_support() {
         note.message
     );
     assert_eq!(app, before, "attribution must not change types or IR");
-    assert_eq!(diagnose(&app), raw, "raw analysis is still unsupported");
+    assert_eq!(diagnose(&app), raw, "attribution leaves raw analysis unchanged");
     let once = attributed.clone();
     attribute_unknown_gems(&mut attributed, &app);
     assert_eq!(attributed, once, "attribution is idempotent");
