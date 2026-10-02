@@ -448,15 +448,20 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // exist — the target's string/builder is whatever it is — so
             // unary `+@` on a string literal is the identity: lower to
             // the literal. The ruby-family trees ship their runtime
-            // sources verbatim (never through this path), so the idiom
-            // survives where it matters.
+            // sources verbatim (never through this path), but an APP's
+            // models and services do come through it, and on spinel a
+            // bare literal is frozen: `buf = ""; buf << x` raises
+            // FrozenError. So the literal carries the hint, and the
+            // ruby emitter writes the `+` back.
             if method == "+@" && args.is_empty() && block.is_none() {
                 if let Some(r) = &recv {
                     if matches!(
                         &*r.node,
                         ExprNode::Lit { value: Literal::Str { .. } }
                     ) {
-                        return Ok(recv.unwrap());
+                        let mut lit = recv.unwrap();
+                        lit.hint = Some(crate::expr::IrHint::MutableStringLiteral);
+                        return Ok(lit);
                     }
                 }
             }

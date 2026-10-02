@@ -69,6 +69,30 @@ raise "keyed pattern accepted a missing key" if HashPatternProbe.key_match({ y: 
         .assert_passes();
 }
 
+/// A test class that a `module` wraps is emitted and runs. Ingest used
+/// to read only the top-level classes of a test file. It lost this
+/// class, and `check` reported nothing. The emit names the file after
+/// the full class name, as it does for `class Models::ArticleTest`.
+#[test]
+fn a_test_class_inside_a_module_runs() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/models_article_test.rb",
+            r#"require "test_helper"
+
+module Models
+  class ArticleTest < ActiveSupport::TestCase
+    test "reads a fixture" do
+      assert_equal "Getting Started with Rails", articles(:one).title
+    end
+  end
+end
+"#,
+        )
+        .run_test("test/models/models_article_test.rb")
+        .assert_passes();
+}
+
 /// Alba's inherited declarations are executable property reads, not just a
 /// return-type assertion. Boot loads the generated classes without Alba.
 #[test]
@@ -2164,5 +2188,78 @@ locator = KeywordLocator.new
 raise "keyword bound to hash" unless locator.locate("host") == "host@192.0.2.1"
 raise "positional hash rewritten" unless locator.merged("host") == 'host{opts: 1}'
 "#)
+        .assert_passes();
+}
+
+/// Not `module ApplicationController`, which cannot load beside the controller's own `class ApplicationController`: a class nested in a controller reopens the controller as a class.
+#[test]
+fn a_class_nested_in_a_controller_loads() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n",
+            "class ApplicationController < ActionController::Base\n  class Failure < StandardError\n    attr_reader :status\n\n    def initialize(status)\n      @status = status\n      super(\"failed with #{status}\")\n    end\n  end\n\n",
+        )
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "class ArticlesController < ApplicationController\n",
+            "class ArticlesController < ApplicationController\n  class Missing < StandardError\n  end\n\n",
+        )
+        .write(
+            "test/models/article_nested_class_test.rb",
+            r#"require "test_helper"
+
+class ArticleNestedClassTest < ActiveSupport::TestCase
+  test "a class nested in a controller is the one the source declared" do
+    failure = ApplicationController::Failure.new(404)
+    assert_equal 404, failure.status
+    assert_equal "failed with 404", failure.message
+    assert_kind_of StandardError, ArticlesController::Missing.new
+    assert ArticlesController < ApplicationController
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_nested_class_test.rb")
+        .assert_passes();
+}
+
+
+
+/// Not `out = ""`, a literal spinel freezes: `+""` stays an unfrozen copy that the method can append to.
+#[test]
+fn a_mutable_string_literal_stays_mutable() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r##"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+
+  def initials
+    out = +""
+    title.split.each { |word| out << word[0] }
+    out
+  end
+
+  def hashtag
+    tag = +"#"
+    tag << title.downcase.delete(" ")
+  end"##,
+        )
+        .write(
+            "test/models/article_mutable_literal_test.rb",
+            r##"require "test_helper"
+
+class ArticleMutableLiteralTest < ActiveSupport::TestCase
+  test "an unfrozen copy of a literal can be appended to" do
+    article = Article.new(title: "Hello World")
+    assert_equal "HW", article.initials
+    assert_equal "#helloworld", article.hashtag
+  end
+end
+"##,
+        )
+        .run_test_frozen("test/models/article_mutable_literal_test.rb")
         .assert_passes();
 }

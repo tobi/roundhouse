@@ -45,7 +45,27 @@ pub fn emit_expr(e: &Expr) -> String {
         return crate::emit::diagnostics::StubStyle::Raise
             .render(&crate::diagnostic::Diagnostic::stub_text(kind));
     }
+    if is_mutable_string_literal(e) {
+        return format!("+{}", emit_node(&e.node));
+    }
     emit_node(&e.node)
+}
+
+/// A string literal ingested from `+"literal"`. Written back with its
+/// `+`: spinel freezes a bare literal, and the source made this copy
+/// because it mutates it.
+fn is_mutable_string_literal(e: &Expr) -> bool {
+    e.hint == Some(crate::expr::IrHint::MutableStringLiteral)
+        && matches!(&*e.node, ExprNode::Lit { value: Literal::Str { .. } })
+}
+
+/// A receiver that a postfix form (`[i]`, `.attr = v`, `.method(:m)`)
+/// follows directly. `+"a"[0]` is `+("a"[0])`: unary `+` binds looser
+/// than both, so a `+"literal"` there keeps parentheses. The general
+/// call path makes the same call through `recv_needs_parens`.
+fn emit_postfix_recv(r: &Expr) -> String {
+    let s = emit_expr(r);
+    if is_mutable_string_literal(r) { format!("({s})") } else { s }
 }
 
 /// True when an If's else-branch carries no statements: an empty `Seq`
@@ -113,7 +133,7 @@ fn emit_node(n: &ExprNode) -> String {
         // (`&method(:name)`), `emit_do_block`'s non-Lambda fallback
         // re-attaches this as `&` — see its doc comment.
         ExprNode::MethodRef { recv, name } => match recv {
-            Some(r) => format!("{}.method(:{name})", emit_expr(r)),
+            Some(r) => format!("{}.method(:{name})", emit_postfix_recv(r)),
             None => format!("method(:{name})"),
         },
         ExprNode::Apply { fun, args, block } => {
@@ -851,6 +871,10 @@ fn is_multi_seq(e: &Expr) -> bool {
 }
 
 fn recv_needs_parens(r: &Expr) -> bool {
+    // `+"a".freeze` is `+("a".freeze)`: unary `+` binds looser than `.`.
+    if is_mutable_string_literal(r) {
+        return true;
+    }
     match &*r.node {
         ExprNode::Seq { exprs } if exprs.len() > 1 => true,
         ExprNode::BoolOp { .. } | ExprNode::Range { .. } | ExprNode::RescueModifier { .. } => true,
@@ -989,12 +1013,12 @@ pub(super) fn emit_send_base(
     // `[]=`, not valid Ruby in those positions).
     if m == "[]" && !args_s.is_empty() {
         if let Some(r) = recv {
-            return format!("{}[{}]", emit_expr(r), args_s.join(", "));
+            return format!("{}[{}]", emit_postfix_recv(r), args_s.join(", "));
         }
     }
     if m == "[]=" && args_s.len() == 2 {
         if let Some(r) = recv {
-            return format!("{}[{}] = {}", emit_expr(r), args_s[0], args_s[1]);
+            return format!("{}[{}] = {}", emit_postfix_recv(r), args_s[0], args_s[1]);
         }
     }
     // Unary `!` Send (`Send { recv: cond, method: "!", args: [] }`)
@@ -1063,7 +1087,7 @@ pub(super) fn emit_send_base(
         return format!("{method} {}", args_s.join(", "));
     }
     match (recv, m) {
-        (Some(r), "[]") => format!("{}[{}]", emit_expr(r), args_s.join(", ")),
+        (Some(r), "[]") => format!("{}[{}]", emit_postfix_recv(r), args_s.join(", ")),
         // Binary operator methods (`@x == 0`, `a + b`) round-trip as
         // infix syntax — Ruby parses them as `Send` with method names
         // like `==`, `+`, etc., but emitting `recv.== 0` is technically
@@ -1101,7 +1125,7 @@ pub(super) fn emit_send_base(
         // surface form is `recv.attr = value`, not `recv.attr= value`.
         (Some(r), name) if is_setter_method(name) && args_s.len() == 1 => {
             let attr = &name[..name.len() - 1];
-            format!("{}.{attr} = {}", emit_expr(r), args_s[0])
+            format!("{}.{attr} = {}", emit_postfix_recv(r), args_s[0])
         }
         (None, _) => {
             if args_s.is_empty() {
@@ -1375,7 +1399,7 @@ fn emit_lvalue(lv: &LValue) -> String {
     match lv {
         LValue::Var { name, .. } => name.to_string(),
         LValue::Ivar { name } => format!("@{name}"),
-        LValue::Attr { recv, name } => format!("{}.{name}", emit_expr(recv)),
+        LValue::Attr { recv, name } => format!("{}.{name}", emit_postfix_recv(recv)),
         LValue::Index { recv, index } => {
             // Index-write target (`h[:x] = …`): coerce the key when writing
             // to a string-keyed hash, same as the read path above.
@@ -1384,7 +1408,7 @@ fn emit_lvalue(lv: &LValue) -> String {
             } else {
                 emit_expr(index)
             };
-            format!("{}[{}]", emit_expr(recv), key)
+            format!("{}[{}]", emit_postfix_recv(recv), key)
         }
         LValue::Const { path } => path.iter().map(|s| s.as_str().to_string()).collect::<Vec<_>>().join("::"),
     }
@@ -1795,5 +1819,31 @@ mod tests {
         // chain needs no parens regardless of how the tree nests.
         let right_nested = or_sym(send(None, "a", vec![]), or_sym(send(None, "b", vec![]), send(None, "c", vec![])));
         assert_eq!(emit_expr(&right_nested), "a || b || c");
+    }
+
+    #[test]
+    fn a_mutable_string_literal_keeps_its_plus() {
+        // `+"lit"` ingests as the literal, which is what every other
+        // target emits, with a hint; the ruby family writes the `+`
+        // back, because spinel freezes a bare literal.
+        let ingest = |src: &str| {
+            let parsed = ruby_prism::parse(src.as_bytes());
+            let stmts = parsed.node().as_program_node().unwrap().statements().as_node();
+            crate::ingest::ingest_expr(&stmts, "literal.rb").unwrap()
+        };
+        for (src, want) in [
+            ("buf = +\"\"", "buf = +\"\""),
+            ("tag = +\"#\"", "tag = +\"#\""),
+            ("(+\"a\").upcase", "(+\"a\").upcase"),
+            ("x = (+\"ab\")[9]", "x = (+\"ab\")[9]"),
+            ("(+\"ab\")[0] = \"c\"", "(+\"ab\")[0] = \"c\""),
+            ("x = +\"a\" + b", "x = +\"a\" + b"),
+            ("buf = \"\"", "buf = \"\""),
+        ] {
+            let expr = ingest(src);
+            let emitted = emit_expr(&expr);
+            assert_eq!(emitted, want, "source: {src}");
+            assert!(ingest(&emitted) == expr, "IR diverged across emit: {src} -> {emitted}");
+        }
     }
 }

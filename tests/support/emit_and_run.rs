@@ -102,14 +102,30 @@ impl Overlay {
     /// Emit, then run one of the emitted test files
     /// (`ruby -Itest -I. <path>` in the emitted tree).
     pub fn run_test(self, test_path: &str) -> Run {
+        self.run_test_with(&[], test_path)
+    }
+
+    /// `run_test` with every string literal frozen
+    /// (`ruby --enable-frozen-string-literal`), as spinel compiles the
+    /// tree. A construct whose emitted Ruby mutates a literal passes on
+    /// plain CRuby and raises FrozenError in the spinel binary; this
+    /// makes the CRuby run fail the same way.
+    pub fn run_test_frozen(self, test_path: &str) -> Run {
+        self.run_test_with(&["--enable-frozen-string-literal"], test_path)
+    }
+
+    fn run_test_with(self, flags: &[&str], test_path: &str) -> Run {
         let (emitted, errors) = self.emit();
         let output = ruby()
+            .args(flags)
             .args(["-Itest", "-I."])
             .arg(test_path)
             .current_dir(&emitted)
             .output()
             .expect("spawn ruby");
-        Run::new(format!("ruby -Itest -I. {test_path}"), emitted, errors, output)
+        let command: Vec<&str> =
+            std::iter::once("ruby").chain(flags.iter().copied()).chain(["-Itest", "-I.", test_path]).collect();
+        Run::new(command.join(" "), emitted, errors, output)
     }
 
     /// Emit, then run `script` against the booted app: `main.rb` is
