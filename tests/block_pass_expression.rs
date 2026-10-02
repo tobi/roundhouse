@@ -71,3 +71,28 @@ end
     assert!(out.contains("instance_exec(&@callback)"), "got:\n{out}");
     assert!(out.contains("instance_exec(&guard.predicate)"), "got:\n{out}");
 }
+
+#[test]
+fn forwarded_ivar_and_call_result_execute_once() {
+    let out = emit(r#"class Filter
+  def initialize
+    @calls = 0
+    @callback = ->(x) { x * 2 }
+  end
+
+  def compute(n)
+    @calls += 1
+    ->(x) { x + n }
+  end
+
+  def run
+    doubled = [1, 2].map(&@callback)
+    added = [1, 2].map(&compute(3))
+    [doubled, added, @calls]
+  end
+end
+"#);
+    let script = format!("{out}\nraise 'block forwarding changed' unless Filter.new.run == [[2, 4], [4, 5], 1]\n");
+    let result = std::process::Command::new("ruby").args(["-e", &script]).output().unwrap();
+    assert!(result.status.success(), "{}\n{script}", String::from_utf8_lossy(&result.stderr));
+}

@@ -2303,7 +2303,15 @@ fn ingest_call_block(
                     ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
                 )));
             }
-            // Any other proc-valued expression is evaluated once and passed as the block.
+            // Any other `&expr` — `&method(:foo)`, `&@callback`,
+            // `&SORT_ORDERS[key]`, `&record.block`, `&->(x) { … }` — is
+            // a proc-valued EXPRESSION handed to the callee as its
+            // block. Ruby evaluates it once, converts it with
+            // `to_proc`, and passes the result; the Proc-forward slot
+            // (see the `&local_var` case above) carries exactly that,
+            // whatever the expression is. Refusing these dropped the
+            // whole file's ingest for `instance_exec(&SORT_ORDERS[k])`,
+            // `map(&method(:one))` and the like.
             return Ok(Some(ingest_expr(&expr, file)?));
         }
         // Ruby 3.4 anonymous block forwarding (`fetch(key, &)`) —
