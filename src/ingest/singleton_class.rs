@@ -140,6 +140,11 @@ fn walk_statement(
     if matches!(name.as_str(), "private_constant" | "public_constant") {
         return Ok(());
     }
+    // Deprecation annotates an existing method without changing the
+    // class-side surface, just as it does in the library-class walk.
+    if name == "deprecate" && call.block().is_none() {
+        return Ok(());
+    }
 
     match name.as_str() {
         "attr_reader" | "attr_writer" | "attr_accessor" => {

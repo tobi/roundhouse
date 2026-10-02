@@ -6170,9 +6170,8 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
         let counted = if in_lane {
             match test_class_and_count(&entry.1, &entry.0) {
                 Ok(counted) => Some(counted),
-                // A test program the snapshot runner cannot shape is
-                // dropped with a note rather than failing the project:
-                // a large app's suite has files outside the lane shape.
+                // Preserve recovery for app tests outside the snapshot
+                // runner's supported shape, with their sidecars removed too.
                 Err(e) => {
                     eprintln!("roundhouse: {e}; dropped");
                     dropped.push(entry.0.clone());

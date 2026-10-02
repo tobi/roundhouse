@@ -231,6 +231,39 @@ impl Ty {
         }
     }
 
+    /// The same type with every class name it mentions rewritten by
+    /// `f`. Structure (containers, unions, signatures) is preserved;
+    /// only `Ty::Class` ids change.
+    pub fn map_class_ids(&self, f: &dyn Fn(&ClassId) -> ClassId) -> Ty {
+        match self {
+            Ty::Class { id, args } => Ty::Class {
+                id: f(id),
+                args: args.iter().map(|t| t.map_class_ids(f)).collect(),
+            },
+            Ty::Array { elem } => Ty::Array { elem: Box::new(elem.map_class_ids(f)) },
+            Ty::Hash { key, value } => Ty::Hash {
+                key: Box::new(key.map_class_ids(f)),
+                value: Box::new(value.map_class_ids(f)),
+            },
+            Ty::Tuple { elems } => {
+                Ty::Tuple { elems: elems.iter().map(|t| t.map_class_ids(f)).collect() }
+            }
+            Ty::Union { variants } => {
+                Ty::Union { variants: variants.iter().map(|t| t.map_class_ids(f)).collect() }
+            }
+            Ty::Fn { params, block, ret, effects } => Ty::Fn {
+                params: params
+                    .iter()
+                    .map(|p| Param { name: p.name.clone(), ty: p.ty.map_class_ids(f), kind: p.kind.clone() })
+                    .collect(),
+                block: block.as_ref().map(|b| Box::new(b.map_class_ids(f))),
+                ret: Box::new(ret.map_class_ids(f)),
+                effects: effects.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// True when an unknown ([`Ty::is_unknown`]) sits anywhere inside
     /// this type: `untyped`, `Array[untyped]`, `Hash[Symbol, untyped]`,
     /// `String | untyped`, a signature with an untyped parameter. A
