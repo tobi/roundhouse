@@ -6980,19 +6980,20 @@ fn ivar_read(name: &Symbol) -> Expr {
 /// read makes every `user.is_admin?` guard pass for non-admins.
 /// Rewritten body: `@col == true || @col == 1` (handles both a
 /// DB-hydrated Integer and an app-assigned true/false; nil/0/false →
-/// false). Strict targets hydrate native booleans and keep the shared
-/// synthesized shape. Only plain `@col`-read bodies are rewritten
+/// false). An ordinary nullable getter keeps nil; its `?` predicate
+/// still answers false. Strict targets hydrate native booleans and keep
+/// the shared synthesized shape. Only plain `@col`-read bodies are rewritten
 /// (idempotent; custom bodies win).
 pub(crate) fn apply_boolean_lowering(lcs: &mut [LibraryClass], app: &App) {
     for model in &app.models {
         let Some(table) = app.schema.tables.get(&model.table.0) else {
             continue;
         };
-        let bool_cols: BTreeSet<Symbol> = table
+        let bool_cols: HashMap<Symbol, bool> = table
             .columns
             .iter()
             .filter(|c| matches!(c.col_type, crate::schema::ColumnType::Boolean))
-            .map(|c| c.name.clone())
+            .map(|c| (c.name.clone(), c.nullable && !c.primary_key))
             .collect();
         if bool_cols.is_empty() {
             continue;
@@ -7005,11 +7006,26 @@ pub(crate) fn apply_boolean_lowering(lcs: &mut [LibraryClass], app: &App) {
                 continue;
             }
             let col = Symbol::from(m.name.as_str().trim_end_matches('?'));
-            if !bool_cols.contains(&col) {
+            let Some(nullable) = bool_cols.get(&col) else {
                 continue;
-            }
+            };
             if is_plain_ivar_read(&m.body, &col) {
-                m.body = boolean_cast_body(&col);
+                let cast = boolean_cast_body(&col);
+                m.body = if *nullable && !m.name.as_str().ends_with('?') {
+                    sp_expr(ExprNode::If {
+                        cond: sp_expr(ExprNode::Send {
+                            recv: Some(ivar_read(&col)),
+                            method: Symbol::from("nil?"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: false,
+                        }),
+                        then_branch: sp_expr(ExprNode::Lit { value: Literal::Nil }),
+                        else_branch: cast,
+                    })
+                } else {
+                    cast
+                };
             }
         }
     }

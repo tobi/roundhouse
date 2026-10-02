@@ -385,14 +385,11 @@ fn emit_cast(value: &Expr, target_ty: &crate::ty::Ty) -> String {
     // carry no stamped type at all, so that gate would skip them too.
     // For a boolean, identity is not a no-op: it is the bug. See the
     // arm below for why.
-    if is_bool_target(target_ty) {
-        return format!("![\"0\", \"\", \"false\"].include?(({inner}).to_s)");
-    }
     let value_is_poly = matches!(
         value.ty.as_ref(),
         Some(Ty::Untyped) | Some(Ty::Union { .. })
     );
-    if !value_is_poly {
+    if !value_is_poly && !is_bool_target(target_ty) {
         return inner;
     }
     // NIL-SAFE coercion for pure reads (Var/Ivar — no double-eval
@@ -452,6 +449,16 @@ fn emit_cast(value: &Expr, target_ty: &crate::ty::Ty) -> String {
         }
         _ => false,
     };
+    // Boolean casts need the same nil guard as numeric/string casts:
+    // their `to_s` would otherwise turn a nullable NULL into false.
+    if is_bool_target(target_ty) {
+        let cast = format!("![\"0\", \"\", \"false\"].include?(({inner}).to_s)");
+        return if pure_read {
+            format!("({inner}).nil? ? nil : ({cast})")
+        } else {
+            cast
+        };
+    }
     // `x&.to_s`, not `(x).nil? ? nil : (x).to_s`: the same value on every
     // Ruby, and the one spelling spinel types as a nullable primitive --
     // nil met with a String at a ternary is untyped there (spinel#4567),
