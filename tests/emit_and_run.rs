@@ -2263,3 +2263,45 @@ end
         .run_test_frozen("test/models/article_mutable_literal_test.rb")
         .assert_passes();
 }
+
+/// The key forms Rails' PostgreSQL schema dumper writes run. `id:
+/// :serial` stopped ingest ("unsupported type `serial`"), and `id: {
+/// type: :string, limit: 32 }` was read as the default key, so the
+/// emitted table had an integer autoincrement key where the app keeps
+/// string ones.
+#[test]
+fn postgres_dumped_key_forms_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", id: :serial, force: :cascade do |t|",
+        )
+        .edit(
+            "db/schema.rb",
+            "  add_foreign_key \"comments\", \"articles\"",
+            "  create_table \"codes\", id: { type: :string, limit: 32 }, force: :cascade do |t|\n    \
+             t.string \"label\"\n  end\n\n  add_foreign_key \"comments\", \"articles\"",
+        )
+        .write("app/models/code.rb", "class Code < ApplicationRecord\nend\n")
+        .write(
+            "test/models/key_forms_test.rb",
+            r#"require "test_helper"
+
+class KeyFormsTest < ActiveSupport::TestCase
+  test "a serial key is generated" do
+    article = Article.create!(title: "Serial", body: "A long enough body")
+    assert_kind_of Integer, article.id
+    assert_equal "Serial", Article.find(article.id).title
+  end
+
+  test "a string key is the one the app supplies" do
+    Code.create!(id: "launch-2026", label: "Launch")
+    assert_equal "Launch", Code.find("launch-2026").label
+  end
+end
+"#,
+        )
+        .run_test("test/models/key_forms_test.rb")
+        .assert_passes();
+}
