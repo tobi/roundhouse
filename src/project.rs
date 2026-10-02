@@ -1003,7 +1003,7 @@ pub fn target_files(
     }
     let files = match target {
         BuildTarget::Blog => blog_files(fixture),
-        BuildTarget::Spinel => spinel_files(app, fixture).and_then(spin_shape),
+        BuildTarget::Spinel => spinel_files(app, fixture).and_then(|(files, _)| spin_shape(files)),
         // The ruby family gets the bundled-library requires too: the
         // table used to live inside `spin_shape` and so reached only
         // the spinel tree, which cost campfire two test files on a
@@ -1948,7 +1948,7 @@ fn ruby_family_runtime_files(
     fixture: &Path,
     flavor: RubyFlavor,
 ) -> Result<Vec<(String, String)>, String> {
-    let mut files = spinel_files(app, fixture)?;
+    let (mut files, test_stems) = spinel_files(app, fixture)?;
 
     files.retain(|(p, _)| p != "runtime/db.rb");
     // The spinel SQL-functions file is FFI; CRuby writes its own below
@@ -2300,7 +2300,7 @@ fn ruby_family_runtime_files(
     apply_controller_dispatch(&mut files, app, true);
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
-    apply_makefile_test_list(&mut files, app);
+    apply_makefile_test_list_stems(&mut files, &test_stems);
     apply_runtime_gem_wiring(&mut files);
     // AGAIN, on purpose, and this time PERFORMING them. `spinel_files`
     // appended a commented-out block to the spinel tree's boot.rb (that
@@ -3469,7 +3469,7 @@ pub fn spinel_base_files(app: &App, fixture: &Path) -> Result<Vec<(String, Strin
     // got it — one layer down. A lane is evidence only if it runs the
     // same code. Idempotent: the gap scan skips a file that already
     // requires the library, so `spin_shape` running it again is inert.
-    let mut files = spinel_files(app, fixture)?;
+    let (mut files, _) = spinel_files(app, fixture)?;
 
     write_bundled_requires(&mut files);
     Ok(files)
@@ -3670,7 +3670,9 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     }
 }
 
-fn spinel_files(app: &App, fixture: &Path) -> Result<Vec<(String, String)>, String> {
+// Return app-emitted test stems separately: merging the scaffold loses
+// their provenance, and the Ruby-family Makefile must exclude runtime tests.
+fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let mut files: Vec<(String, String)> = Vec::new();
 
     crate::runtime_files::walk_into("runtime/spinel/scaffold", "", &mut files)?;
@@ -4043,7 +4045,9 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<Vec<(String, String)>, Stri
         }
     }
 
-    files.extend(sort_files(emit::ruby::emit_spinel(app)));
+    let app_files = emit::ruby::emit_spinel(app);
+    let test_stems = app_test_stems(&app_files);
+    files.extend(sort_files(app_files));
 
     // Emit the ingested support classes (extras/, lib/, app/helpers/,
     // app/mailers/, and non-AR classes under app/models/ — Markdowner,
@@ -4155,7 +4159,7 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<Vec<(String, String)>, Stri
     apply_test_gem_wiring(&mut files);
     apply_spinel_sql_functions(&mut files, app)?;
     apply_pagination_demand(&mut files)?;
-    Ok(files)
+    Ok((files, test_stems))
 }
 
 /// geared_pagination's `set_page_and_extract_portion_from` sets `@page` on
@@ -4501,7 +4505,7 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
 /// dependency we invented. The constant in an emitted body IS the demand.
 ///
 /// Ruby-family only, and wired at the CRuby/JRuby forks rather than in
-/// `spinel_files`, beside `apply_makefile_test_list` for the reason that
+/// `spinel_files`, beside `apply_makefile_test_list_stems` for the reason that
 /// function's own note gives: the shared scaffold set feeds spinel too,
 /// and a spinel tree that declares nokogiri in a Gemfile its toolchain
 /// lane has to `bundle install` is a build break in a target that never
@@ -4952,31 +4956,6 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
     }
 }
 
-/// De-blog the scaffold Makefile's `SPINEL_TESTS` list for the CRuby /
-/// JRuby trees, where it drives `make cruby-test` over the app's own
-/// emitted tests. The scaffold hard-codes the blog's four stems, so
-/// every other app shipped a target naming files it does not have —
-/// campfire emits 52 and named none of them.
-///
-/// NOT applied in `spinel_files`, even though that is where the
-/// Makefile arrives: the SPINEL target rewrites the same block from its
-/// own `lane` (see `spin_shape`), which is a different selection of
-/// tests, and it anchors on the blog list with a hard error if the
-/// anchor is missing. Running this first consumed that anchor and took
-/// `build-site` down. Two lanes, two owners, and the split is by TARGET
-/// — so this has to sit on the CRuby side of the fork, not upstream of
-/// it.
-///
-/// Derived from what the EMITTER produced rather than from
-/// `app.test_modules`: re-deriving the stems from the source
-/// declarations would be a second copy of `test_file_stem`'s naming
-/// rules — including the namespace flatten
-/// `Rooms::ClosedsControllerTest` → `rooms_closeds_controller` — and a
-/// stale one the first time those rules change. It also cannot be a
-/// scan of the FINAL file set: the scaffold drops the framework
-/// runtime's own `test/models/*_test.rb` at the same paths (they
-/// `require "models/article"` and are not runnable standalone), and
-/// `article_broadcasts_test` rode along into the blog's list that way.
 /// The prebuilt JS bundles that arrive from a gem rather than from the
 /// app's own tree, keyed by the filename an import map pins them as.
 /// Each is `<gem_dir>/<dir>/<file>` — `app/assets/javascripts` for the
@@ -5008,7 +4987,7 @@ const GEM_JS_BUNDLES: &[(&str, &str, &str)] = &[
 const RAILS_JS: &str = "app/assets/javascripts";
 
 /// De-blog the scaffold Makefile's `ASSET_JS` list and its gem-bundle
-/// rules, the way `apply_makefile_test_list` does for `SPINEL_TESTS`.
+/// rules, the way `apply_makefile_test_list_stems` does for `SPINEL_TESTS`.
 ///
 /// The scaffold hard-codes the blog's seven pins, ending in
 /// `controllers/hello_controller.js` — a file no other app has, so
@@ -5311,8 +5290,12 @@ fn apply_makefile_asset_blocks(
     }
 }
 
-fn apply_makefile_test_list(files: &mut [(String, String)], app: &App) {
-    let mut stems: Vec<String> = emit::ruby::emit_spinel(app)
+/// Read the actual app emission before scaffold/runtime merging. The emitter
+/// owns filename rules, including `Rooms::ClosedsControllerTest` becoming
+/// `rooms_closeds_controller_test`. Scanning the merged tree would also pick
+/// up scaffold-only tests such as `test/models/article_broadcasts_test.rb`.
+fn app_test_stems(app_files: &[EmittedFile]) -> Vec<String> {
+    let mut stems: Vec<String> = app_files
         .iter()
         .filter_map(|f| {
             let p = f.path.to_str()?;
@@ -5326,9 +5309,11 @@ fn apply_makefile_test_list(files: &mut [(String, String)], app: &App) {
         })
         .collect();
     stems.sort();
-    apply_makefile_test_list_stems(files, &stems);
+    stems
 }
 
+/// Replace the scaffold's blog test list only for CRuby/JRuby. Spinel's
+/// `spin_shape` selects its own lane and still needs the original anchor.
 fn apply_makefile_test_list_stems(files: &mut [(String, String)], stems: &[String]) {
     const BLOG_LIST: &str = "SPINEL_TESTS := \\\n\
                              \ttest/models/article_test \\\n\
