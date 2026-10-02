@@ -2375,13 +2375,6 @@ pub(super) fn hash_method(
 ) -> Ty {
     match method.as_str() {
         "[]" => Ty::Union { variants: vec![value.clone(), Ty::Nil] },
-        // Not `deep_*` on nested values: grounding is identity or one-level conversion, and nested hashes stay as they are.
-        "symbolize_keys" | "symbolize_keys!" | "deep_symbolize_keys" => {
-            Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(value.clone()) }
-        }
-        "stringify_keys" | "deep_stringify_keys" => {
-            Ty::Hash { key: Box::new(Ty::Str), value: Box::new(value.clone()) }
-        }
         // `h[k] = v` returns the assigned value in Ruby, but here we
         // can't tell the argument's type from just the receiver's
         // generic Value — and the result is rarely chained. Return
@@ -2565,10 +2558,9 @@ pub(super) fn hash_method(
             }
         }
         // The first key that maps to a value, or nil.
-        "key" => Ty::Union { variants: vec![key.clone(), Ty::Nil] },
         "filter_map" => Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or_else(unknown)) },
         // Strong-parameters `permit!` marks everything permitted.
-        "permit!" | "to_hash" => Ty::Hash {
+        "to_hash" => Ty::Hash {
             key: Box::new(key.clone()),
             value: Box::new(value.clone()),
         },
@@ -2636,7 +2628,7 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         "casecmp" => Ty::Int,
         // Bang forms answer nil when nothing changed, so the value is `String?`.
         "gsub!" | "sub!" | "strip!" | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "squeeze!"
-        | "downcase!" | "upcase!" | "capitalize!" | "tr!" | "delete!" => Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
+        | "downcase!" | "upcase!" | "capitalize!" | "slice!" | "tr!" | "delete!" | "squish!" => Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
         "casecmp?" => Ty::Bool,
         // `ord` → the codepoint of the first character.
         "ord" => Ty::Int,
@@ -2662,10 +2654,6 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         "insert" | "to_str" | "encode" | "first" | "last" => Ty::Str,
         // The in-place forms answer the receiver, or nil when nothing
         // changed.
-        "gsub!" | "sub!" | "strip!" | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "squeeze!"
-        | "downcase!" | "upcase!" | "capitalize!" | "slice!" | "tr!" | "delete!" | "squish!" => {
-            Ty::Union { variants: vec![Ty::Str, Ty::Nil] }
-        }
         // `String#unpack` decodes into an Array of whatever the
         // template names; `unpack1` its first element.
         "unpack" => Ty::Array { elem: Box::new(Ty::Untyped) },
@@ -2790,18 +2778,16 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
         // `Integer` give it and which the table above left out.
         // `clamp` answers one of its bounds or the receiver: Integer for
         // Integer bounds, the common shape (`page.clamp(1, 100)`).
-        "clamp" | "to_int" | "size" | "bit_length" | "gcd" | "lcm" | "div"
-        | "modulo" | "remainder" | "ceildiv" | "pow" | "ord" | "magnitude" => Ty::Int,
+        "to_int" | "size" | "remainder" | "ceildiv" | "ord" | "magnitude" => Ty::Int,
         "between?" | "integer?" | "finite?" | "infinite?" | "nan?" | "allbits?"
         | "anybits?" | "nobits?" => Ty::Bool,
-        "fdiv" => Ty::Float,
-        "divmod" | "digits" => Ty::Array { elem: Box::new(Ty::Int) },
+        "digits" => Ty::Array { elem: Box::new(Ty::Int) },
         "nonzero?" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
         // `upto` / `downto` / `step` return the receiver with a block and
         // an Enumerator without one; the two are not told apart here.
         // `to_d` / `to_r` / `to_c` build BigDecimal / Rational / Complex,
         // which the registry does not model.
-        "upto" | "downto" | "step" | "to_d" | "to_r" | "to_c" | "rationalize" | "coerce" => Ty::Untyped,
+        "to_d" | "to_r" | "to_c" | "rationalize" | "coerce" => Ty::Untyped,
         // ActiveSupport Numeric duration helpers — `1.day`, `2.hours`,
         // `30.minutes`, etc. Each returns an ActiveSupport::Duration
         // instance; we don't model that structurally so propagate
@@ -2946,42 +2932,6 @@ fn flatten_elem(t: &Ty) -> Ty {
     }
 }
 
-/// The request-params value a nested read answers: a scalar, a hash or an array, whichever the request carried.
-pub(crate) const PARAM_VALUE: &str = "Roundhouse::ParamValue";
-
-pub(crate) fn param_value_ty() -> Ty {
-    Ty::Class { id: crate::ident::ClassId(Symbol::from(PARAM_VALUE)), args: vec![] }
-}
-
-// Not `permit`/`to_unsafe_h`/`require`: ActionController::Parameters methods no ruby-family runtime Hash answers.
-fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
-    let pv = param_value_ty;
-    let maybe_pv = || Ty::Union { variants: vec![pv(), Ty::Nil] };
-    Some(match method.as_str() {
-        "[]" | "dig" | "first" | "last" | "presence" => maybe_pv(),
-        "fetch" | "[]=" => pv(),
-        "key?" | "has_key?" | "include?" | "member?" | "present?" | "blank?" | "empty?" | "any?"
-        | "all?" | "none?" | "nil?" | "is_a?" | "kind_of?" | "instance_of?" | "respond_to?" | "=="
-        | "!=" | "===" | "equal?" | "eql?" => Ty::Bool,
-        "each" | "each_pair" | "each_value" | "each_key" | "each_with_index" | "reverse_each"
-        | "select" | "filter" | "reject" | "compact" | "uniq" | "sort" | "sort_by" | "reverse"
-        | "merge" | "except" | "slice" | "permit" | "permit!" | "to_unsafe_h" | "to_h" | "require" => pv(),
-        "map" | "collect" | "flat_map" | "filter_map" => {
-            Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or(Ty::Untyped)) }
-        }
-        "keys" => Ty::Array { elem: Box::new(Ty::Str) },
-        "values" | "to_a" => Ty::Array { elem: Box::new(pv()) },
-        "size" | "length" | "count" | "to_i" => Ty::Int,
-        "to_f" => Ty::Float,
-        "to_s" | "join" => Ty::Str,
-        "to_sym" => Ty::Sym,
-        "tap" | "dup" | "freeze" => pv(),
-        "!" => Ty::Bool,
-        "inspect" | "to_json" => Ty::Str,
-        _ => return None,
-    })
-}
-
 /// Ruby's own object protocol, answered for any receiver whose type
 /// table has no entry for `method`.
 ///
@@ -3050,4 +3000,40 @@ pub(super) fn params_as_hash() -> Ty {
         key: Box::new(Ty::Sym),
         value: Box::new(crate::analyze::registry::controllers::param_value_ty(false)),
     }
+}
+
+/// The request-params value a nested read answers: a scalar, a hash or an array, whichever the request carried.
+pub(crate) const PARAM_VALUE: &str = "Roundhouse::ParamValue";
+
+pub(crate) fn param_value_ty() -> Ty {
+    Ty::Class { id: crate::ident::ClassId(Symbol::from(PARAM_VALUE)), args: vec![] }
+}
+
+// Not `permit`/`to_unsafe_h`/`require`: ActionController::Parameters methods no ruby-family runtime Hash answers.
+fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
+    let pv = param_value_ty;
+    let maybe_pv = || Ty::Union { variants: vec![pv(), Ty::Nil] };
+    Some(match method.as_str() {
+        "[]" | "dig" | "first" | "last" | "presence" => maybe_pv(),
+        "fetch" | "[]=" => pv(),
+        "key?" | "has_key?" | "include?" | "member?" | "present?" | "blank?" | "empty?" | "any?"
+        | "all?" | "none?" | "nil?" | "is_a?" | "kind_of?" | "instance_of?" | "respond_to?" | "=="
+        | "!=" | "===" | "equal?" | "eql?" => Ty::Bool,
+        "each" | "each_pair" | "each_value" | "each_key" | "each_with_index" | "reverse_each"
+        | "select" | "filter" | "reject" | "compact" | "uniq" | "sort" | "sort_by" | "reverse"
+        | "merge" | "except" | "slice" | "permit" | "permit!" | "to_unsafe_h" | "to_h" | "require" => pv(),
+        "map" | "collect" | "flat_map" | "filter_map" => {
+            Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or(Ty::Untyped)) }
+        }
+        "keys" => Ty::Array { elem: Box::new(Ty::Str) },
+        "values" | "to_a" => Ty::Array { elem: Box::new(pv()) },
+        "size" | "length" | "count" | "to_i" => Ty::Int,
+        "to_f" => Ty::Float,
+        "to_s" | "join" => Ty::Str,
+        "to_sym" => Ty::Sym,
+        "tap" | "dup" | "freeze" => pv(),
+        "!" => Ty::Bool,
+        "inspect" | "to_json" => Ty::Str,
+        _ => return None,
+    })
 }
