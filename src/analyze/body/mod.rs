@@ -611,10 +611,34 @@ impl<'a> BodyTyper<'a> {
                 // A later typing pass may resolve a value constant whose
                 // owner was unknown in an earlier constant fixpoint round.
                 expr.diagnostic = None;
+                let generated = expr_span.file.0 == 0
+                    || expr.decisions & crate::expr::GENERATED_CONST_REF != 0;
+                // A real FileId outside the snapshot is an indexing
+                // defect, not a generated expression or an ERB fallback.
+                if !generated && self.const_resolver.as_ref()
+                    .is_some_and(|resolver| !resolver.has_registered_source(expr_span.file))
+                {
+                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                        target: None,
+                        construct: Symbol::from("constant"),
+                        detail: format!("{}: missing source document for FileId({})",
+                            written_class_id(path).0, expr_span.file.0),
+                    });
+                    return unknown();
+                }
                 // Never search by suffix or borrow another scope's
                 // same-named declaration: only the exact written class.
                 let exact_modeled_class = |path: &[Symbol]| {
                     let id = written_class_id(path);
+                    if let Some((name, owner)) = path.split_last() {
+                        if !owner.is_empty() {
+                            if let Some(info) = self.classes().get(&written_class_id(owner)) {
+                                if info.gem_boundary {
+                                    if let Some(ty) = info.constants.get(name) { return ty.clone(); }
+                                }
+                            }
+                        }
+                    }
                     if self.classes().contains_key(&id) {
                         Ty::Class { id, args: vec![] }
                     } else {
@@ -629,6 +653,7 @@ impl<'a> BodyTyper<'a> {
                 let source_reference = self
                     .const_resolver
                     .as_ref()
+                    .filter(|_| !generated)
                     .and_then(|resolver| resolver.reference(expr_span, path));
                 let ty = match source_reference {
                     Some(Some(ResolvedConstant::Namespace { class, runtime })) => {
@@ -641,25 +666,32 @@ impl<'a> BodyTyper<'a> {
                             unknown()
                         }
                     }
-                    Some(Some(ResolvedConstant::Value { declaration, runtime })) => self.typed_constants
-                        .and_then(|values| values.get(declaration))
-                        .cloned()
-                        .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()))
-                        .unwrap_or_else(unknown),
+                    Some(Some(ResolvedConstant::Value { declaration, name, runtime })) => {
+    // Concern splices retain the resolved value owner as well as its type.
+    qualify_resolved_path(path, name);
+    self.typed_constants.and_then(|values| values.get(declaration)).cloned()
+        .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()))
+        .unwrap_or_else(unknown)
+}
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
                     Some(None) => exact_modeled_class(path),
-                    // No reference in an indexed file: a lowering pass
-                    // generated this node with a borrowed source span
-                    // (Alba's serializers).
-                    None if indexed_source => exact_modeled_class(path),
+                    // A borrowed span is not evidence of a written constant
+                    // only when the producer marked its generated origin.
+                    None if indexed_source && generated => exact_modeled_class(path),
+                    None if indexed_source => unknown(),
                     // Views and generated IR have no Rubydex answer. A
                     // bare name can use the app's bare-name values. A
                     // qualified name `A::B` names its owner, so only the
                     // value declared at that full name answers it.
                     None => {
                         let value = if let [name] = path.as_slice() {
-                            ctx.constants.get(name).cloned()
+                            ctx.constants.get_own(name).cloned()
+                                .or_else(|| {
+                                    let ty = exact_modeled_class(path);
+                                    (!matches!(ty, Ty::Var { .. })).then_some(ty)
+                                })
+                                .or_else(|| ctx.constants.get_global(name).cloned())
                         } else {
                             let name = written_class_id(path);
                             self.typed_constants

@@ -303,7 +303,7 @@ pub fn attachable_partial_bindings(app: &App) -> Vec<AttachablePartial> {
         let content_type = lc
             .methods
             .iter()
-            .find_map(|m| literal_or_constant_of(m, "attachable_content_type", &lc.constants));
+            .find_map(|m| literal_or_constant_of(m, "attachable_content_type", &lc.constants, Some(&lc.name)));
         // Only a class the framework could hand a node to: one the
         // sgid names (a model, handled above) or one that builds
         // itself from the node by content type. A library class with
@@ -337,20 +337,23 @@ fn element_of(class: &ClassId) -> String {
 }
 
 fn literal_of(m: &MethodDef, name: &str) -> Option<String> {
-    literal_or_constant_of(m, name, &[])
+    literal_or_constant_of(m, name, &[], None)
 }
 
 /// A body that is one String literal, or one bare constant the class
 /// declares as one — campfire's `attachable_content_type` answers
 /// `OPENGRAPH_EMBED_CONTENT_TYPE`, declared two lines up.
-fn literal_or_constant_of(m: &MethodDef, name: &str, constants: &[(Symbol, Expr)]) -> Option<String> {
+fn literal_or_constant_of(m: &MethodDef, name: &str, constants: &[(Symbol, Expr)], owner: Option<&ClassId>) -> Option<String> {
     if m.name.as_str() != name || m.receiver != MethodReceiver::Instance {
         return None;
     }
     match &*m.body.node {
         ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
-        ExprNode::Const { path } if path.len() == 1 => constants.iter().find_map(|(n, e)| {
-            if *n != path[0] {
+        ExprNode::Const { path } => constants.iter().find_map(|(n, e)| {
+            let written = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+            let matches = written == n.as_str()
+                || owner.is_some_and(|owner| written == format!("{}::{n}", owner.0));
+            if !matches {
                 return None;
             }
             match &*e.node {

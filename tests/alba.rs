@@ -319,7 +319,7 @@ fn constructor_reader_evidence_requires_unmodified_required_parameters() {
 }
 
 #[test]
-fn unused_resources_and_unrelated_library_diagnostics_are_unchanged() {
+fn unused_resources_leave_unresolved_library_constants_reported() {
     let source = SOURCE.split("class SurveyProbe").next().unwrap().to_owned()
         + "\nclass Unrelated; def call; UnknownVendor.unknown; end; end\n";
     let mut app = ingest_app_from_tree(HashMap::from([(
@@ -328,12 +328,16 @@ fn unused_resources_and_unrelated_library_diagnostics_are_unchanged() {
     )]))
     .unwrap();
     Analyzer::new(&app).analyze(&mut app);
-    assert!(diagnose(&app).is_empty());
+    let diagnostics = diagnose(&app);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code(), "unsupported");
+    assert!(diagnostics[0].message.contains("UnknownVendor"), "{diagnostics:?}");
+    assert_eq!(diagnostics[0].severity, roundhouse::diagnostic::Severity::Error);
 }
 
 #[test]
 fn nullable_and_false_properties_remain_outside_the_named_contract() {
-    for expression in ["nil", "false", "[9]", "@author", "AlbaAuthor"] {
+    for expression in ["nil", "false", "[9]", "AlbaAuthor"] {
         let source = SOURCE.replace("@author || raise(\"author required\")", expression);
         let mut app = app(&source);
         Analyzer::new(&app).analyze(&mut app);
@@ -342,6 +346,14 @@ fn nullable_and_false_properties_remain_outside_the_named_contract() {
             "accepted {expression}"
         );
     }
+    // A direct readonly getter is safe when each represented constructor
+    // supplies a proven object. A nil construction must still be rejected,
+    // even if another site's observations infer a non-null joined type.
+    let source = SOURCE.replace("@author || raise(\"author required\")", "@author")
+        .replace("AlbaArticle.new(7, \"Syn\", author)", "AlbaArticle.new(7, \"Syn\", nil)");
+    let mut app = app(&source);
+    Analyzer::new(&app).analyze(&mut app);
+    assert!(diagnose(&app).iter().any(|d| d.code() == "unsupported"));
 }
 
 #[test]
