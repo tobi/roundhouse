@@ -817,6 +817,7 @@ module ActiveSupport
   end
 
   def self.humanize(text)
+    raise NoMethodError, "undefined method 'humanize' for nil" if text.nil?
     s = text.to_s.tr("_", " ").lstrip
     s = s[0, s.length - 3].to_s if s.end_with?(" id")
     s = s.downcase
@@ -825,6 +826,7 @@ module ActiveSupport
   end
 
   def self.titleize(text)
+    raise NoMethodError, "undefined method 'titleize' for nil" if text.nil?
     s = humanize(underscore(text))
     out = +""
     n = s.length

@@ -103,6 +103,6 @@ module ActiveSupport
   def self.local_time: (Integer y, Integer mo, Integer d, Integer h, Integer mi, Integer s, Integer nsec) -> Time
   def self.number_delimited: (Integer | Float number) -> String
   def self.underscore: (String text) -> String
-  def self.humanize: (String text) -> String
-  def self.titleize: (String text) -> String
+  def self.humanize: (String? text) -> String
+  def self.titleize: (String? text) -> String
 end
