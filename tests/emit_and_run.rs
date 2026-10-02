@@ -5858,3 +5858,15 @@ end
         .run_test("test/models/article_views_test.rb")
         .assert_passes();
 }
+
+#[path = "support/runtime_block_signature.rs"]
+mod runtime_block_signature;
+
+#[test]
+fn an_rbs_array_block_runs_after_app_emission() {
+    emit_and_run::real_blog()
+        .write("app/lib/batch.rb", runtime_block_signature::RUBY)
+        .write("sig/batch.rbs", runtime_block_signature::RBS)
+        .run_ruby("raise 'wrong sum' unless Batch.new.consume == 3")
+        .assert_passes();
+}

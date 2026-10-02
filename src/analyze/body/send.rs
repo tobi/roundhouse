@@ -376,8 +376,7 @@ impl<'a> BodyTyper<'a> {
             // that as the block-param type. Lets framework stubs
             // declare what their block yields (form_with → FormBuilder,
             // ErrorCollection.each → Str) without hardcoding each one
-            // in this match. Single-param yield only — multi-param
-            // destructure isn't expressible in Ty::Fn::block today.
+            // in this match.
             Ty::Class { id, .. } => {
                 // Walk the class + parent chain (and includes) for a
                 // registered method whose `Ty::Fn` declares a block param,
