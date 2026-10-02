@@ -6476,3 +6476,31 @@ raise "positional hash rewritten" unless locator.merged("host") == 'host{opts: 1
 "#)
         .assert_passes();
 }
+
+/// `t.integer …, limit: 8` is a `bigint` now (the width Rails creates),
+/// where it was an `integer`. On SQLite both are INTEGER and both type
+/// as `Integer`, so the emitted program must keep a value past 32 bits
+/// through a save and a reload, as it did before.
+#[test]
+fn an_eight_byte_integer_column_keeps_a_value_past_32_bits() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"views\", limit: 8, default: 0, null: false",
+        )
+        .write(
+            "test/models/article_views_test.rb",
+            r#"require "test_helper"
+
+class ArticleViewsTest < ActiveSupport::TestCase
+  test "a value past 32 bits survives a reload" do
+    article = Article.create!(title: "Popular", body: "A long enough body", views: 5_000_000_000)
+    assert_equal 5_000_000_000, Article.find(article.id).views
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_views_test.rb")
+        .assert_passes();
+}
