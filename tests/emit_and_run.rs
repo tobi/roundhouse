@@ -1176,6 +1176,125 @@ fn a_partial_reading_a_reserved_word_local_assign_runs() {
     run.assert_passes();
 }
 
+/// B4 in NEXUS_BUGS.md: a partial in `app/views/application/` that a
+/// view in another directory renders. Rails looks in the view's own
+/// directory first, so a same-name partial there wins.
+#[test]
+fn a_partial_in_the_application_view_directory_runs_from_another_directory() {
+    let run = on_the_index(
+        emit_and_run::real_blog()
+            .write(
+                "app/views/application/_blank_slate.html.erb",
+                "<%# locals: (message:) %>\n<p id=\"b4-app\"><%= message %></p>\n",
+            )
+            .write(
+                "app/views/application/_shadowed.html.erb",
+                "<%# locals: (message:) %>\n<p id=\"b4-shadow-app\"><%= message %></p>\n",
+            )
+            .write(
+                "app/views/articles/_shadowed.html.erb",
+                "<%# locals: (message:) %>\n<p id=\"b4-shadow-own\"><%= message %></p>\n",
+            ),
+        "<%= render \"blank_slate\", message: \"No articles\" %>\n\
+         <%= render \"shadowed\", message: \"own dir\" %>\n",
+        "    assert_match(/<p id=\"b4-app\">No articles<\\/p>/, response.body)\n    \
+             assert_match(/<p id=\"b4-shadow-own\">own dir<\\/p>/, response.body)\n    \
+             assert_no_match(/b4-shadow-app/, response.body)\n",
+    );
+    run.assert_passes();
+}
+
+/// B4 in NEXUS_BUGS.md: `render "x", k: v` looks in the view directory
+/// of each controller ancestor, nearest first. The `application`
+/// directory is only reached when the chain reaches ApplicationController.
+#[test]
+fn a_partial_in_a_parent_controller_view_directory_runs() {
+    let run = on_the_index(
+        emit_and_run::real_blog()
+            .write(
+                "app/controllers/base_controller.rb",
+                "class BaseController < ApplicationController\nend\n",
+            )
+            .edit(
+                "app/controllers/articles_controller.rb",
+                "class ArticlesController < ApplicationController",
+                "class ArticlesController < BaseController",
+            )
+            .write(
+                "app/views/base/_nav.html.erb",
+                "<%# locals: (label:) %>\n<p id=\"b4-base\"><%= label %></p>\n",
+            )
+            .write(
+                "app/views/application/_nav.html.erb",
+                "<%# locals: (label:) %>\n<p id=\"b4-app\"><%= label %></p>\n",
+            ),
+        "<%= render \"nav\", label: \"parent dir\" %>\n",
+        "    assert_match(/<p id=\"b4-base\">parent dir<\\/p>/, response.body)\n    \
+             assert_no_match(/b4-app/, response.body)\n",
+    );
+    run.assert_passes();
+}
+
+/// The `render partial: "x", locals: { ... }` spelling resolves
+/// through the parent controller's view directory too.
+#[test]
+fn a_partial_keyword_in_a_parent_controller_view_directory_runs() {
+    let run = on_the_index(
+        emit_and_run::real_blog()
+            .write(
+                "app/controllers/base_controller.rb",
+                "class BaseController < ApplicationController\nend\n",
+            )
+            .edit(
+                "app/controllers/articles_controller.rb",
+                "class ArticlesController < ApplicationController",
+                "class ArticlesController < BaseController",
+            )
+            .write(
+                "app/views/base/_nav.html.erb",
+                "<%# locals: (label:) %>\n<p id=\"b4-base\"><%= label %></p>\n",
+            )
+            .write(
+                "app/views/application/_nav.html.erb",
+                "<%# locals: (label:) %>\n<p id=\"b4-app\"><%= label %></p>\n",
+            ),
+        "<%= render partial: \"nav\", locals: { label: \"hash form\" } %>\n",
+        "    assert_match(/<p id=\"b4-base\">hash form<\\/p>/, response.body)\n    \
+             assert_no_match(/b4-app/, response.body)\n",
+    );
+    run.assert_passes();
+}
+
+/// A namespaced parent controller (`Admin::BaseController`) has the
+/// view directory `admin/base`, which wins over `application`.
+#[test]
+fn a_partial_in_a_namespaced_parent_controller_view_directory_runs() {
+    let run = on_the_index(
+        emit_and_run::real_blog()
+            .write(
+                "app/controllers/admin/base_controller.rb",
+                "class Admin::BaseController < ApplicationController\nend\n",
+            )
+            .edit(
+                "app/controllers/articles_controller.rb",
+                "class ArticlesController < ApplicationController",
+                "class ArticlesController < Admin::BaseController",
+            )
+            .write(
+                "app/views/admin/base/_nav.html.erb",
+                "<%# locals: (label:) %>\n<p id=\"b4-admin\"><%= label %></p>\n",
+            )
+            .write(
+                "app/views/application/_nav.html.erb",
+                "<%# locals: (label:) %>\n<p id=\"b4-app\"><%= label %></p>\n",
+            ),
+        "<%= render \"nav\", label: \"admin dir\" %>\n",
+        "    assert_match(/<p id=\"b4-admin\">admin dir<\\/p>/, response.body)\n    \
+             assert_no_match(/b4-app/, response.body)\n",
+    );
+    run.assert_passes();
+}
+
 /// Not handed to the csv gem's `headers:`: the lowering writes the header row itself, so the output is held to what CSV.generate answers.
 #[test]
 fn csv_generate_with_written_headers_runs() {
