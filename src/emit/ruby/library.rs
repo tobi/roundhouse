@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use super::super::EmittedFile;
 use crate::App;
-use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
+use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, MethodVisibility};
 use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
@@ -1070,6 +1070,11 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     // has to be inserted on the MODEL.
     let (assoc_class_methods, declined) =
         crate::lower::scope_chain::survey_assoc_class_methods(app, &assocs, &scopes);
+    for lc in lcs.iter_mut() {
+        for method in &mut lc.methods {
+            crate::lower::scope_chain::ground_literal_model_dispatch(&mut method.body, app, &assocs);
+        }
+    }
     // Reported by the pass that owns the model's own file — this runs
     // once per emitted family over a different `lcs`, and the ledger
     // line should appear once, beside the class it is about.
@@ -1809,6 +1814,7 @@ fn autosave_method(
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from(format!("_autosave_{}", name.as_str())),
         receiver: MethodReceiver::Instance,
+        visibility: MethodVisibility::Public,
         params: Vec::new(),
         body,
         signature: None,
@@ -1857,6 +1863,7 @@ fn fold_before_validation(
         name_span: crate::span::Span::synthetic(),
         name: hook,
         receiver: MethodReceiver::Instance,
+        visibility: MethodVisibility::Public,
         params: Vec::new(),
         body: call,
         signature: None,
@@ -2490,6 +2497,7 @@ fn push_helper_ivar_writers(
             name_span: crate::span::Span::synthetic(),
             name: setter,
             receiver: MethodReceiver::Instance,
+            visibility: MethodVisibility::Public,
             params: vec![crate::dialect::Param::positional(Symbol::from("value"))],
             body: Expr::new(
                 span,
@@ -2528,6 +2536,7 @@ fn push_helper_ivar_readers(
             name_span: crate::span::Span::synthetic(),
             name: name.clone(),
             receiver: MethodReceiver::Instance,
+            visibility: MethodVisibility::Public,
             params: vec![],
             body: Expr::new(Span::synthetic(), ExprNode::Ivar { name: name.clone() }),
             signature: None,
@@ -5767,6 +5776,7 @@ fn synthesize_module_lc(
             name_span: crate::span::Span::synthetic(),
             name: f.name.clone(),
             receiver: MethodReceiver::Class,
+            visibility: MethodVisibility::Public,
             params: f.params.clone(),
             body: f.body.clone(),
             signature: f.signature.clone(),
@@ -5788,6 +5798,7 @@ fn synthesize_module_lc(
         origin: None,
         constants: Vec::new(),
         unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
     }
 }
 
@@ -6211,6 +6222,15 @@ fn emit_library_class_decl_inner(
         }
     }
 
+    // Finite class-side initialization is lowered IR, not replay of a
+    // framework DSL. Each assignment runs once on this class object;
+    // unset subclasses deliberately keep their ivar absent.
+    for init in &lc.class_ivar_initializers {
+        for line in super::emit_expr(init).lines() {
+            writeln!(s, "{body_pad}{line}").unwrap();
+        }
+    }
+
     let mut first = true;
     for m in &lc.methods {
         if !first {
@@ -6224,6 +6244,29 @@ fn emit_library_class_decl_inner(
             } else {
                 writeln!(s, "{body_pad}{line}").unwrap();
             }
+        }
+        // Named, immediately after its own def: a sticky `private` section
+        // would privatize unrelated methods once source bodies are flattened.
+        // Public needs no annotation, except for Ruby's implicitly private
+        // constructor/copy hooks when the source explicitly made one public.
+        let implicit_private = m.receiver == MethodReceiver::Instance
+            && matches!(m.name.as_str(), "initialize" | "initialize_copy" | "initialize_dup" | "initialize_clone");
+        let directive = match (m.receiver, m.visibility) {
+            (_, MethodVisibility::Public) if !implicit_private => None,
+            (MethodReceiver::Instance, MethodVisibility::Public) => Some("public"),
+            (MethodReceiver::Instance, MethodVisibility::Protected) => Some("protected"),
+            (MethodReceiver::Instance, MethodVisibility::Private) => Some("private"),
+            (MethodReceiver::Class, MethodVisibility::Private) => Some("private_class_method"),
+            (MethodReceiver::Class, MethodVisibility::Public) => None,
+            (MethodReceiver::Class, MethodVisibility::Protected) => {
+                writeln!(s, "{body_pad}class << self").unwrap();
+                writeln!(s, "{body_pad}  protected :{}", m.name).unwrap();
+                writeln!(s, "{body_pad}end").unwrap();
+                None
+            }
+        };
+        if let Some(directive) = directive {
+            writeln!(s, "{body_pad}{directive} :{}", m.name).unwrap();
         }
     }
 

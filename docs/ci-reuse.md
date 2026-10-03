@@ -1,10 +1,137 @@
-# Conservative PR-local CI reuse
+# CI coverage and conservative PR-local reuse
+
+## Compact PR checks and full validation
+
+`.github/workflows/ci.yml` runs a compact floor on PRs and main pushes:
+
+- Fixture generation and `unit` (`cargo test --all-targets`, including emitted
+  Ruby execution tests and the debug-profile bench emission checks).
+- Store analysis, Ruby/Rust/TypeScript comparisons against live Rails.
+- TypeScript SharedWorker browser tests, Campfire conformance, and Campfire
+  comparison including its model/database differential.
+
+These are nine validation executions, plus three small orchestration jobs
+(`plan`, `compact-required`, `ci-summary`). Drafts select only fixture and
+unit validation. **`CI summary` is informational:** it reports missing,
+skipped, cancelled or failed selected non-advisory checks as red. Unselected
+jobs may skip; advisory failures remain separate signals. This workflow does
+not configure branch protection or require the summary to pass before merging;
+maintainers decide when to merge. Publication still requires the compact floor
+and verified assembly.
+
+The planner compares the actual PR merge tree with its base, not just the last
+commit. Renames/deletions retain both ownership sets. Unknown diff identity
+expands to full validation. Documentation-only PRs still get the summary
+status instead of being left pending by workflow-level path filters.
+
+The CI helpers use Python's standard library, following the existing receipt
+helper, without additional Python packages.
+
+| Changed inputs | Additional coverage |
+|---|---|
+| Target emitter file **or directory**, target runtime, toolchain/framework test | Owning comparison and archive smoke; existing embedded framework/toolchain suites stay intact |
+| Ruby emitter | Ruby/JRuby owners plus advisory native Spinel core (`build-spinel`, `toolchain-spinel`, `compare-spinel`) |
+| `runtime/ruby/`, native `runtime/spinel/`, or a focused Spinel test | Advisory native core plus the relevant focused Spinel framework suite |
+| Interpreter-only `db_jruby` / `markly_jruby` or `scaffold/ruby_overlay` | Interpreted Ruby/JRuby owners, not native fanout |
+| Spinel scaffold packaging | Advisory native core plus the native archive smoke |
+| Shared emitter helpers (`src/emit/shared/`) | Full validation across target languages |
+| Shared analyzer or lowerer | Compact floor; no mandatory Spinel lane on an ordinary PR; reviewers can request `ci:full` for broad/risky changes |
+| `wasm/` | WASM build and IDE/playground/studio browser verification |
+| Site/guide sources | Site/archive build and WASM verification, without publishing |
+| Shared compare, framework, archive, or E2E harness | The checks owned by that harness |
+| Cross-target packaging, CI policy/workflows/planner, Cargo/build/toolchain policy, unknown new target | Full validation |
+
+### Requesting broader or fresh validation
+
+For broad/risky changes, or when targeted coverage is insufficient, request
+**`ci:full`**. Applying labels requires upstream repository triage access or
+higher; fork contributors and their agents without that access should ask a
+maintainer to apply the label. A request in a PR comment alone does not trigger
+CI. The label must exist in the upstream repository before it can be applied.
+
+- The PR must be **ready for review**: drafts retain fixture + unit only,
+  even with `ci:full`.
+- Applying the label starts a new full-matrix run of the current **PR merge
+  tree**, without a new commit. Superseded PR runs are cancelled.
+- Further pushes retain full coverage while the label remains set.
+- Removing it starts a run with automatic coverage selection. Policy/shared
+  emitter changes can still select full coverage without the label.
+- Full **coverage** does not disable conservative PR execution-receipt reuse.
+  For fresh execution, ask a maintainer to select **Re-run all jobs** on the
+  full-matrix run. A rerun retains that run's original SHA and event coverage;
+  rerunning an older compact run does not expand coverage or test a newer head.
+
+A manual **Actions → Full validation → Run workflow** dispatch validates the
+chosen ref freshly. A branch-head dispatch is not a replacement for the PR
+merge-tree check. Leave **publish** unchecked for validation only.
+
+### Validation is not publication
+
+`full` selects coverage; `publish` separately authorizes publication work.
+Applying `ci:full` never enables `publish`.
+
+| Trigger | Publication behavior |
+|---|---|
+| PR, including `ci:full`, or ordinary main push | Validation/artifacts only; no deploy |
+| Manual Full validation, `publish=false` (default) | Fresh validation only; no deploy |
+| Manual Full validation, `publish=true` | Accepted only on canonical `rubys/roundhouse` main; guarded publication |
+| Four-hour schedule on canonical main | Fresh full validation plus guarded publication |
+
+The shared validator and PR jobs have no Pages/OIDC deployment privileges and
+no deploy job. Only the separate full-workflow deploy job receives those
+permissions. Publication requests outside canonical main and schedule/manual
+events are rejected. Publication still requires the compact floor, verified
+assembly and a live-main SHA check; the detailed archive contract follows below.
+
+### Current-run artifacts and the full cycle
+
+Targeted archive smokes use `roundhouse --archives rust,go` (selected
+`browse/<target>.{json,tgz,zip}` outputs) and do not build WASM, demos, website
+assets or unrelated archives. The same archive writers power `--site`, which
+keeps the complete developer-facing build. Full publication and smoke consume
+the same producer bytes, without later re-emission.
+
+`.github/workflows/full-ci.yml` checks canonical main at **00:17, 04:17,
+08:17, 12:17, 16:17 and 20:17 UTC**, bundling full validation and publication.
+Every cycle executes freshly; validation results are not cached. Spinel master
+is resolved once per run, and evidence records the compiler revision actually
+used. Its lanes remain advisory. Ordinary build caches and the conservative PR
+execution receipts described below are unchanged.
+
+Archive producers upload with `always()`, preserving any files already produced
+if a later producer step fails. The outcome report names the source SHA, run and
+attempt, actual byte size/hash, and applicable Spinel provenance, and classifies
+each archive `passed`, `reused`, `failed`, `unverified`, or `not-selected`.
+Validation is byte-specific: a TGZ smoke does not certify sibling ZIP or JSON
+bytes. A Spinel source archive contains source, not a built compiler; its native
+smoke witness therefore records the compiler revision separately. Likewise a
+Docker producer's compiler revision is distinct provenance from a native
+archive consumer's compiler revision.
+
+Publication requires the **compact** floor and assembled site, not passing all
+extra-target or advisory lanes: failed or unverified archives can still be
+useful repros, but are not described as validated. Assembly waits for the same
+run's outcome report, copies only that run's archives, and verifies the actual
+copied bytes against the report hashes. It never rebuilds from a newer main.
+The published sidecar at `ci/archive-results.json` separately records whether
+each archive is present for download. Older-attempt witnesses remain visible
+but are conservatively `unverified` on a rerun, not evidence that it passed.
+Deployment guards are unchanged: the deployment lock rechecks that canonical
+main still equals the validated SHA; lookup failure or a superseded snapshot
+prevents publication. A new main commit racing the final check cannot be made
+atomic with Pages deployment.
+Started background runs finish; only the newest pending request is retained.
+Extra comparison/smoke matrices use `max-parallel: 2`, GC uses 1. These bound
+fanouts, **not** total repository concurrency or a guaranteed PR runner priority.
+
+## Reuse within selected PR checks
 
 `scripts/ci-reuse.py` can reuse **executed, successful** checks from the same
 pull request. The allowlist is `store-check`, `writebook-inventory`, Rust archive
 smoke, SharedWorker browser smoke, and the Rust inflector framework suite.
 Unit tests, fixture generation, artifact producers, DOM comparisons, other
-toolchain lanes and all main-branch checks still execute freshly.
+selected toolchain lanes and all selected main-branch checks execute freshly.
+Routing changes the required coverage, not the execution-receipt trust rules.
 
 ## What must match
 
@@ -135,28 +262,26 @@ Stage-aware cancellation needs a separate controller to inspect the previous
 run; GitHub's concurrency expression cannot inspect that run's job progress.
 This PR does not add privileged cancellation machinery.
 
-The next substantial opportunity is sharing **current-run** native compiler
-builds, not declaring more outputs unchanged without a dependency witness.
-In [run 36998514579](https://github.com/rubys/roundhouse/actions/runs/36998514579),
-the unit Cargo step took 309 seconds and the two TypeScript toolchain/framework
-steps took 210 seconds together. Those are whole-step timings, not measurements
-of compiler cost alone. A shared build needs consistent profiles/toolchains,
-native-library ABI, current commit provenance and coverage of each consumer's
-actual build flags. It should be measured and proved separately.
+A separate measured follow-up may evaluate sharing the `unit` job's Debug
+binary with Campfire conformance/compare. This change does not copy Cargo target
+directories, share images, introduce Bazel, or claim a measured queue-time
+improvement. Any sharing proposal still needs compatible toolchains/build flags,
+native-library ABI, current-commit provenance, and proof at each consumer.
 
 Matrix `fail-fast: false` still preserves cross-target diagnostic coverage;
 advisory lanes remain signals rather than reasons to cancel independent checks.
-Existing `needs` gates and normal step failure handling are unchanged. The
-Campfire Docker recipe no longer downloads a separate Dockerfile frontend:
+Receipt reuse does not bypass selected checks' dependency or failure handling.
+The Campfire Docker recipe no longer downloads a separate Dockerfile frontend:
 its ordinary multi-stage instructions use the bundled frontend and COPY
 preserves the archive's executable boot mode. Base images and apt packages
 still resolve freshly, and the real Docker smoke remains enabled.
 
 ## Forcing a fresh check and extending the allowlist
 
-GitHub's **Re-run jobs** always executes these checks freshly, even if a matching
-receipt exists. The fresh attempt may produce new evidence. Existing draft,
-`needs` and main-branch behavior is unchanged.
+Rerun checks bypass matching receipts. Choose **Re-run all jobs** to execute
+the entire selected graph freshly, rather than only failed or individual jobs.
+The rerun keeps the original SHA, ref and coverage; the fresh attempt may
+produce new evidence. Draft, `needs` and main-branch behavior is unchanged.
 
 Before adding another job, audit its complete input contract, including
 generated artifacts, framework tests, executable README blocks and the actual
@@ -168,3 +293,6 @@ unless current-run outputs and their provenance can be preserved honestly.
 Run `PYTHONDONTWRITEBYTECODE=1 python3 tests/ci_reuse_test.py -v` and
 `cargo test --test workflow_yaml_parses` when changing this policy. The Rust
 workflow tests execute the Python adversarial suite, so normal unit CI gates it.
+For coverage routing, archive evidence or full-workflow changes, also run
+`cargo test --test ci_policy_workflow`; it executes the planner and archive
+evidence suites and checks the publication boundaries.

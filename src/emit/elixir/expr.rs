@@ -2478,6 +2478,7 @@ mod tests {
                 origin: None,
                 constants: Vec::new(),
                 unknown_calls: Vec::new(),
+                class_ivar_initializers: Vec::new(),
             }
         }
         fn const_ref(path: &[&str]) -> Expr {
@@ -2552,6 +2553,7 @@ mod tests {
         fn syn(node: ExprNode) -> Expr { Expr::new(crate::span::Span::synthetic(), node) }
         fn m(name: &str, params: &[&str], body: Expr) -> MethodDef {
             MethodDef {
+                visibility: crate::dialect::MethodVisibility::Public,
                 unsupported_formals: None,
                 has_anonymous_block: false,
                 name_span: crate::span::Span::synthetic(),
@@ -2601,6 +2603,7 @@ mod tests {
             origin: None,
             constants: Vec::new(),
             unknown_calls: Vec::new(),
+            class_ivar_initializers: Vec::new(),
         };
         let class = crate::lower::functionalize::functionalize(vec![class]).pop().unwrap();
         let ex = crate::emit::elixir::emit_library_class(&class).expect("emit");
@@ -2807,6 +2810,7 @@ mod tests {
         });
         // `def truncate(s, length = 30, omission = "...")` on ViewHelpers.
         let truncate = MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
             unsupported_formals: None,
             has_anonymous_block: false,
             name_span: crate::span::Span::synthetic(),
@@ -2836,6 +2840,7 @@ mod tests {
             origin: None,
             constants: Vec::new(),
             unknown_calls: Vec::new(),
+            class_ivar_initializers: Vec::new(),
         };
         clear_modules();
         register_modules(std::iter::once(&vh));

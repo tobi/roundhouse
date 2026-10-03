@@ -90,16 +90,12 @@ fn spinel_cache_download_failure_falls_back_without_hiding_build_failures() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(fs::read_to_string(&env_file).unwrap(), "NO_CCACHE=1\n");
-    assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .contains("::warning::")
-    );
-    assert!(
-        fs::read_to_string(summary)
-            .unwrap()
-            .contains("without compiler cache")
-    );
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("::warning::"));
+    assert!(fs::read_to_string(summary)
+        .unwrap()
+        .contains("without compiler cache"));
 
     // Execute the actual build bodies with controlled make exits, both with
     // caching enabled and after sourcing the fallback's exported environment.
@@ -310,10 +306,10 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
     assert_eq!(
         jobs["build-site"]["if"].as_str(),
         Some(
-            "${{ !cancelled() && needs.generate-fixture.result == 'success' && needs.build-wasm.result == 'success' }}"
+            "${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'build-site') && needs.generate-fixture.result == 'success' && (needs.plan.outputs.site != 'true' || needs.build-wasm.result == 'success') }}"
         )
     );
-    assert_eq!(jobs["smoke"]["needs"].as_str(), Some("build-site"));
+    assert_eq!(jobs["smoke"]["needs"][0].as_str(), Some("build-site"));
     let steps = jobs["build-site"]["steps"].as_sequence().unwrap();
     for (id, output, renderer) in [
         ("fetch-bench", "bench_data", "Render bench page"),
@@ -344,7 +340,7 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
             .unwrap();
         assert_eq!(
             fetch["if"].as_str(),
-            Some("github.ref == 'refs/heads/main'")
+            Some("needs.plan.outputs.publish == 'true'")
         );
         let render = steps
             .iter()
@@ -360,31 +356,26 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
         .iter()
         .find(|step| step["name"].as_str() == Some("Upload browse archives"))
         .unwrap();
-    assert!(archives.get("if").is_none(), "PR smoke needs the archives");
+    assert_eq!(archives["if"].as_str(), Some("always()"));
     assert_eq!(archives["with"]["name"].as_str(), Some("browse-archives"));
-    let pages = steps
+    let pages = jobs["assemble-site"]["steps"]
+        .as_sequence()
+        .unwrap()
         .iter()
         .find(|step| step["name"].as_str() == Some("Upload Pages artifact"))
         .unwrap();
-    assert_eq!(
-        pages["if"].as_str(),
-        Some("github.ref == 'refs/heads/main'")
-    );
-    // Keep the status function: a failed Campfire floor must not suppress
-    // its explanatory publication, but cancellation or a bad site must.
+    assert!(pages.get("if").is_none());
+    // Publication waits for the report that describes the exact archive bytes.
     assert_eq!(
         jobs["assemble-site"]["if"].as_str(),
         Some(
-            "${{ !cancelled() && github.ref == 'refs/heads/main' && needs.build-site.result == 'success' }}"
+            "${{ !cancelled() && needs.plan.outputs.publish == 'true' && needs.build-site.result == 'success' && needs.archive-results.result == 'success' }}"
         )
     );
-    assert_eq!(
-        jobs["deploy"]["if"].as_str(),
-        Some("github.repository == 'rubys/roundhouse' && github.ref == 'refs/heads/main'")
+    assert!(
+        jobs.get("deploy").is_none(),
+        "PR validation must not carry deployment privileges"
     );
-    assert!(jobs["deploy"].get("continue-on-error").is_none(), "production deployment failures must remain visible");
-    assert_eq!(jobs["deploy"]["needs"][0].as_str(), Some("assemble-site"));
-    assert_eq!(jobs["deploy"]["needs"][1].as_str(), Some("unit"));
 }
 
 #[test]
@@ -392,13 +383,18 @@ fn draft_transitions_replace_the_previous_pr_run() {
     let ci: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
     let events = ci["on"]["pull_request"]["types"].as_sequence().unwrap();
-    for event in ["ready_for_review", "converted_to_draft"] {
+    for event in [
+        "ready_for_review",
+        "converted_to_draft",
+        "labeled",
+        "unlabeled",
+    ] {
         assert!(events.iter().any(|value| value.as_str() == Some(event)));
     }
     assert_eq!(
         ci["concurrency"]["group"].as_str(),
         Some(
-            "${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}"
+            "validation-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}"
         )
     );
     assert_eq!(
@@ -420,9 +416,10 @@ fn campfire_comparisons_require_an_uploaded_binary_and_report_blocking() {
     assert_eq!(producer["continue-on-error"].as_bool(), Some(true));
     assert_eq!(consumer["continue-on-error"].as_bool(), Some(true));
     assert_eq!(
-        consumer["needs"].as_str(),
+        consumer["needs"][0].as_str(),
         Some("build-campfire-compare-spinel")
     );
+    assert_eq!(consumer["needs"][1].as_str(), Some("plan"));
     assert_eq!(
         producer["outputs"]["artifact-id"].as_str(),
         Some("${{ steps.binary.outputs.artifact-id }}")
@@ -430,7 +427,7 @@ fn campfire_comparisons_require_an_uploaded_binary_and_report_blocking() {
     assert_eq!(
         consumer["if"].as_str(),
         Some(
-            "${{ !cancelled() && needs.build-campfire-compare-spinel.outputs.artifact-id != '' }}"
+            "${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'campfire-compare-spinel') && needs.build-campfire-compare-spinel.outputs.artifact-id != '' }}"
         )
     );
     let steps = producer["steps"].as_sequence().unwrap();
@@ -734,7 +731,8 @@ fn spinel_model_differential_does_not_wait_for_the_gc_comparison_build() {
     let ci: serde_yaml_ng::Value = serde_yaml_ng::from_str(&src).expect("parse CI workflow");
     let jobs = &ci["jobs"];
     let db = &jobs["campfire-db-differential-spinel"];
-    assert_eq!(db["needs"].as_str(), Some("build-spinel"));
+    assert_eq!(db["needs"][0].as_str(), Some("build-spinel"));
+    assert_eq!(db["needs"][1].as_str(), Some("plan"));
     assert_eq!(db["continue-on-error"].as_bool(), Some(true));
 
     let command = "scripts/campfire-db-differential --spinel /tmp/campfire";
@@ -750,7 +748,11 @@ fn spinel_model_differential_does_not_wait_for_the_gc_comparison_build() {
     );
 
     let gc = &jobs["campfire-compare-spinel"];
-    assert_eq!(gc["needs"].as_str(), Some("build-campfire-compare-spinel"));
+    assert_eq!(
+        gc["needs"][0].as_str(),
+        Some("build-campfire-compare-spinel")
+    );
+    assert_eq!(gc["needs"][1].as_str(), Some("plan"));
     let modes: Vec<_> = gc["strategy"]["matrix"]["include"]
         .as_sequence()
         .expect("GC matrix")
@@ -809,7 +811,7 @@ fn pr_reuse_never_masks_validation_failures_or_changes_the_job_graph() {
                 &["build", "check"]
             }
             "writebook-inventory" => {
-                assert_eq!(job["needs"].as_str(), Some("unit"));
+                assert_eq!(job["needs"][0].as_str(), Some("unit"));
                 &["inventory", "report"]
             }
             "browser-smoke-typescript" => {
@@ -818,7 +820,7 @@ fn pr_reuse_never_masks_validation_failures_or_changes_the_job_graph() {
                 &["browser"]
             }
             "smoke" => {
-                assert_eq!(job["needs"].as_str(), Some("build-site"));
+                assert_eq!(job["needs"][0].as_str(), Some("build-site"));
                 assert_eq!(
                     probe["if"].as_str(),
                     Some("github.event_name == 'pull_request' && matrix.target == 'rust'")

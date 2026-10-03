@@ -149,8 +149,10 @@ A new deployment with no such volume can drop `boot` for `USER
 runs the whole product — sign-in, rooms, uploads, search,
 live updates over the socket — from `docker run -p 3000:3000`.
 [rubys.github.io/roundhouse/campfire/docker.tgz](https://rubys.github.io/roundhouse/campfire/docker.tgz)
-is that archive, rebuilt on every push; it is the fastest way to see
-the door's end state before pointing it at your own app.
+is that archive, refreshed by scheduled full validation or an explicitly
+publishing manual run on canonical main. PR archive checks never publish it;
+see [CI coverage](../ci-reuse.md). It is the fastest way to see the door's
+end state before pointing it at your own app.
 
 ## What to expect
 
@@ -169,8 +171,9 @@ cleanly, and when it does not, the failure is in one of two places:
 - **It builds but behaves differently from Rails.** The
   [compare oracle](verifying.md) is the reproduction: `bin/rh compare
   spinel` for the fixture, or `roundhouse-compare` against your own
-  app. The Campfire lane compares every page and every cable frame
-  against live Rails on every push.
+  app. The Campfire Spinel lane compares every page and every cable frame
+  against live Rails in full validation and when its owning inputs select
+  it; ordinary native Spinel changes do not automatically run that lane.
 
 The binary's performance is measured continuously on the blog and on
 Campfire against Rails as Rails ships it — with its fragment caching

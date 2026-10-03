@@ -991,6 +991,16 @@ pub fn target_files(
     ) {
         report_keyword_params(app, target.as_str());
     }
+    if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
+        for controller in &app.controllers {
+            if controller.body.iter().any(|item| matches!(item, crate::dialect::ControllerBodyItem::ClassMethod { configuration_slot: Some(_), .. })) {
+                return Err(format!("finite class-side configuration is not supported ({})", target.as_str()));
+            }
+        }
+        if app.library_classes.iter().any(|lc| !lc.class_ivar_initializers.is_empty()) {
+            return Err(format!("class-instance-variable initialization is not supported ({})", target.as_str()));
+        }
+    }
     let files = match target {
         BuildTarget::Blog => blog_files(fixture),
         BuildTarget::Spinel => spinel_files(app, fixture).and_then(spin_shape),
@@ -3788,6 +3798,15 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<Vec<(String, String)>, Stri
         let rbs = crate::runtime_files::read_to_string("runtime/spinel/request_forgery_protection.rbs")
             .map_err(|e| format!("read runtime/spinel/request_forgery_protection.rbs: {e}"))?;
         files.push(("sig/runtime/request_forgery_protection.rbs".to_string(), rbs));
+    }
+
+    // HTTP Token/Basic auth sidecar — the ActionController::Base reopen in
+    // runtime/http_authentication.rb (ruby family only). It types the
+    // block parameters the helpers yield, which the app's blocks compare.
+    {
+        let rbs = crate::runtime_files::read_to_string("runtime/spinel/http_authentication.rbs")
+            .map_err(|e| format!("read runtime/spinel/http_authentication.rbs: {e}"))?;
+        files.push(("sig/runtime/http_authentication.rbs".to_string(), rbs));
     }
 
     // Secret sidecar — `LocalSecret.resolve` in runtime/local_secret.rb,
@@ -6612,10 +6631,23 @@ pub fn build_site(fixture: &Path, out: &Path) -> Result<(), String> {
     fs::create_dir_all(out.join("browse"))
         .map_err(|e| format!("mkdir {}: {e}", out.display()))?;
 
+    // Archive generation cleans browse/, so copy its viewer assets afterwards.
+    build_archives(fixture, out, BuildTarget::ALL)?;
     copy_site_assets(out)?;
     copy_create_blog(out)?;
     crate::guide::render_site(out)?;
 
+    Ok(())
+}
+
+/// Build selected browse archives without website assets or WASM demos.
+/// The file sets and archive writers are shared with `build_site`.
+pub fn build_archives(fixture: &Path, out: &Path, targets: &[BuildTarget]) -> Result<(), String> {
+    let browse = out.join("browse");
+    if browse.exists() {
+        fs::remove_dir_all(&browse).map_err(|e| format!("clean {}: {e}", browse.display()))?;
+    }
+    fs::create_dir_all(&browse).map_err(|e| format!("mkdir {}: {e}", browse.display()))?;
     let mut app =
         ingest_app(fixture).map_err(|e| format!("ingest {}: {e}", fixture.display()))?;
     // Analyze + the same post-analyze shared lowerings as the
@@ -6623,7 +6655,7 @@ pub fn build_site(fixture: &Path, out: &Path) -> Result<(), String> {
     // so the residue is dropped.
     let _ = crate::session::analyze_and_lower(&mut app);
 
-    for target in BuildTarget::ALL {
+    for target in targets {
         let files = target_files(&app, fixture, *target)?;
         let name = target.as_str();
 
@@ -7666,6 +7698,7 @@ mod tests {
             origin: None,
             constants: Vec::new(),
             unknown_calls: Vec::new(),
+            class_ivar_initializers: Vec::new(),
         };
 
         // The app declares one: the arm names it.
@@ -7837,6 +7870,7 @@ mod tests {
             origin: None,
             constants: Vec::new(),
             unknown_calls: Vec::new(),
+            class_ivar_initializers: Vec::new(),
         });
         let mut files = vec![("boot.rb".to_string(), "# boot\n".to_string())];
         apply_module_mixins(&mut files, &modapp, MixinForm::Reopen);

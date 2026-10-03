@@ -185,6 +185,8 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
                             .into_iter()
                             .map(|method| ControllerBodyItem::ClassMethod {
                                 method,
+                                configuration_slot: None,
+                                configuration_role: None,
                                 leading_comments: Vec::new(),
                                 leading_blank_line: false,
                             })
@@ -317,6 +319,12 @@ fn ingest_controller_body_item(
     leading_comments: Vec<Comment>,
 ) -> IngestResult<ControllerBodyItem> {
     if let Some(def) = stmt.as_def_node() {
+        if def.receiver().is_some() {
+            return Err(IngestError::Unsupported {
+                file: file.to_string(),
+                message: "controller singleton methods are not supported; finite Concern configuration is expanded separately".to_string(),
+            });
+        }
         super::forwarding::reject_entrypoint(&def, file, "controller method")?;
         let action_name = constant_id_str(&def.name()).to_string();
         let body_expr = match def.body() {

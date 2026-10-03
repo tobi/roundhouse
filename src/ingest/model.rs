@@ -15,6 +15,7 @@ use crate::ty::{Row, Ty};
 use crate::{ClassId, Symbol, TableRef};
 
 use super::expr::ingest_expr;
+use super::visibility::{self, Visibility};
 use super::util::{
     class_name_path, collect_comments, constant_id_str, constant_path_of, drain_comments_before,
     find_first_class, flatten_statements, source_has_blank_line, string_value, symbol_or_string_value,
@@ -181,6 +182,7 @@ pub(super) fn ingest_model_with_enum_constants(
     let mut enums: IndexMap<Symbol, Vec<(String, Literal)>> = IndexMap::new();
     let mut enum_defaults: IndexMap<Symbol, Literal> = IndexMap::new();
     let mut primary_key: Option<Symbol> = None;
+    let visibility = Visibility::resolve(class.body().as_ref(), file, None)?;
     if let Some(class_body) = class.body() {
         let mut prev_end: Option<usize> = None;
         // Constants the class body assigns, for `enum :x, CONST` and for
@@ -188,7 +190,14 @@ pub(super) fn ingest_model_with_enum_constants(
         let stmts = flatten_statements(class_body);
         let class_consts = ClassConsts::collect(&stmts, file);
         let resolve_constant = |node: &Node<'_>| enum_constants.resolve(node, &enum_owners);
-        for stmt in stmts {
+        for statement in stmts {
+            let definition = visibility::definition(&statement).map(|d| d.as_node());
+            let stmt = definition.as_ref().unwrap_or(&statement);
+            if stmt.as_def_node().is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
+                prev_end = Some(statement.location().end_offset());
+                continue;
+            }
+
             // Explicit names override convention before schema binding.
             // Like primary_key, the setter is consumed: lowering already
             // synthesizes table_name from Model::table for every target.
@@ -251,7 +260,7 @@ pub(super) fn ingest_model_with_enum_constants(
             // can't. Library classes get the same treatment one level
             // down, in `walk_decl_body`.
             if let Some(sc) = stmt.as_singleton_class_node() {
-                match ingest_singleton_class_body(&sc, &owner, file) {
+                match ingest_singleton_class_body(&sc, &owner, file, &visibility) {
                     Ok(singleton) => {
                         let mut leading = leading;
                         let mut blank = leading_blank;
@@ -316,6 +325,11 @@ pub(super) fn ingest_model_with_enum_constants(
             // attribute; only the first carries the blank line that
             // separated the declaration from what came before it.
             for (i, mut item) in items.into_iter().enumerate() {
+                if let ModelBodyItem::Method { method, .. } = &mut item {
+                    visibility.apply(&statement, method);
+                } else if let ModelBodyItem::Unknown { .. } = &item {
+                    visibility.check_model_item(&statement, file)?;
+                }
                 item.set_leading_blank_line(leading_blank && i == 0);
                 body.push(item);
             }
@@ -802,6 +816,7 @@ pub(super) fn expand_enum_decl(
                 name_span: crate::span::Span::synthetic(),
                 name: Symbol::from(name),
                 receiver: MethodReceiver::Instance,
+                visibility: crate::dialect::MethodVisibility::Public,
                 params: Vec::new(),
                 unsupported_formals: None,
                 has_anonymous_block: false,
@@ -898,6 +913,7 @@ if generate.instance_methods {
             name_span: crate::span::Span::synthetic(),
             name: Symbol::from(crate::naming::pluralize_snake(&column)),
             receiver: MethodReceiver::Class,
+            visibility: crate::dialect::MethodVisibility::Public,
             params: Vec::new(),
             unsupported_formals: None,
             has_anonymous_block: false,
@@ -1307,8 +1323,9 @@ fn ingest_singleton_class_body(
     sc: &ruby_prism::SingletonClassNode<'_>,
     owner: &ClassId,
     file: &str,
+    visibility: &Visibility,
 ) -> IngestResult<super::singleton_class::SingletonBody> {
-    super::singleton_class::ingest_singleton_body(sc, owner, file, &|def| ingest_method(def, file))
+    super::singleton_class::ingest_singleton_body_with_visibility(sc, owner, file, &|def| ingest_method(def, file), Some(visibility))
 }
 
 pub(super) fn ingest_method(
@@ -1453,6 +1470,7 @@ pub(super) fn ingest_method(
         name_span: super::util::def_name_span(def, file),
         name,
         receiver,
+        visibility: crate::dialect::MethodVisibility::Public,
         params,
         unsupported_formals: formals.unsupported,
         has_anonymous_block: formals.has_anonymous_block,
@@ -2212,7 +2230,7 @@ mod singleton_visibility_tests {
     /// file's ingest ("unsupported statement inside `class << self`"),
     /// which drops the model rather than the marker.
     #[test]
-    fn a_visibility_marker_in_a_singleton_block_is_skipped_not_refused() {
+    fn a_visibility_marker_in_a_singleton_block_is_resolved_not_refused() {
         let model = ingest(
             "class Thing < ApplicationRecord\n  \
              class << self\n    \
@@ -2231,6 +2249,11 @@ mod singleton_visibility_tests {
             })
             .collect();
         assert_eq!(names, vec!["visible", "hidden"], "both singleton methods survive");
+        let visibility: Vec<_> = model.body.iter().filter_map(|item| match item {
+            crate::dialect::ModelBodyItem::Method { method, .. } => Some(method.visibility),
+            _ => None,
+        }).collect();
+        assert_eq!(visibility, vec![crate::dialect::MethodVisibility::Public, crate::dialect::MethodVisibility::Private]);
     }
 
     /// A statement the walk genuinely cannot read still refuses — the

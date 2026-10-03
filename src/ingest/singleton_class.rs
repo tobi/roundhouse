@@ -68,6 +68,16 @@ pub(super) fn ingest_singleton_body(
     file: &str,
     ingest_def: &dyn Fn(&ruby_prism::DefNode<'_>) -> IngestResult<MethodDef>,
 ) -> IngestResult<SingletonBody> {
+    ingest_singleton_body_with_visibility(sc, owner, file, ingest_def, None)
+}
+
+pub(super) fn ingest_singleton_body_with_visibility(
+    sc: &ruby_prism::SingletonClassNode<'_>,
+    owner: &ClassId,
+    file: &str,
+    ingest_def: &dyn Fn(&ruby_prism::DefNode<'_>) -> IngestResult<MethodDef>,
+    visibility: Option<&super::visibility::Visibility>,
+) -> IngestResult<SingletonBody> {
     let mut out = SingletonBody::default();
     // Only `class << self` is the enclosing class's own singleton. The
     // `class << other_object` form opens somebody else's.
@@ -77,7 +87,13 @@ pub(super) fn ingest_singleton_body(
     }
     let Some(body) = sc.body() else { return Ok(out) };
     for stmt in flatten_statements(body) {
+        let start = out.methods.len();
         walk_statement(&stmt, owner, file, ingest_def, &mut out)?;
+        if let Some(visibility) = visibility {
+            for method in &mut out.methods[start..] {
+                visibility.apply(&stmt, method);
+            }
+        }
     }
     Ok(out)
 }
