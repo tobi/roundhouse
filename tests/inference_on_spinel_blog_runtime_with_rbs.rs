@@ -129,6 +129,27 @@ fn collect_untyped(e: &Expr, path: &str, out: &mut Vec<String>) {
                 collect_untyped(&arm.body, &format!("{path}/case.arm[{i}].body"), out);
             }
         }
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            collect_untyped(scrutinee, &format!("{path}/case_match.scrut"), out);
+            for (i, arm) in arms.iter().enumerate() {
+                arm.pattern.for_each_expr(&mut |e| {
+                    collect_untyped(e, &format!("{path}/case_match.arm[{i}].pattern"), out);
+                });
+                if let Some((_, g)) = &arm.guard {
+                    collect_untyped(g, &format!("{path}/case_match.arm[{i}].guard"), out);
+                }
+                collect_untyped(&arm.body, &format!("{path}/case_match.arm[{i}].body"), out);
+            }
+            if let Some(e) = else_body {
+                collect_untyped(e, &format!("{path}/case_match.else"), out);
+            }
+        }
+        ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+            collect_untyped(value, &format!("{path}/match.value"), out);
+            pattern.for_each_expr(&mut |e| {
+                collect_untyped(e, &format!("{path}/match.pattern"), out);
+            });
+        }
         ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => {
             collect_untyped(value, &format!("{path}/assign.value"), out)
         }
@@ -895,7 +916,16 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // the method is typed `(String) -> String` in connection.rbs. What
     // it buys: `upsert_all(unique_by:)` names a partial unique index
     // with its `WHERE`, as Rails does, which SQLite needs to match it.
-    const CEILING: usize = 1130;
+    // 2026-10-02 1130 -> 1179, +49, MEASURED by method against main
+    // e0d8610e: Kaminari's surface on Relation (relation.rb 691 -> 738)
+    // and `Base.page` (connection.rb 208 -> 210). Almost all of it is
+    // the readers calling one another bare (`next_page` reads
+    // `current_page` and `total_pages`, `total_count` is `count`), which
+    // this probe does not resolve; the rest is the untyped `num`
+    // parameter of `page` / `per`. The full-context gate in
+    // runtime_src_integration counts three. What it buys: Kaminari's
+    // `page` / `per` chains and readers run.
+    const CEILING: usize = 1179;
 
     assert!(
         all_untyped.len() <= CEILING,

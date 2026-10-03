@@ -834,55 +834,9 @@ fn reject_unsupported_forwarded_procs(app: &App, target: BuildTarget) -> Result<
         }
         e.node.for_each_child(&mut |child| visit(child, target, found));
     }
-    fn visit_method(method: &crate::dialect::MethodDef, f: &mut impl FnMut(&crate::expr::Expr)) {
-        f(&method.body);
-        for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-            f(default);
-        }
-    }
     let mut found = false;
     let mut f = |e: &crate::expr::Expr| visit(e, target.as_str(), &mut found);
-    crate::lower::for_each_hook_body_ref(app, &mut f);
-    for controller in &app.controllers {
-        for action in controller.actions() {
-            for default in action.kw_params.iter().filter_map(|(_, e)| e.as_ref()) {
-                f(default);
-            }
-        }
-    }
-    for view in &app.views {
-        f(&view.body);
-        for default in view.strict_locals.iter().flatten().filter_map(|p| p.default.as_ref()) {
-            f(default);
-        }
-    }
-    for tm in &app.test_modules {
-        if let Some(setup) = &tm.setup { f(setup); }
-        for test in &tm.tests { f(&test.body); }
-        for method in &tm.helpers { visit_method(method, &mut f); }
-        for class in &tm.inner_classes {
-            for method in &class.methods { visit_method(method, &mut f); }
-            for (_, value) in &class.constants { f(value); }
-            for call in &class.unknown_calls { f(call); }
-        }
-        for (_, value) in &tm.constants { f(value); }
-    }
-    for fixture in &app.fixtures {
-        for e in &fixture.preamble { f(e); }
-        for value in fixture.records.values().flat_map(|record| record.values()) {
-            if let crate::dialect::FixtureValue::Ruby(e) = value { f(e); }
-        }
-    }
-    for helper in &app.routes.direct_helpers { f(&helper.body); }
-    for function in &app.sql_functions {
-        match &function.kind {
-            crate::app::SqlFunctionKind::Scalar { method } => visit_method(method, &mut f),
-            crate::app::SqlFunctionKind::Aggregate { step, finalize } => {
-                visit_method(step, &mut f);
-                visit_method(finalize, &mut f);
-            }
-        }
-    }
+    crate::lower::for_each_emit_body_ref(app, &mut f);
     if found {
         return Err(format!("{}: arbitrary &expr Proc forwarding is not supported; use Ruby instead", target.as_str()));
     }
@@ -928,11 +882,39 @@ fn report_sqlite_index_predicates(app: &App, target: BuildTarget) {
     }
 }
 
+/// `case/in` is not equivalent to the targets' existing `case/when`
+/// renderers, even for nil or a plain binding. Refuse before file emission
+/// rather than lose bindings, skip evaluation, or turn a test into a wildcard.
+fn reject_unsupported_pattern_matches(app: &App, target: BuildTarget) -> Result<(), String> {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby
+        | BuildTarget::Spinel | BuildTarget::Roda) {
+        return Ok(());
+    }
+    fn visit(e: &crate::expr::Expr, target: &str, found: &mut bool) {
+        use crate::expr::ExprNode;
+        if matches!(&*e.node, ExprNode::CaseMatch { .. } | ExprNode::MatchPredicate { .. }
+            | ExprNode::MatchRequired { .. }) {
+            *found = true;
+            emit::diagnostics::report_unsupported(e.span, target, e.node.kind_str(),
+                "structural pattern matching requires a native Ruby target");
+        }
+        e.node.for_each_child(&mut |child| visit(child, target, found));
+    }
+    let mut found = false;
+    let mut f = |e: &crate::expr::Expr| visit(e, target.as_str(), &mut found);
+    crate::lower::for_each_emit_body_ref(app, &mut f);
+    if found {
+        return Err(format!("{}: structural pattern matching requires a native Ruby target", target.as_str()));
+    }
+    Ok(())
+}
+
 pub fn target_files(
     app: &App,
     fixture: &Path,
     target: BuildTarget,
 ) -> Result<Vec<(String, String)>, String> {
+    reject_unsupported_pattern_matches(app, target)?;
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);
@@ -1001,7 +983,7 @@ pub fn target_files(
             return Err(format!("class-instance-variable initialization is not supported ({})", target.as_str()));
         }
     }
-    let files = match target {
+    let files = crate::timings::phase(format_args!("emit {}: assemble", target.as_str()), || match target {
         BuildTarget::Blog => blog_files(fixture),
         BuildTarget::Spinel => spinel_files(app, fixture).and_then(|(files, _)| spin_shape(files)),
         // The ruby family gets the bundled-library requires too: the
@@ -1024,7 +1006,7 @@ pub fn target_files(
             app,
             &crate::profile::DeploymentProfile::worker(),
         ))),
-    }?;
+    })?;
 
     // Ruby-family trees ship the framework runtime as verbatim text, so
     // their tree-shake runs here, on the finished file set (after
@@ -1043,7 +1025,9 @@ pub fn target_files(
             .map(|s| s.as_str().to_string())
             .collect();
         let mut files = files;
-        emit::ruby::shake::shake_tree(&mut files, &synth_shakeable, target.as_str());
+        crate::timings::phase(format_args!("emit {}: tree shake", target.as_str()), || {
+            emit::ruby::shake::shake_tree(&mut files, &synth_shakeable, target.as_str());
+        });
         files
     } else {
         files
@@ -5460,6 +5444,11 @@ fn trim_gemfile(content: &str, has_js: bool, has_cable: bool) -> String {
 /// comments are skipped: the cookie jar explains a `Set.new` rewrite in
 /// one, and that is not a use.
 fn names_constant(src: &str, konst: &str) -> bool {
+    // Most files never mention this name. Reject those with the optimized
+    // substring search before walking/decoding every line of the runtime.
+    if !src.contains(konst) {
+        return false;
+    }
     src.lines().any(|line| {
         if line.trim_start().starts_with('#') {
             return false;
@@ -5499,6 +5488,9 @@ fn names_constant(src: &str, konst: &str) -> bool {
 /// True where the emitted program defines the constant itself, in which
 /// case the bundled library is not what the name refers to.
 fn defines_constant(src: &str, konst: &str) -> bool {
+    if !src.contains(konst) {
+        return false;
+    }
     src.lines().any(|line| {
         let trimmed = line.trim_start();
         ["class ", "module "].iter().any(|kw| {
@@ -5522,6 +5514,9 @@ fn defines_constant(src: &str, konst: &str) -> bool {
 /// `packages/erb` (a `class`) collided with the shim (a `module`). The
 /// lobsters AOT lane was red for ten days on that comment.
 fn requires_feature(src: &str, require_line: &str) -> bool {
+    if !src.contains(require_line) {
+        return false;
+    }
     src.lines().any(|line| {
         let trimmed = line.trim_start();
         trimmed
@@ -6521,89 +6516,6 @@ fn walk_dir_into(
     Ok(())
 }
 
-/// Walk `src` recursively, routing `.rb` files under `rb_prefix` and
-/// `.rbs` files under `rbs_prefix`. Other extensions and dotfiles are
-/// skipped. Splits `runtime/ruby/<sub>/` between the load-path tree
-/// (`runtime/`) and the typed sidecar tree (`sig/runtime/`) in one pass.
-fn walk_dir_partitioned(
-    src: &Path,
-    rb_prefix: &str,
-    rbs_prefix: &str,
-    out: &mut Vec<(String, String)>,
-) -> Result<(), String> {
-    if !src.exists() {
-        return Err(format!("missing {}/", src.display()));
-    }
-    let mut stack: Vec<(PathBuf, String)> = vec![(src.to_path_buf(), String::new())];
-    while let Some((dir, sub)) = stack.pop() {
-        for entry in fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
-            let entry = entry.map_err(|e| format!("read entry: {e}"))?;
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') {
-                continue;
-            }
-            let path = entry.path();
-            let ty = entry.file_type().map_err(|e| format!("stat: {e}"))?;
-            if ty.is_dir() && SKIP_DIRS.contains(&name_str.as_ref()) {
-                continue;
-            }
-            let nested = format!("{sub}{name_str}");
-            if ty.is_dir() {
-                stack.push((path, format!("{nested}/")));
-                continue;
-            }
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let prefix = match ext {
-                "rb" => rb_prefix,
-                "rbs" => rbs_prefix,
-                _ => continue,
-            };
-            let content = match fs::read_to_string(&path) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            out.push((format!("{prefix}{nested}"), content));
-        }
-    }
-    Ok(())
-}
-
-/// Walk `src` non-recursively, collecting only files whose extension
-/// is in `exts`. Used to gather `runtime/spinel/*.rb` without
-/// recursing into `runtime/spinel/{scaffold,test}` (those are walked
-/// separately into different output prefixes).
-fn walk_dir_flat(
-    src: &Path,
-    exts: &[&str],
-    prefix: &str,
-    out: &mut Vec<(String, String)>,
-) -> Result<(), String> {
-    for entry in fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
-        let entry = entry.map_err(|e| format!("read entry: {e}"))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let ext_match = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|e| exts.contains(&e))
-            .unwrap_or(false);
-        if !ext_match {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("non-utf8 filename: {}", path.display()))?;
-        let content = fs::read_to_string(&path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        out.push((format!("{prefix}{name}"), content));
-    }
-    Ok(())
-}
-
 /// Orchestrates the `--site` mode of the `roundhouse` binary: for
 /// every `BuildTarget`, produce `_site/browse/<lang>.{json,tgz,zip}`,
 /// and copy the static landing-page assets (`site/`) plus the
@@ -7246,7 +7158,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_seed_file_is_REPLACED_not_preserved() {
+    fn a_stale_seed_file_is_replaced_not_preserved() {
         // The inverse of the old contract, and the point of the change:
         // spinel/ruby/jruby pick up the scaffold's copy by directory
         // walk, and that copy held the BLOG's rows for every app.
