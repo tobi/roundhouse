@@ -5928,3 +5928,47 @@ fn rails_root_join_takes_any_number_of_parts() {
     run.assert_passes();
     assert!(run.stdout.contains("Rails.root.join contract passed"));
 }
+
+/// `javascript_include_tag :application` names the source with a
+/// Symbol, as Rails allows. The call is hoisted to a constant, so it
+/// runs at load. Before, the runtime called `include?` on the Symbol,
+/// and the layout raised `NoMethodError` at boot.
+#[test]
+fn a_symbol_source_for_javascript_include_tag_renders_a_script_tag() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/views/layouts/application.html.erb",
+            "    <%= javascript_importmap_tags %>\n",
+            "    <%= javascript_importmap_tags %>\n    <%= javascript_include_tag :application %>\n",
+        )
+        .write(
+            "app/views/articles/_scripts.html.erb",
+            "<%= javascript_include_tag :admin, defer: true %>",
+        )
+        .run_ruby(
+            r#"html = Views::Articles.scripts(nil)
+raise "script tag: #{html}" unless html == %(<script src="/assets/admin.js" defer="defer"></script>)
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// A Symbol source that a value holds, not a literal, reaches the
+/// runtime as a Symbol. Before, the runtime called `include?` on it and
+/// raised `NoMethodError`.
+#[test]
+fn a_symbol_source_in_a_value_for_javascript_include_tag_renders_a_script_tag() {
+    emit_and_run::real_blog()
+        .write(
+            "app/views/articles/_scripts.html.erb",
+            "<% source = :admin %><%= javascript_include_tag source %>",
+        )
+        .run_ruby(
+            r#"html = Views::Articles.scripts(nil)
+raise "script tag: #{html}" unless html == %(<script src="/assets/admin.js"></script>)
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
