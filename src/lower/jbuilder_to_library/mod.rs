@@ -41,6 +41,9 @@
 //!  11. `begin … rescue … end`          → the same `begin`; a `rescue`
 //!                                       first drops a pair the body
 //!                                       left half-written
+//!  12. `x = <expr>`                    → kept as written, in place; a
+//!                                       local the template reads
+//!                                       later
 //!
 //! (6)-(9) arrived together with campfire's bot API, which is six
 //! jbuilder templates written in exactly that dialect.
@@ -422,6 +425,9 @@ enum JbStmt<'a> {
         body: &'a Expr,
         rescues: &'a [RescueClause],
     },
+    /// `x = <expr>` — a template local. Emitted as written; it adds
+    /// no pair.
+    Local,
     /// Unrecognized DSL or non-Send statement. Surfaces as an empty io
     /// append so the lowered body stays well-formed.
     Unknown,
@@ -476,27 +482,38 @@ fn emit_object(raw_stmts: &[&Expr], ctx: &Ctx) -> Vec<Expr> {
 
     // Whole-template DSL forms (single stmt covers the entire JSON
     // body) — array! and partial! produce a top-level array or method
-    // call respectively, no `{}` wrap.
-    if classified.len() == 1 {
+    // call respectively, no `{}` wrap. Template locals around that one
+    // statement stay where they are and do not count.
+    let mut dsl = classified
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !matches!(c, JbStmt::Local));
+    if let (Some((index, only)), None) = (dsl.next(), dsl.next()) {
         // Synthesis choke point (whole-template forms): everything
         // emitted for the single DSL statement attributes back to it.
-        let src_span = raw_stmts[0].span;
-        match &classified[0] {
+        let src_span = raw_stmts[index].span;
+        let whole = match only {
             JbStmt::ArrayPartial { collection, partial_path, item_var } => {
-                let mut out = emit_array_partial(collection, partial_path, item_var, ctx);
-                for e in &mut out {
-                    e.inherit_span(src_span);
-                }
-                return out;
+                Some(emit_array_partial(collection, partial_path, item_var, ctx))
             }
             JbStmt::Partial { partial_path, arg } => {
-                let mut out = emit_partial_call(partial_path, arg, ctx);
-                for e in &mut out {
-                    e.inherit_span(src_span);
-                }
-                return out;
+                Some(emit_partial_call(partial_path, arg, ctx))
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(mut whole) = whole {
+            for e in &mut whole {
+                e.inherit_span(src_span);
+            }
+            let mut out: Vec<Expr> = Vec::new();
+            for (i, src) in raw_stmts.iter().enumerate() {
+                if i == index {
+                    out.append(&mut whole);
+                } else {
+                    out.push((*src).clone());
+                }
+            }
+            return out;
         }
     }
 
@@ -708,6 +725,9 @@ fn emit_pairs(
             JbStmt::Guarded { body, rescues } => {
                 sep = emit_guarded(body, rescues, ctx, out, sep);
             }
+            JbStmt::Local => {
+                out.push((*src).clone());
+            }
             JbStmt::Unknown => {
                 out.push(io_append_lit(&ctx.accumulator, ""));
             }
@@ -812,6 +832,9 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
     }
     if let ExprNode::If { cond, then_branch, else_branch } = &*stmt.node {
         return JbStmt::Cond { cond, then_branch, else_branch };
+    }
+    if let ExprNode::Assign { target: LValue::Var { .. }, .. } = &*stmt.node {
+        return JbStmt::Local;
     }
     let ExprNode::Send {
         recv: Some(recv),
