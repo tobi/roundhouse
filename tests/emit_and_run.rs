@@ -6027,3 +6027,32 @@ end
         )
         .assert_passes();
 }
+
+/// A prior explicit include is a no-op when an included block repeats it.
+/// The Concern itself never gains the nested module as an ancestor.
+#[test]
+fn a_repeated_included_block_include_preserves_host_and_concern_ancestry() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/concerns/signing.rb",
+            "module Signing\n  extend ActiveSupport::Concern\n  included do\n    include Signing::Codes\n  end\n  def shout\n    \"outer\"\n  end\nend\n",
+        )
+        .write(
+            "app/models/concerns/signing/codes.rb",
+            "module Signing::Codes\n  extend ActiveSupport::Concern\n  def shout\n    \"inner\"\n  end\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  include Signing::Codes\n  include Signing\n",
+        )
+        .run_ruby(
+            r#"raise "concern ancestry changed" if Signing.ancestors.include?(Signing::Codes)
+a = Article.new(title: "Hi", body: "Body text here")
+raise "repeated include changed precedence" unless a.shout == "outer"
+raise "host ancestry changed" unless Article.ancestors.index(Signing) < Article.ancestors.index(Signing::Codes)
+"#,
+        )
+        .assert_passes();
+}
+
