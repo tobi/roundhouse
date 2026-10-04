@@ -742,17 +742,3 @@ pub(crate) fn is_view_helper_marker_include(path: &[&str]) -> bool {
 pub(crate) fn is_active_model_marker_include(path: &[&str]) -> bool {
     matches!(path, ["ActiveModel", ..])
 }
-
-/// The name `def m(...)` binds its forwarded positional arguments to, and
-/// the `foo(...)` call site splats back out.
-pub(super) const FORWARDED_REST: &str = "__fwd";
-
-/// The name `def m(...)` binds its forwarded block to (the same binding an
-/// anonymous `&` parameter gets), and the `foo(...)` call site passes on.
-pub(super) const FORWARDED_BLOCK: &str = "__blk";
-
-/// Is this the `...` parameter (`def m(...)`, `def m(a, ...)`)? Prism
-/// parks it in the keyword-rest slot.
-pub(super) fn has_forwarding_parameter(pn: &ruby_prism::ParametersNode<'_>) -> bool {
-    pn.keyword_rest().is_some_and(|k| k.as_forwarding_parameter_node().is_some())
-}

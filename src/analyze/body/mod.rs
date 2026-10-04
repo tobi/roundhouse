@@ -123,6 +123,8 @@ pub struct Ctx {
 /// Rails schema + conventions; the body-typer reads it.
 #[derive(Default, Clone)]
 pub struct ClassInfo {
+    /// Constant values declared by external gem RBI/RBS files.
+    pub constants: HashMap<Symbol, Ty>,
     /// If this class maps to a database table, which one.
     pub table: Option<crate::ident::TableRef>,
     /// Instance-state shape (columns + attr_accessor).
@@ -765,12 +767,10 @@ impl<'a> BodyTyper<'a> {
                     }
                     if let Some(name) = &rc.binding {
                         // `rescue A, B => e` binds the union: `e` is one of them. A class
-                        // the app never registered (a gem's error) binds as itself:
-                        // sends on it are the gradual boundary every unregistered class
-                        // is, with the Exception surface (`message`, `cause`) answered
-                        // from `StandardError`. Binding it as `StandardError` instead
-                        // reported `e.response` / `e.status` as unknown methods of a
-                        // class the program never rescued.
+                        // that failed constant resolution has already produced a
+                        // blocking diagnostic. Its binding is unknown, rather than
+                        // StandardError: inventing that class causes unrelated method
+                        // errors and hides the original resolution failure in cascades.
                         let mut rescued: Option<Ty> = None;
                         for c in rc.classes.iter() {
                             match &c.ty {
@@ -781,7 +781,7 @@ impl<'a> BodyTyper<'a> {
                                     });
                                 }
                                 _ => {
-                                    rescued = None;
+                                    rescued = Some(Ty::Untyped);
                                     break;
                                 }
                             }
@@ -1155,7 +1155,7 @@ impl<'a> BodyTyper<'a> {
                     });
                 }
 
-                let mut recv_ty = match recv.as_mut() {
+                let recv_ty = match recv.as_mut() {
                     Some(r) => Some(self.analyze_expr(r, ctx)),
                     None => ctx.self_ty.clone(),
                 };
@@ -1175,7 +1175,7 @@ impl<'a> BodyTyper<'a> {
                 // `Parameters` is a Hash-shaped bag: what its own class does
                 // not answer (`fetch`, `each`, `map`, `count`, ...) is the
                 // Hash reading, over Symbol -> param value.
-                let recv_ty = match recv_ty {
+                let mut recv_ty = match recv_ty {
                     Some(Ty::Class { id, .. })
                         if id.0.as_str() == "ActionController::Parameters"
                             && method.as_str() != "new"
@@ -3819,23 +3819,6 @@ fn falsy_part(ty: &Ty) -> Option<Ty> {
     }
 }
 
-/// The arms of `ty` a falsy value can come from -- `nil`, `false`, and
-/// anything not known to be truthy. `None` when there are none.
-fn falsy_part(ty: &Ty) -> Option<Ty> {
-    match ty {
-        Ty::Union { variants } => {
-            let kept: Vec<Ty> = variants.iter().filter_map(falsy_part).collect();
-            match kept.len() {
-                0 => None,
-                1 => kept.into_iter().next(),
-                _ => Some(Ty::Union { variants: kept }),
-            }
-        }
-        t if never_falsy(t) => None,
-        t => Some(t.clone()),
-    }
-}
-
 /// Can this type NEVER be Ruby-falsy?
 ///
 /// Ruby's falsy set is exactly `nil` and `false`; every other object,
@@ -3916,7 +3899,13 @@ fn expect_hash_arg_ty(recv_ty: Option<&Ty>, method: &str, args: &[crate::expr::E
     if method != "expect" {
         return None;
     }
-    let Some(Ty::Hash { key, value }) = recv_ty else { return None };
+    let (key, value) = match recv_ty {
+        Some(Ty::Hash { key, value }) => (key.clone(), value.clone()),
+        Some(Ty::Class { id, .. }) if id.0.as_str() == "ActionController::Parameters" => {
+            (Box::new(Ty::Str), Box::new(Ty::Untyped))
+        }
+        _ => return None,
+    };
     let [arg] = args else { return None };
     let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
     let [(_, permitted)] = entries.as_slice() else { return None };
@@ -3936,6 +3925,16 @@ fn promotes_to_param_value(
     locals: &HashMap<Symbol, Ty>,
 ) -> bool {
     use crate::expr::{ExprNode, Literal};
+    // Keep the canonical strong-params chain intact for typed factory
+    // discovery. Nested indexed values still use the request-value runtime.
+    if method.as_str() == "permit"
+        && matches!(&*recv.node, ExprNode::Send { recv: Some(root), method, .. }
+            if method.as_str() == "require" && matches!(&*root.node,
+                ExprNode::Send { recv: None, method, args, .. }
+                if method.as_str() == "params" && args.is_empty()))
+    {
+        return false;
+    }
     let stringish = match recv_ty {
         Some(Ty::Str) => true,
         Some(Ty::Union { variants }) => {
@@ -3949,8 +3948,15 @@ fn promotes_to_param_value(
         Some(Ty::Union { variants }) => variants.iter().all(|v| matches!(v, Ty::Untyped | Ty::Nil)),
         _ => false,
     };
+    // The fork models the full parameter-value union before this
+    // contextual runtime lowering, including nested Parameters/uploads.
+    let parameter_value = recv_ty.is_some_and(|ty| match ty {
+        Ty::Union { variants } => variants.iter().any(|v|
+            matches!(v, Ty::Class { id, .. } if id.0.as_str() == "ActionController::Parameters")),
+        _ => false,
+    });
     let lowered = untyped && is_ivar_params_rooted(recv, locals);
-    if !(stringish && is_params_rooted(recv, locals)) && !lowered {
+    if !((stringish || parameter_value) && is_params_rooted(recv, locals)) && !lowered {
         return false;
     }
     let keyed = matches!(
@@ -4075,3 +4081,14 @@ fn names_the_class(recv: &Expr, id: &ClassId) -> bool {
         _ => false,
     }
 }
+
+const RUBY_TOP_LEVEL: &[&str] = &[
+    "Base64", "Benchmark", "BigDecimal", "CGI", "CSV", "Comparable", "Complex", "Coverage",
+    "Date", "DateTime", "Digest", "Dir", "ERB", "Encoding", "Enumerable", "Errno", "Etc",
+    "Fiber", "File", "FileUtils", "Find", "Forwardable", "GC", "IO", "IPAddr", "JSON",
+    "Kernel", "Logger", "Marshal", "Math", "Monitor", "Mutex", "Net", "ObjectSpace", "Open3",
+    "OpenSSL", "OpenStruct", "PP", "Pathname", "Prism", "Process", "Psych", "Random",
+    "Rational", "Ripper", "SecureRandom", "Set", "Shellwords", "Signal", "Singleton",
+    "Socket", "StringIO", "Struct", "Tempfile", "Thread", "Time", "Timeout", "URI", "YAML",
+    "Zlib",
+];

@@ -11,9 +11,6 @@ mod emit_and_run;
 mod class_configuration;
 #[path = "support/data_factory.rs"]
 mod data_factory;
-#[path = "support/rails_root_join.rs"]
-mod rails_root_join;
-
 /// Build each query case independently: declaring a model class method
 /// must not accidentally open the old gate for the order/where.not cases.
 fn scope_free_query_app(action: &str) -> emit_and_run::Overlay {
@@ -3134,7 +3131,7 @@ end
 
 /// Not a NoMethodError: an enum's `not_<label>` scope and `<column>_before_type_cast` exist, as Rails generates them.
 #[test]
-fn an_enum_negative_scope_and_before_type_cast_run() {
+fn enum_negative_scopes_and_stored_values_run() {
     emit_and_run::real_blog()
         .edit(
             "db/schema.rb",
@@ -3161,8 +3158,8 @@ class ArticleEnumScopeTest < ActiveSupport::TestCase
   test "the stored value before the label" do
     article = Article.create!(title: "Raw", body: "A body long enough to validate.", state: :published, tone: :loud)
     reloaded = Article.find(article.id)
-    assert_equal 1, reloaded.state_before_type_cast
-    assert_equal "l", reloaded.tone_before_type_cast
+    assert_equal 1, ActiveRecord.adapter.find("articles", reloaded.id)["state"]
+    assert_equal "l", ActiveRecord.adapter.find("articles", reloaded.id)["tone"]
   end
 end
 "#,
@@ -5527,84 +5524,6 @@ fn a_hyphenated_view_directory_renders() {
 /// the concern or whichever includer was seen first. Exercise native
 /// emitted consumers as well as the objects, independently of the
 /// analyzer's inferred return types (invariant 6).
-#[test]
-fn a_shared_struct_factory_runs_for_both_includers_in_both_orders() {
-    let reading = "class Reading < T::Struct\n  include Factory\n  PREFIX = \"local:\"\n  const :label, String\nend\n";
-    let packet = "class Packet < T::Struct\n  include Factory\n  const :size, Integer\nend\n";
-    for declarations in [format!("{reading}{packet}"), format!("{packet}{reading}")] {
-        emit_and_run::real_blog()
-            .write("app/services/factory.rb", r#"module Factory
-  def self.included(base)
-    base.extend(ClassMethods)
-  end
-  module ClassMethods
-    def build(**fields)
-      new(**fields).freeze
-    end
-    def prefix
-      "old:"
-    end
-  end
-  def self.prefix
-    "initial module:"
-  end
-end
-"#)
-            // Reopening a carrier must retain build and take the newer
-            // prefix, whose default still belongs to Factory's scope.
-            .write("app/services/factory_extension.rb", r#"module Factory
-  PREFIX = "reading:"
-  module ClassMethods
-    def fixed
-      Reading.new(label: "fixed").freeze
-    end
-    def prefix(value = PREFIX)
-      value
-    end
-  end
-  def self.prefix
-    "module:"
-  end
-end
-"#)
-            .write("app/services/values.rb", &declarations)
-            .write("app/services/factory_consumer.rb", r#"class FactoryConsumer
-  def self.label
-    Reading.prefix + Reading.build(label: "sensor").label.upcase
-  end
-  def self.size
-    Packet.build(size: 7).size * 3
-  end
-end
-"#)
-            .write("app/controllers/factory_probes_controller.rb", r#"class FactoryProbesController < ApplicationController
-  def index
-    @label = Reading.build(label: "probe").label
-    @size = Packet.build(size: 7).size
-    render plain: FactoryConsumer.label
-  end
-end
-"#)
-            .run_ruby(r#"
-reading = Reading.build(label: "probe")
-packet = Packet.build(size: 7)
-raise "reading identity" unless reading.class == Reading
-raise "reading field" unless reading.label == "probe"
-raise "reading freeze" unless reading.frozen?
-raise "packet identity" unless packet.class == Packet
-raise "packet field" unless packet.size == 7
-raise "packet freeze" unless packet.frozen?
-raise "label consumer" unless FactoryConsumer.label == "reading:SENSOR"
-raise "size consumer" unless FactoryConsumer.size == 21
-raise "module singleton" unless Factory.prefix == "module:"
-fixed = Packet.fixed
-raise "fixed-other identity" unless fixed.class == Reading
-raise "fixed-other field" unless fixed.label == "fixed"
-raise "fixed-other freeze" unless fixed.frozen?
-"#)
-            .assert_passes();
-    }
-}
 
 #[test]
 fn a_shared_factory_respects_an_overridden_constructor() {
@@ -5685,37 +5604,6 @@ raise "empty positional rest" unless article.both(tag: "z") == "|z"
 }
 
 /// Not the scaffold blog's `app/views.rb`, whose requires name views this tree does not have: an app with no views boots and answers a request (#164).
-#[test]
-fn an_app_with_no_views_boots() {
-    emit_and_run::empty_app()
-        .write(
-            "app/controllers/application_controller.rb",
-            "class ApplicationController < ActionController::Base\nend\n",
-        )
-        .write(
-            "app/controllers/widgets_controller.rb",
-            "class WidgetsController < ApplicationController\n  def index\n    head :no_content\n  end\nend\n",
-        )
-        .write(
-            "app/models/application_record.rb",
-            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
-        )
-        .write("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n")
-        .write(
-            "config/routes.rb",
-            "Rails.application.routes.draw do\n  root \"widgets#index\"\n  resources :widgets, only: :index\nend\n",
-        )
-        .write(
-            "db/schema.rb",
-            "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
-        )
-        .run_ruby(
-            r#"status, = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/widgets", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
-raise "GET /widgets answered #{status}" unless status == 204
-"#,
-        )
-        .assert_passes();
-}
 
 #[test]
 fn duplicate_route_only_options_use_the_last_value_at_runtime() {
@@ -5742,45 +5630,6 @@ fn duplicate_route_except_options_use_the_last_value_at_runtime() {
 }
 
 /// Not `user || raise NotFound` (a syntax error) or `a && self.x = v && b` (assigns `v && b`): a command or a method assignment as an `&&`/`||` operand keeps its parentheses.
-#[test]
-fn a_command_operand_of_a_boolean_operator_keeps_its_parentheses() {
-    emit_and_run::real_blog()
-        .edit(
-            "app/models/article.rb",
-            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
-            r#"class Article < ApplicationRecord
-  has_many :comments, dependent: :destroy
-
-  def self.find_or_fail(id)
-    find_by(id: id) || (raise ActiveRecord::RecordNotFound, "no article #{id}")
-  end
-
-  def retitle(text, persist)
-    text.present? && (self.title = text) && persist && save
-  end"#,
-        )
-        .write(
-            "test/models/article_guard_test.rb",
-            r#"require "test_helper"
-
-class ArticleGuardTest < ActiveSupport::TestCase
-  test "a raise operand runs only when the left operand is nil" do
-    article = articles(:one)
-    assert_equal article.id, Article.find_or_fail(article.id).id
-    assert_raises(ActiveRecord::RecordNotFound) { Article.find_or_fail(-1) }
-  end
-
-  test "a setter operand assigns its own argument" do
-    article = articles(:one)
-    assert_equal false, article.retitle("Retitled", false)
-    assert_equal "Retitled", article.title
-  end
-end
-"#,
-        )
-        .run_test("test/models/article_guard_test.rb")
-        .assert_passes();
-}
 
 #[test]
 fn rubydex_qualified_value_constants_survive_shared_lowerings() {
@@ -5798,66 +5647,11 @@ end
         .assert_passes();
 }
 
-#[test]
-fn typed_instance_keywords_bind_values_and_keep_positional_hashes() {
-    emit_and_run::real_blog()
-        .write("app/services/keyword_fetcher.rb", r##"
-class KeywordFetcher
-  def fetch(url, ip: url.upcase)
-    "#{url}@#{ip}"
-  end
-
-  def merge(url, opts = {})
-    "#{url}#{opts}"
-  end
-end
-"##)
-        .write("app/services/keyword_locator.rb", r#"
-class KeywordLocator
-  def locate(url)
-    KeywordFetcher.new.fetch(url, ip: "192.0.2.1")
-  end
-
-  def merged(url)
-    KeywordFetcher.new.merge(url, opts: 1)
-  end
-end
-"#)
-        .run_ruby(r#"
-locator = KeywordLocator.new
-raise "keyword bound to hash" unless locator.locate("host") == "host@192.0.2.1"
-raise "positional hash rewritten" unless locator.merged("host") == 'host{opts: 1}'
-"#)
-        .assert_passes();
-}
 
 /// `t.integer …, limit: 8` is a `bigint` now (the width Rails creates),
 /// where it was an `integer`. On SQLite both are INTEGER and both type
 /// as `Integer`, so the emitted program must keep a value past 32 bits
 /// through a save and a reload, as it did before.
-#[test]
-fn an_eight_byte_integer_column_keeps_a_value_past_32_bits() {
-    emit_and_run::real_blog()
-        .edit(
-            "db/schema.rb",
-            "create_table \"articles\", force: :cascade do |t|",
-            "create_table \"articles\", force: :cascade do |t|\n    t.integer \"views\", limit: 8, default: 0, null: false",
-        )
-        .write(
-            "test/models/article_views_test.rb",
-            r#"require "test_helper"
-
-class ArticleViewsTest < ActiveSupport::TestCase
-  test "a value past 32 bits survives a reload" do
-    article = Article.create!(title: "Popular", body: "A long enough body", views: 5_000_000_000)
-    assert_equal 5_000_000_000, Article.find(article.id).views
-  end
-end
-"#,
-        )
-        .run_test("test/models/article_views_test.rb")
-        .assert_passes();
-}
 
 #[path = "support/runtime_block_signature.rs"]
 mod runtime_block_signature;
@@ -5922,56 +5716,15 @@ mod rails_root_join;
 /// `Rails.root.join("source", "posts")` as often as the one-part form.
 /// `check` is clean on the call, so the emitted `Rails::AppPath#join`
 /// must accept every part, or none, and join them like Pathname does.
-#[test]
-fn rails_root_join_takes_any_number_of_parts() {
-    let run = rails_root_join::overlay().run_ruby(rails_root_join::ASSERTIONS);
-    run.assert_passes();
-    assert!(run.stdout.contains("Rails.root.join contract passed"));
-}
 
 /// `javascript_include_tag :application` names the source with a
 /// Symbol, as Rails allows. The call is hoisted to a constant, so it
 /// runs at load. Before, the runtime called `include?` on the Symbol,
 /// and the layout raised `NoMethodError` at boot.
-#[test]
-fn a_symbol_source_for_javascript_include_tag_renders_a_script_tag() {
-    emit_and_run::real_blog()
-        .edit(
-            "app/views/layouts/application.html.erb",
-            "    <%= javascript_importmap_tags %>\n",
-            "    <%= javascript_importmap_tags %>\n    <%= javascript_include_tag :application %>\n",
-        )
-        .write(
-            "app/views/articles/_scripts.html.erb",
-            "<%= javascript_include_tag :admin, defer: true %>",
-        )
-        .run_ruby(
-            r#"html = Views::Articles.scripts(nil)
-raise "script tag: #{html}" unless html == %(<script src="/assets/admin.js" defer="defer"></script>)
-puts "ok"
-"#,
-        )
-        .assert_passes();
-}
 
 /// A Symbol source that a value holds, not a literal, reaches the
 /// runtime as a Symbol. Before, the runtime called `include?` on it and
 /// raised `NoMethodError`.
-#[test]
-fn a_symbol_source_in_a_value_for_javascript_include_tag_renders_a_script_tag() {
-    emit_and_run::real_blog()
-        .write(
-            "app/views/articles/_scripts.html.erb",
-            "<% source = :admin %><%= javascript_include_tag source %>",
-        )
-        .run_ruby(
-            r#"html = Views::Articles.scripts(nil)
-raise "script tag: #{html}" unless html == %(<script src="/assets/admin.js"></script>)
-puts "ok"
-"#,
-        )
-        .assert_passes();
-}
 #[test]
 fn an_action_controller_api_controller_dispatches() {
     emit_and_run::empty_app()

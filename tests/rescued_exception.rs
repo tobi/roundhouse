@@ -1,14 +1,6 @@
-//! A rescued exception is an Exception, whichever class the program
-//! names.
-//!
-//! `rescue Stripe::CardError => e` binds `e` to that class. When the
-//! class comes from a gem the app never registered, the binding used to
-//! fall back to `StandardError`, and then `e.response` / `e.status`
-//! (which the gem's error defines) were reported as unknown methods of a
-//! class the program never rescued. The binding now keeps the class the
-//! program wrote: sends on it are the unmodelled-gem boundary, with the
-//! `Exception` surface (`message`, `cause`, `backtrace`, `full_message`)
-//! still answered with its Ruby types.
+//! Unresolved rescue classes remain blocking constant errors. Their unknown
+//! bindings must not invent StandardError and produce method-error cascades.
+//! Resolved exception classes retain their checked Exception surface.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};

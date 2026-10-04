@@ -239,7 +239,7 @@ fn expand_controller(
         ] {
             // The analyzer's parameter table has no receiver-kind key.
             // Refuse rather than mixing instance and class call-site types.
-            if surface.instance_methods.contains(&method.name) {
+            if surface.instance_methods.contains(&method.name) || controller.class_methods().any(|existing| existing.name == method.name) {
                 return Err(refuse(
                     "instance/class configuration method name collision is not supported",
                 ));
@@ -261,8 +261,8 @@ fn expand_controller(
             }
             methods.push(ControllerBodyItem::ClassMethod {
                 method,
-                configuration_slot: (config.carrier.clone(), config.slot.clone()),
-                configuration_role: role,
+                configuration_slot: Some((config.carrier.clone(), config.slot.clone())),
+                configuration_role: Some(role),
                 leading_comments: vec![],
                 leading_blank_line: false,
             });

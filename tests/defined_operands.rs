@@ -60,9 +60,12 @@ end
 
 #[test]
 fn a_method_call_operand_is_refused_by_name() {
-    let tree = [(PathBuf::from("app/helpers/probe.rb"),
-        b"class Probe\n  def responds?(obj)\n    defined?(obj.meth)\n  end\nend\n".to_vec())]
-        .into_iter().collect();
-    let error = ingest_app_from_tree(tree).expect_err("method-call defined? remains unsupported");
+    // Exercise strict declaration ingest directly: the application support
+    // walk currently tolerates refused helper files, so it is not a witness
+    // for this operator's admission boundary.
+    let error = roundhouse::ingest::ingest_library_classes(
+        b"class Probe\n  def responds?(obj)\n    defined?(obj.meth)\n  end\nend\n",
+        "app/helpers/probe.rb",
+    ).expect_err("method-call defined? remains unsupported");
     assert!(error.to_string().contains("`defined?` only supports bareword, ivar, and constant targets"), "{error}");
 }

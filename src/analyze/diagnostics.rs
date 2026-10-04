@@ -45,6 +45,31 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // graphql-ruby object types: their bodies, and each `null: false`
     // field's resolved value.
     out.extend(super::graphql::diagnose(app, diagnose_expr));
+    out.extend(super::enum_raw_input::diagnose(app));
+    // Rubydex's unresolved constants emit refusal stubs. Collect those
+    // annotations from support methods/defaults/constants as well, so
+    // an emitted raise cannot be hidden by the library diagnostic policy.
+    fn collect_constants(expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if matches!(&expr.diagnostic,
+            Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "constant")
+        {
+            if let Some(DiagnosticKind::Unsupported { detail, .. }) = &expr.diagnostic {
+                out.push(Diagnostic::unsupported(expr.span, None, "constant", detail.clone()));
+            }
+        }
+        expr.node.for_each_child(&mut |child| collect_constants(child, out));
+    }
+    // Declaration DSL arguments are handled by the class-body ledger;
+    // this pass covers executable support methods and initializers.
+    for class in app.library_classes.iter().chain(app.rails_application.iter()) {
+        for method in &class.methods {
+            collect_constants(&method.body, &mut out);
+            for param in &method.params {
+                if let Some(default) = &param.default { collect_constants(default, &mut out); }
+            }
+        }
+        for (_, value) in &class.constants { collect_constants(value, &mut out); }
+    }
     // A filter's return value is Rails' to discard (`around_action
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing
     // escapes from its tail, so an `untyped` there is not a gradual
