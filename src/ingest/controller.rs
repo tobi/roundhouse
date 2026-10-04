@@ -205,6 +205,8 @@ pub(super) fn ingest_controller_with_nesting(
                         let items = methods
                             .into_iter()
                             .map(|method| ControllerBodyItem::ClassMethod {
+                                configuration_slot: None,
+                                configuration_role: None,
                                 method,
                                 leading_comments: Vec::new(),
                                 leading_blank_line: false,

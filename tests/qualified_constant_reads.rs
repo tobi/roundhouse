@@ -265,3 +265,11 @@ fn ingested_source_apps_refuse_ir_only_mode_after_source_table_loss() {
         .or_else(|| refusal.downcast_ref::<&str>().copied()).unwrap();
     assert!(message.contains("source_index_missing"), "{message}");
 }
+
+#[test]
+fn an_empty_source_project_needs_no_source_index() {
+    let app = ingest_app_from_tree(HashMap::new()).expect("empty project ingests");
+    assert!(app.sources.is_empty());
+    assert!(!app.source_index_required);
+    roundhouse::analyze::Analyzer::new(&app);
+}

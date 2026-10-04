@@ -646,9 +646,13 @@ fn answer_file(
                             .and_then(|definition| graph.documents().get(definition.uri_id()))
                             .is_some_and(|document| document.uri() == CORE_URI)
                     });
-                    let runtime = (!app_write && is_runtime_declaration(graph, declaration))
-                        .then(|| if builtin_float { Some(Arc::new(Ty::Float)) } else { runtime_value_types().get(declaration.name()).cloned() })
-                        .flatten();
+                    let runtime = if builtin_float {
+                        Some(Arc::new(Ty::Float))
+                    } else if !app_write && is_runtime_declaration(graph, declaration) {
+                        runtime_value_types().get(declaration.name()).cloned()
+                    } else {
+                        None
+                    };
                     ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(name))), runtime }
                 }
             });

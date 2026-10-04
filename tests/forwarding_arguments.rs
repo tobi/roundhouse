@@ -6,10 +6,7 @@
 //! `T.unsafe(self).checkout_token(...)`). Ingest used to refuse the
 //! `ForwardingArgumentsNode` and drop the whole file with it.
 //!
-//! We bind the rest and the block to fixed synthetic names, `__fwd` and
-//! `__blk` (the binding an anonymous `&` already gets), and splat and pass
-//! them at the call. Keywords ride in the rest as a trailing Hash, the
-//! convention `*args, **opts` already follows.
+//! The native anonymous contract preserves positionals, keywords and blocks.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,11 +27,13 @@ fn emit(body: &str) -> String {
         .map(|(p, c)| (PathBuf::from(p), c.into_bytes()))
         .collect();
     let app = ingest_app_from_tree(tree).expect("`...` forwarding must ingest");
-    ruby::emit_library(&app)
+    let out = ruby::emit_library(&app)
         .iter()
         .find(|f| f.path.to_string_lossy().ends_with("proxy.rb"))
         .map(|f| f.content.clone())
-        .expect("proxy.rb")
+        .expect("proxy.rb");
+    assert_eq!(ruby_prism::parse(out.as_bytes()).errors().count(), 0, "{out}");
+    out
 }
 
 #[test]
@@ -47,8 +46,8 @@ fn a_forwarding_def_passes_positionals_and_block_to_the_call() {
 end
 "#,
     );
-    assert!(out.contains("def each(*__fwd, &__blk)"), "got:\n{out}");
-    assert!(out.contains("@set.each(*__fwd, &__blk)"), "got:\n{out}");
+    assert!(out.contains("def each(...)"), "got:\n{out}");
+    assert!(out.contains("@set.each(...)"), "got:\n{out}");
 }
 
 #[test]
@@ -61,8 +60,8 @@ fn leading_parameters_stay_ahead_of_the_forwarded_rest() {
 end
 "#,
     );
-    assert!(out.contains("def open_with(mode, *__fwd, &__blk)"), "got:\n{out}");
-    assert!(out.contains("open(mode, *__fwd, &__blk)"), "got:\n{out}");
+    assert!(out.contains("def open_with(mode, ...)"), "got:\n{out}");
+    assert!(out.contains("open(mode, ...)"), "got:\n{out}");
 }
 
 #[test]
@@ -79,6 +78,6 @@ class Proxy < Base
 end
 "#,
     );
-    assert!(out.contains("def go(*__fwd, &__blk)"), "got:\n{out}");
-    assert!(out.contains("super(*__fwd"), "got:\n{out}");
+    assert!(out.contains("def go(...)"), "got:\n{out}");
+    assert!(out.contains("super(..."), "got:\n{out}");
 }

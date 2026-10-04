@@ -23,7 +23,7 @@ use crate::ty::Ty;
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
 /// A generated constant may borrow a source span for diagnostics/layout;
 /// that position is not a written Ruby constant reference to index.
-pub const GENERATED_CONST_REF: u64 = 1 << 3;
+pub const GENERATED_CONST_REF: u64 = 1 << 4;
 
 /// An admitted library-class Data factory with its exact declaration identity.
 pub const RESOLVED_DATA_FACTORY: u64 = 1 << 3;
@@ -76,7 +76,7 @@ pub enum IrHint {
 
 /// A `Const` that is only the operand of `defined?(Foo)` or
 /// `defined?(A::B)`. It is not evaluated, resolved, or autoloaded.
-pub const DEFINED_CONSTANT: u64 = 1 << 3;
+pub const DEFINED_CONSTANT: u64 = 1 << 5;
 
 /// The core typed λ-calculus. Ruby's ~80 AST node kinds collapse into ~15 here;
 /// everything else lives in the Rails dialect or is handled by normalization.

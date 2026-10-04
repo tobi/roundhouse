@@ -24,6 +24,7 @@
 //! Each of those comes when a fixture forces it.
 
 mod alba;
+mod enum_raw_input;
 mod body;
 mod class_configuration;
 mod data;
@@ -127,6 +128,8 @@ pub struct Analyzer {
     refined_action_bindings: HashMap<(ClassId, Symbol), HashMap<Symbol, Ty>>,
     /// Resolved once from the source snapshot supplied to `Analyzer::new`.
     const_resolver: std::sync::Arc<body::ConstResolver>,
+    /// Explicit source-free API mode never certifies source indexing.
+    source_indexed: bool,
     /// Inferred values keyed by Rubydex declaration IDs, not by names.
     typed_constants: IdentityHashMap<DeclarationId, Ty>,
     /// Literal Data constants on library classes, keyed by source span.
@@ -897,6 +900,11 @@ impl Analyzer {
         // ordinary application methods.
         test_module::register(&mut classes, app);
 
+        assert!(
+            !app.source_index_required || !app.sources.is_empty(),
+            "source_index_missing: ingested source app cannot use IR-only analysis"
+        );
+
         let const_resolver = app.const_resolver.for_sources(&app.sources);
         let data_factories = data::register(app, &const_resolver, &mut classes);
 
@@ -914,6 +922,7 @@ impl Analyzer {
             refined_action_bindings: HashMap::new(),
             inquirers: inquiry::inquirer_methods(app),
             const_resolver,
+            source_indexed: !app.sources.is_empty(),
             typed_constants: IdentityHashMap::default(),
             data_factories,
         }
@@ -922,11 +931,11 @@ impl Analyzer {
     /// Build a body-typer borrowing this analyzer's dispatch tables.
     /// Cheap — just a struct with a reference.
     fn body_typer(&self) -> BodyTyper<'_> {
-        BodyTyper::new(&self.classes)
+        let typer = BodyTyper::new(&self.classes)
             .with_inquirers(&self.inquirers)
-            .with_const_resolver(self.const_resolver.clone())
             .with_typed_constants(&self.typed_constants)
-            .with_data_factories(&self.data_factories)
+            .with_data_factories(&self.data_factories);
+        if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer }
     }
 
     /// The per-class member registry — schema columns, catalog-sourced
@@ -1406,9 +1415,9 @@ impl Analyzer {
             let shared = body::ConstScope::global(map.clone());
             let typer = BodyTyper::new(&self.classes)
                 .with_inquirers(&self.inquirers)
-                .with_const_resolver(self.const_resolver.clone())
                 .with_typed_constants(&resolved)
                 .with_data_factories(&self.data_factories);
+            let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };
             for (self_ty, name, id, value, production) in entries.iter_mut() {
                 let ctx = Ctx {
                     self_ty: Some(self_ty.clone()),
@@ -1446,6 +1455,14 @@ impl Analyzer {
             map = next;
             resolved = next_resolved;
         }
+        // These source-declared constants have modeled factory-generated
+        // object methods even though their initializer is not a retained class.
+        for constant in app.generated_helper_methods.keys() {
+            resolved.insert(
+                rubydex::model::ids::declaration_id_from_lookup_name(constant.0.as_str()),
+                Ty::Class { id: constant.clone(), args: vec![] },
+            );
+        }
         (map, resolved)
     }
 
@@ -1462,6 +1479,20 @@ impl Analyzer {
         let (fallback, resolved_values) = self.build_constant_registry(app);
         self.typed_constants = resolved_values;
         let global_constants = body::ConstScope::global(fallback);
+        // Type the actual initializer trees, not only registry clones.
+        // Their lexical class references become load-time dependencies
+        // when a source file's nested declarations emit into separate files.
+        for class in &mut app.library_classes {
+            let ctx = Ctx {
+                self_ty: Some(Ty::Class { id: class.name.clone(), args: vec![] }),
+                constants: global_constants.clone(),
+                class_side: true,
+                ..Ctx::default()
+            };
+            for (_, value) in &mut class.constants {
+                self.body_typer().analyze_expr(value, &ctx);
+            }
+        }
         // Controller→view ivar channel: as each action is analyzed, we harvest
         // the ivars it sets and key them by the view that action renders.
         // When we reach the view pass below, the view's Ctx is seeded from
@@ -1657,7 +1688,10 @@ impl Analyzer {
             // typed with `self` the class itself. Nothing reads their
             // ivars into a view; typing them is what resolves their own
             // bodies and their harvested return types.
-            for method in controller.class_methods_mut() {
+            for method in controller.body.iter_mut().filter_map(|item| match item {
+                ControllerBodyItem::ClassMethod { method, configuration_slot: None, .. } => Some(method),
+                _ => None,
+            }) {
                 for p in &mut method.params {
                     if let Some(default) = &mut p.default {
                         self.body_typer().analyze_expr(default, &ctx);
@@ -2857,11 +2891,6 @@ impl Analyzer {
                 constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false,
             };
 
-            for (_, value) in &mut lc.constants {
-                if self.data_factories.contains_key(&value.span) {
-                    self.body_typer().analyze_expr(value, &class_ctx);
-                }
-            }
             let lc_name = lc.name.clone();
             for method in &mut lc.methods {
                 // A default is an expression of the class body too, and

@@ -1,16 +1,6 @@
-//! Points in time compare across their classes.
-//!
-//! ```ruby
-//! def overdue?
-//!   expires_at < CUTOFF_DATE || expires_at < DateTime.now
-//! end
-//! ```
-//!
-//! `Time`, `Date`, `DateTime` and `ActiveSupport::TimeWithZone` order against
-//! one another (ActiveSupport teaches `Time#<=>` to take a `Date`), and only
-//! the first was recognised as a time, so a cutoff of type `Time | Date`
-//! against a `Time` was a mismatch. A `nil` arm is not temporal and a time is
-//! still not comparable to a number.
+//! Native Date-only values are distinct from timestamps. Mixed Date/Time
+//! ordering is refused until the emitted runtime implements ActiveSupport's
+//! cross-type coercion. Nil remains incompatible with timestamp ordering.
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};
 
@@ -39,7 +29,7 @@ fn binops(model: &str) -> Vec<String> {
 }
 
 #[test]
-fn time_date_and_datetime_order_against_each_other() {
+fn date_only_values_do_not_silently_take_timestamp_ordering() {
     let found = binops(
         r#"class Thing < ApplicationRecord
   CUTOFF = Date.new(2020, 1, 1)
@@ -56,7 +46,8 @@ fn time_date_and_datetime_order_against_each_other() {
 end
 "#,
     );
-    assert!(found.is_empty(), "{found:?}");
+    assert_eq!(found.len(), 2, "Date and a Date/Time union must both refuse: {found:?}");
+    assert!(found.iter().all(|d| d.contains("Date")), "{found:?}");
 }
 
 #[test]
