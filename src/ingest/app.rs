@@ -1912,6 +1912,8 @@ fn splice_concerns_into_models(app: &mut App) {
 /// Only a key that still EQUALS the concern-derived default is moved.
 /// An explicit `foreign_key:` differs from it and is left exactly as
 /// written; if it happens to coincide, the two names are equal anyway.
+/// Polymorphic `as:` keys derive from the interface, never the owner.
+/// They stay unchanged even when the concern happens to have that name.
 /// `belongs_to` is untouched — its key derives from the TARGET, which
 /// the splice does not change.
 fn rehome_default_fk(
@@ -1927,7 +1929,8 @@ fn rehome_default_fk(
     let model_default =
         crate::ident::Symbol::from(format!("{}_id", crate::naming::snake_case(crate::naming::demodulize(model.0.as_str()))));
     match assoc {
-        Association::HasMany { foreign_key, .. } | Association::HasOne { foreign_key, .. } => {
+        Association::HasMany { foreign_key, as_interface: None, .. }
+        | Association::HasOne { foreign_key, as_interface: None, .. } => {
             if *foreign_key == concern_default {
                 *foreign_key = model_default;
             }

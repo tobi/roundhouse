@@ -4672,3 +4672,35 @@ raise "host ancestry changed" unless Article.ancestors.index(Signing) < Article.
         .assert_passes();
 }
 
+/// An inverse contributed by a Concern must support actual polymorphic reads.
+#[test]
+fn a_polymorphic_inverse_from_a_concern_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "  create_table \"comments\", force: :cascade do |t|",
+            "  create_table \"notifications\", force: :cascade do |t|\n    t.integer \"notifiable_id\"\n    t.string \"notifiable_type\"\n  end\n\n  create_table \"comments\", force: :cascade do |t|",
+        )
+        .write(
+            "app/models/notification.rb",
+            "class Notification < ApplicationRecord\n  belongs_to :notifiable, polymorphic: true\n  def owner_title\n    notifiable.title\n  end\nend\n",
+        )
+        .write(
+            "app/models/concerns/notifiable.rb",
+            "module Notifiable\n  extend ActiveSupport::Concern\n  included do\n    has_many :notifications, as: :notifiable\n    has_one :last_notification, class_name: \"Notification\", as: :notifiable, foreign_key: :notifiable_id\n  end\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  include Notifiable\n",
+        )
+        .run_ruby(
+            r#"article = Article.create!(title: "Owner", body: "Body text here")
+note = Notification.create!(notifiable_id: article.id, notifiable_type: "Article")
+raise "polymorphic read" unless Notification.find(note.id).owner_title == "Owner"
+raise "inverse read" unless article.notifications.count == 1
+raise "singular inverse read" unless article.last_notification.owner_title == "Owner"
+"#,
+        )
+        .assert_passes();
+}
