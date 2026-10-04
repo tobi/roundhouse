@@ -2214,11 +2214,6 @@ pub(super) fn ingest_library_method(
                 }
             }
         }
-        // `def f(...)`: the forwarded positionals, keywords riding in them
-        // as a trailing Hash (see the `*args, **opts` note below).
-        if super::util::has_forwarding_parameter(&pn) {
-            params.push(Param::rest(Symbol::from(super::util::FORWARDED_REST)));
-        }
         if let Some(krest) = pn.keyword_rest() {
             if let Some(krp) = krest.as_keyword_rest_parameter_node() {
                 if let Some(loc) = krp.name() {
@@ -2277,12 +2272,6 @@ pub(super) fn ingest_library_method(
                 // name so body-side bare-`&` forwarding (`__blk`) binds.
                 .unwrap_or("__blk");
             Param::positional(Symbol::from(name))
-        })
-        // `def f(...)` forwards its block under the same binding.
-        .or_else(|| {
-            def.parameters().filter(super::util::has_forwarding_parameter).map(|_| {
-                Param::positional(Symbol::from(super::util::FORWARDED_BLOCK))
-            })
         });
 
     let body = match def.body() {

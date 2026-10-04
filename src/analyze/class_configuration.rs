@@ -47,8 +47,8 @@ impl Analyzer {
             for item in &controller.body {
                 if let ControllerBodyItem::ClassMethod {
                     method,
-                    configuration_slot: key,
-                    configuration_role: ClassConfigurationRole::Writer,
+                    configuration_slot: Some(key),
+                    configuration_role: Some(ClassConfigurationRole::Writer),
                     ..
                 } = item
                 {
@@ -72,8 +72,8 @@ impl Analyzer {
             for item in &mut controller.body {
                 let ControllerBodyItem::ClassMethod {
                     method,
-                    configuration_slot,
-                    configuration_role,
+                    configuration_slot: Some(configuration_slot),
+                    configuration_role: Some(configuration_role),
                     ..
                 } = item
                 else {

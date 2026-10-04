@@ -203,7 +203,7 @@ end
 "#,
     )]);
     let got: Vec<String> = flat.iter().map(|(m, p, _)| format!("{m} {p}")).collect();
-    assert_eq!(got, vec!["GET /posts/:post_id/comments", "GET /pages/:page_id/comments", "ANY /api/graphql"]);
+    assert_eq!(got, vec!["GET /posts/:post_id/comments", "GET /pages/:page_id/comments", "POST /api/graphql"]);
 }
 
 #[test]

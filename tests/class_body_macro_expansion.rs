@@ -808,8 +808,13 @@ fn readable_class_methods_store_keywords_blocks_and_filter_options() {
 }
 
 #[test]
-fn finite_configuration_does_not_admit_unrelated_controller_singletons() {
-    assert!(configuration_app(WINDOW_SETTINGS, "def self.unrelated; eval('1'); end").is_err());
+fn configuration_keeps_unrelated_class_methods_out_of_its_macro_carriers() {
+    let mut app = configuration_app(WINDOW_SETTINGS, "def self.unrelated; eval('1'); end").expect("ordinary class methods are retained");
+    roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+    let diagnostics = roundhouse::analyze::diagnose(&app);
+    assert!(diagnostics.iter().any(|d| d.message.contains("eval")), "{diagnostics:?}");
+    assert!(app.controllers.iter().flat_map(|c| &c.body).any(|item| matches!(item,
+        ControllerBodyItem::ClassMethod { method, configuration_slot: None, .. } if method.name.as_str() == "unrelated")));
 }
 
 #[test]

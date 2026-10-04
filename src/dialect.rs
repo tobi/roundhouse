@@ -1176,8 +1176,10 @@ pub enum ControllerBodyItem {
         method: MethodDef,
         /// Finite macro carrier and storage slot.
         /// Used to infer a shared method contract without sharing values.
-        configuration_slot: (ClassId, Symbol),
-        configuration_role: ClassConfigurationRole,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration_slot: Option<(ClassId, Symbol)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration_role: Option<ClassConfigurationRole>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         leading_comments: Vec<Comment>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1194,18 +1196,6 @@ pub enum ControllerBodyItem {
         leading_blank_line: bool,
     },
     PrivateMarker {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        leading_comments: Vec<Comment>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        leading_blank_line: bool,
-    },
-    /// A CLASS-side method: `def self.x`, or a `def` inside `class << self`.
-    /// Not an action — nothing routes to it and it takes no part in the
-    /// filter chain — but it is a method of the controller class
-    /// (`ApplicationController.on_field_error`) that subclass bodies and
-    /// the class-side of the registry reach.
-    ClassMethod {
-        method: MethodDef,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         leading_comments: Vec<Comment>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]

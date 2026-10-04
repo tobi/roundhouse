@@ -107,3 +107,20 @@ fn argument_and_index_queries_stay_unsupported() {
         assert!(message.contains("defined? calls with arguments"), "{guard}: {message}");
     }
 }
+
+#[test]
+fn source_guards_and_generated_references_keep_distinct_intent() {
+    use roundhouse::expr::{GENERATED_CONST_REF, RESOLVED_DATA_FACTORY};
+    use roundhouse::span::{FileId, Span};
+    let body = method_body("class Probe; def check; defined?(MissingConstant); end; end");
+    let operand = defined_operand(&body);
+    assert_eq!(operand.decisions & (GENERATED_CONST_REF | RESOLVED_DATA_FACTORY), 0);
+
+    let mut generated = roundhouse::Expr::new(Span::synthetic(), ExprNode::Const {
+        path: vec!["Probe".into()],
+    });
+    generated.inherit_span(Span { file: FileId(1), start: 1, end: 6 });
+    let restored: roundhouse::Expr = serde_json::from_str(&serde_json::to_string(&generated).unwrap()).unwrap();
+    assert_ne!(restored.decisions & GENERATED_CONST_REF, 0);
+    assert_eq!(restored.decisions & (DEFINED_CONSTANT | RESOLVED_DATA_FACTORY), 0);
+}

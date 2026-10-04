@@ -301,7 +301,7 @@ fn association_method(app: &App, owner: &ClassId, method: &MethodDef) -> bool {
     })
 }
 
-fn declaration_error((method, model): (&MethodDef, bool)) -> Option<&'static str> {
+fn declaration_error((method, _model): (&MethodDef, bool)) -> Option<&'static str> {
     if method.unsupported_formals.is_some() {
         Some("forwarding destination has an unrepresented parameter declaration")
     } else if method.has_anonymous_block {
@@ -312,10 +312,6 @@ fn declaration_error((method, model): (&MethodDef, bool)) -> Option<&'static str
         .any(|p| p.from_keyword || p.from_kwrest)
     {
         Some("forwarding destination has flattened keyword parameters")
-    } else if model && !method.params.iter().any(|p| p.forwarding) {
-        Some(
-            "forwarding into a model callee with incomplete rest/block declaration retention is not supported yet",
-        )
     } else {
         None
     }

@@ -1730,7 +1730,7 @@ end
     // answers use these `FileId`s.
     app.sources = super::sources::drain();
     super::sources::assert_snapshot_matches(&sources, &app.sources);
-    app.source_index_required = true;
+    app.source_index_required = !app.sources.is_empty();
     drop(sources);
     splice_concerns_into_controllers(&mut app);
     // After the splice: an action a concern provides is not implicit.
