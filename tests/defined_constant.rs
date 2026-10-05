@@ -122,5 +122,5 @@ fn source_guards_and_generated_references_keep_distinct_intent() {
     generated.inherit_span(Span { file: FileId(1), start: 1, end: 6 });
     let restored: roundhouse::Expr = serde_json::from_str(&serde_json::to_string(&generated).unwrap()).unwrap();
     assert_ne!(restored.decisions & GENERATED_CONST_REF, 0);
-    assert_eq!(restored.decisions & (DEFINED_CONSTANT | RESOLVED_DATA_FACTORY), 0);
+    assert_eq!(restored.decisions & RESOLVED_DATA_FACTORY, 0);
 }

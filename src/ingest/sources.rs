@@ -58,10 +58,6 @@ thread_local! {
 struct Registry {
     files: Vec<SourceFile>,
     by_path: HashMap<String, FileId>,
-    /// Files already drained this ingest. Ids keep counting past them,
-    /// so a pass that synthesizes source after the main drain (the
-    /// `delegate` expansion) hands out ids a second drain can append.
-    drained: u32,
     root: Option<PathBuf>,
     parsed: HashMap<usize, ParsedSource>,
 }
@@ -129,7 +125,7 @@ pub fn register(path: &str, text: &str) -> FileId {
             path: path.to_string(),
             text: text.to_string(),
         });
-        let id = FileId(reg.drained + reg.files.len() as u32);
+        let id = FileId(reg.files.len() as u32);
         reg.by_path.insert(path.to_string(), id);
         id
     })
@@ -157,7 +153,7 @@ pub fn line_at(path: &str, offset: usize) -> Option<u32> {
     SOURCES.with(|s| {
         let reg = s.borrow();
         let id = *reg.by_path.get(path)?;
-        let file = reg.files.get((id.0 as usize).checked_sub(1)?.checked_sub(reg.drained as usize)?)?;
+        let file = reg.files.get((id.0 as usize).checked_sub(1)?)?;
         Some(file.text.as_bytes()[..offset.min(file.text.len())].iter()
             .filter(|&&b| b == b'\n').count() as u32 + 1)
     })
@@ -205,7 +201,7 @@ pub fn text_of(path: &str) -> Option<String> {
     SOURCES.with(|s| {
         let reg = s.borrow();
         let id = reg.by_path.get(path)?;
-        let i = (id.0 as usize).checked_sub(1)?.checked_sub(reg.drained as usize)?;
+        let i = (id.0 as usize).checked_sub(1)?;
         reg.files.get(i).map(|f| f.text.clone())
     })
 }
@@ -229,21 +225,19 @@ pub fn path_of(id: FileId) -> Option<String> {
         let reg = s.borrow();
         (id.0 as usize)
             .checked_sub(1)
-            .and_then(|i| i.checked_sub(reg.drained as usize))
             .and_then(|i| reg.files.get(i))
             .map(|f| f.path.clone())
     })
 }
 
-/// Move the registered files out and clear the registry. Ids stay valid
-/// as indices + 1 into the concatenation of every drain since [`reset`].
+/// Move the registered files out (ids stay valid as indices + 1) and
+/// clear the registry.
 pub fn drain() -> Vec<SourceFile> {
     SOURCES.with(|s| {
         let mut reg = s.borrow_mut();
         reg.by_path.clear();
         reg.root = None;
         reg.parsed.clear();
-        reg.drained += reg.files.len() as u32;
         std::mem::take(&mut reg.files)
     })
 }
@@ -338,15 +332,19 @@ mod tests {
     }
 
     #[test]
-    fn ids_keep_counting_past_a_drain() {
+    fn source_readers_follow_fresh_ids_after_drain() {
         reset();
         register("a.rb", "1");
         let first = drain();
         let late = register("late.rb", "2");
-        assert_eq!(late, FileId(2));
+        assert_eq!(late, FileId(1));
         assert_eq!(path_of(late).as_deref(), Some("late.rb"));
-        let all: Vec<_> = first.into_iter().chain(drain()).collect();
-        assert_eq!(all[late.0 as usize - 1].path, "late.rb");
+        assert_eq!(text_of("late.rb").as_deref(), Some("2"));
+        assert_eq!(with_text("late.rb", str::to_owned).as_deref(), Some("2"));
+        assert_eq!(line_at("late.rb", 0), Some(1));
+        assert_eq!(first[0].path, "a.rb");
+        let current = drain();
+        assert_eq!(current[late.0 as usize - 1].path, "late.rb");
     }
 
     #[test]

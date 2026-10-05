@@ -843,7 +843,7 @@ impl Analyzer {
 
         // Which registered classes the app itself declares: a bare name
         // reaches those through Ruby's constant lookup only (see
-        // `ConstIndex`).
+        // Rubydex).
         for id in app
             .models
             .iter()

@@ -51,7 +51,7 @@ use crate::ident::{ClassId, Symbol};
 use super::library_class::library_class_from_module_node_with_scope;
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
-    find_all_modules_with_scope, flatten_statements, module_name_path,
+    find_all_modules_with_scope, flatten_statements,
 };
 use super::{survey, IngestError};
 
