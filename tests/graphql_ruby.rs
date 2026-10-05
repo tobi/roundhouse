@@ -516,3 +516,35 @@ fn lowering_removes_the_argument_signatures() {
         .collect();
     assert!(leftover.is_empty(), "{leftover:?}");
 }
+
+/// Generated inference methods borrow the field's span for diagnostics,
+/// while authored declarations keep their real constant-reference identity.
+#[test]
+fn generated_graphql_constants_keep_provenance_when_borrowing_source_spans() {
+    use roundhouse::expr::{Expr, ExprNode, GENERATED_CONST_REF};
+    fn inspect(expr: &Expr, generated: bool, count: &mut usize) {
+        if matches!(&*expr.node, ExprNode::Const { .. }) {
+            assert!(expr.span.file.0 > 0, "expected a real borrowed/source span");
+            assert_eq!(expr.decisions & GENERATED_CONST_REF != 0, generated);
+            *count += 1;
+        }
+        expr.node.for_each_child(&mut |child| inspect(child, generated, count));
+    }
+    let post = post_type("    field :author, UserType, null: false, method: :user\n");
+    let app = analyzed(&[("app/graphql/types/post_type.rb", &post)]);
+    let mut generated = 0;
+    let mut authored = 0;
+    for ty in &app.graphql_types {
+        let class = app.library_classes.iter().find(|c| c.name == ty.class).unwrap();
+        for method in &class.methods {
+            if ty.synthesized.contains(&method.name) {
+                inspect(&method.body, true, &mut generated);
+            }
+        }
+        for call in &class.unknown_calls {
+            inspect(call, false, &mut authored);
+        }
+    }
+    assert!(generated > 0, "must inspect generated class wrappers");
+    assert!(authored > 0, "must inspect authored field declarations");
+}
