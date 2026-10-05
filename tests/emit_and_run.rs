@@ -11,6 +11,35 @@ mod emit_and_run;
 mod class_configuration;
 #[path = "support/data_factory.rs"]
 mod data_factory;
+
+#[test]
+fn defined_method_operands_are_not_invoked() {
+    emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"probes\" do |t|\n    t.string \"name\"\n  end\nend\n")
+        .write("app/helpers/defined_probe.rb", r#"class DefinedProbe
+  def present
+    raise "defined? invoked its operand"
+  end
+
+  def present_definition
+    defined?(self.present)
+  end
+
+  def missing_definition
+    defined?(self.missing)
+  end
+end
+"#)
+        .run_ruby(r#"
+probe = DefinedProbe.new
+raise "existing method lost" unless probe.present_definition == "method"
+raise "missing method admitted" unless probe.missing_definition.nil?
+puts "defined? did not invoke either operand"
+"#)
+        .assert_passes();
+}
+
 /// Build each query case independently: declaring a model class method
 /// must not accidentally open the old gate for the order/where.not cases.
 fn scope_free_query_app(action: &str) -> emit_and_run::Overlay {
@@ -6399,4 +6428,3 @@ raise "host ancestry changed" unless Article.ancestors.index(Signing) < Article.
         )
         .assert_passes();
 }
-
