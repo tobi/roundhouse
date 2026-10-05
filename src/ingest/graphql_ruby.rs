@@ -912,6 +912,12 @@ fn synthesize(
         }
     };
     fn mark(expr: &mut Expr, span: Span) {
+        // The method was parsed from <graphql>, not this source location.
+        // Its constants name exact classes selected by the field declaration;
+        // the borrowed span only locates diagnostics, never Rubydex answers.
+        if matches!(&*expr.node, ExprNode::Const { .. }) {
+            expr.decisions |= crate::expr::GENERATED_CONST_REF;
+        }
         expr.span = span;
         expr.node.for_each_child_mut(&mut |child| mark(child, span));
     }
