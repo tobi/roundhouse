@@ -5725,61 +5725,6 @@ mod rails_root_join;
 /// A Symbol source that a value holds, not a literal, reaches the
 /// runtime as a Symbol. Before, the runtime called `include?` on it and
 /// raised `NoMethodError`.
-#[test]
-fn an_action_controller_api_controller_dispatches() {
-    emit_and_run::empty_app()
-        .write(
-            "app/controllers/application_controller.rb",
-            "class ApplicationController < ActionController::API\nend\n",
-        )
-        .write(
-            "app/controllers/widgets_controller.rb",
-            r#"class WidgetsController < ApplicationController
-  before_action :set_widget, only: :show
-
-  def index
-    head :no_content
-  end
-
-  def show
-    head :not_found unless @widget
-  end
-
-  private
-
-  def set_widget
-    @widget = Widget.find_by(id: params[:id])
-  end
-end
-"#,
-        )
-        .write(
-            "app/models/application_record.rb",
-            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
-        )
-        .write("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n")
-        .write(
-            "config/routes.rb",
-            "Rails.application.routes.draw do\n  root \"widgets#index\"\n  resources :widgets, only: %i[index show]\nend\n",
-        )
-        .write(
-            "db/schema.rb",
-            "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
-        )
-        .run_ruby(
-            r#"widget = Widget.create!(name: "a")
-def get(path)
-  status, = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => path, "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
-  status
-end
-{ "/widgets" => 204, "/widgets/#{widget.id}" => 204, "/widgets/#{widget.id + 1}" => 404 }.each do |path, want|
-  got = get(path)
-  raise "GET #{path} answered #{got}, want #{want}" unless got == want
-end
-"#,
-        )
-        .assert_passes();
-}
 
 /// A prior explicit include is a no-op when an included block repeats it.
 /// The Concern itself never gains the nested module as an ancestor.

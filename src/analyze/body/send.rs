@@ -2566,7 +2566,7 @@ pub(super) fn hash_method(
         // JSON/string renderings of a Hash are Strings whatever the
         // value type — campfire's `Webhook#payload(message).to_json`
         // nests hashes three deep.
-        "to_json" | "to_s" | "inspect" | "to_query" | "to_param" => Ty::Str,
+        "to_json" | "to_s" | "inspect" => Ty::Str,
         // ActiveSupport `Hash#as_json`: string keys, JSON-primitive values.
         "as_json" => Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
         _ => unknown(),
@@ -2786,7 +2786,7 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
         // an Enumerator without one; the two are not told apart here.
         // `to_d` / `to_r` / `to_c` build BigDecimal / Rational / Complex,
         // which the registry does not model.
-        "to_d" | "to_r" | "to_c" | "rationalize" | "coerce" => Ty::Untyped,
+        "to_r" | "to_c" | "rationalize" | "coerce" => Ty::Untyped,
         // ActiveSupport Numeric duration helpers — `1.day`, `2.hours`,
         // `30.minutes`, etc. Each returns an ActiveSupport::Duration
         // instance; we don't model that structurally so propagate
