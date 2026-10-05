@@ -2,8 +2,8 @@
 //!
 //! `defined?(Foo)` guards optional constants all over core
 //! (`defined?(AdminAreaController)`, `defined?(Rails::Console)`), and
-//! Method-call operands remain explicitly unsupported. Ruby does not
-//! evaluate the operand. Ingest only knew barewords and ivars and dropped
+//! Method-call operands are preserved without evaluating the method.
+//! Ingest once only knew barewords and ivars and dropped
 //! the whole file on any other operand.
 
 use std::collections::HashMap;
@@ -59,13 +59,7 @@ end
 }
 
 #[test]
-fn a_method_call_operand_is_refused_by_name() {
-    // Exercise strict declaration ingest directly: the application support
-    // walk currently tolerates refused helper files, so it is not a witness
-    // for this operator's admission boundary.
-    let error = roundhouse::ingest::ingest_library_classes(
-        b"class Probe\n  def responds?(obj)\n    defined?(obj.meth)\n  end\nend\n",
-        "app/helpers/probe.rb",
-    ).expect_err("method-call defined? remains unsupported");
-    assert!(error.to_string().contains("`defined?` only supports bareword, ivar, and constant targets"), "{error}");
+fn a_method_call_operand_is_kept() {
+    let out = emit("class Probe\n  def responds?(obj)\n    defined?(obj.meth)\n  end\nend\n");
+    assert!(out.contains("defined?(obj.meth)"), "got:\n{out}");
 }
