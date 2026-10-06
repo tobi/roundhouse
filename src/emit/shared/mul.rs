@@ -60,7 +60,7 @@ pub fn classify_mul<'a>(lhs: &'a Expr, rhs: &'a Expr) -> MulCase<'a> {
     let lhs_ty = lhs_ty.unwrap();
     let rhs_ty = rhs_ty.unwrap();
 
-    if super::operand::is_user_operator_receiver(Some(lhs_ty)) {
+    if super::operand::is_user_operator_receiver(lhs) {
         return MulCase::Unknown;
     }
 

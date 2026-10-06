@@ -81,7 +81,7 @@ pub fn classify_sub<'a>(lhs: &'a Expr, rhs: &'a Expr) -> SubCase<'a> {
         // first-class `Ty::Time` variant (datetime columns hydrate to it,
         // possibly as a `Time | Nil` union) and a legacy concrete
         // `Class { Time }` (`Time.now`/`Time.current`/`Time.at`).
-        _ if super::operand::is_user_operator_receiver(Some(lhs_ty)) => SubCase::Unknown,
+        _ if super::operand::is_user_operator_receiver(lhs) => SubCase::Unknown,
         _ if is_time_operand(lhs_ty) || is_time_operand(rhs_ty) => {
             SubCase::Unknown
         }

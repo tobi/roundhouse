@@ -185,6 +185,8 @@ impl<'a> BodyTyper<'a> {
         let ExprNode::Lambda { params, .. } = &*block.node else {
             return new_ctx;
         };
+        for name in params { new_ctx.class_objects.remove(name); }
+        super::forget_class_object_writes(block, &mut new_ctx);
         // `form_with model: product do |form|` / `form_for @product do
         // |f|`: the builder is parameterized by the record the form is
         // for, so `form.object` (and `form.object.errors`) answer it.
@@ -1121,16 +1123,6 @@ impl<'a> BodyTyper<'a> {
                         if let Some(ty) = self.lookup_in_module(module_id, method) {
                             return subst(&ty);
                         }
-                        // A module the app never registered (a gem's
-                        // `ApiVersioning::ApiClient`) contributes methods
-                        // this walk cannot see, class-side ones too
-                        // (`mixes_in_class_methods`, an `included` hook that
-                        // extends). Ruby's own and the frameworks' modules
-                        // are known ground: their absence from the registry
-                        // is not evidence of unknown members.
-                        if !self.classes().contains_key(module_id) && !is_known_module(module_id) {
-                            unknown_named_ancestor = true;
-                        }
                     }
                     if method_missing_ty.is_none() {
                         method_missing_ty = cls
@@ -1738,7 +1730,7 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
-    fn lookup_in_module(&self, module_id: &ClassId, method: &Symbol) -> Option<Ty> {
+    pub(super) fn lookup_in_module(&self, module_id: &ClassId, method: &Symbol) -> Option<Ty> {
         let mut stack = vec![module_id.clone()];
         let mut seen = std::collections::BTreeSet::new();
         while let Some(id) = stack.pop() {
@@ -2922,11 +2914,23 @@ fn flatten_elem(t: &Ty) -> Ty {
 /// before it is called unknown. Consulted AFTER the receiver's own
 /// dispatch, so an app class that defines `send` or `in?` itself, or a
 /// table that types `Symbol#in?` more precisely, wins.
+pub(super) fn is_module_protocol(method: &Symbol) -> bool {
+    matches!(method.as_str(),
+        "define_method" | "alias_method" | "class_eval" | "class_exec" | "module_eval" | "module_exec"
+        | "instance_method" | "public_instance_method" | "const_get" | "constants"
+        | "class_variable_get" | "class_variable_set" | "class_variable_defined?"
+        | "method_defined?" | "public_method_defined?" | "private_method_defined?"
+        | "const_defined?" | "include?" | "instance_methods" | "public_instance_methods"
+        | "private_instance_methods" | "remove_method" | "undef_method")
+}
+
 pub(super) fn object_protocol_method(
     recv_ty: Option<&Ty>,
     method: &Symbol,
     block_ret: Option<&Ty>,
+    class_object: bool,
 ) -> Option<Ty> {
+    if is_module_protocol(method) && !class_object { return None; }
     let sym_list = || Ty::Array { elem: Box::new(Ty::Sym) };
     let recv = || recv_ty.cloned().unwrap_or(Ty::Untyped);
     let block = || block_ret.filter(|t| !matches!(t, Ty::Var { .. })).cloned().unwrap_or(Ty::Untyped);
@@ -2934,8 +2938,8 @@ pub(super) fn object_protocol_method(
         // Kernel / Object reflection.
         "instance_variable_get" | "instance_variable_set" | "method" | "instance_method"
         | "public_instance_method" | "const_get" | "class_variable_get" | "class_variable_set"
-        | "enum_for" | "to_enum" | "with_options" | "as_json" => Ty::Untyped,
-        "instance_variable_defined?" | "in?" | "acts_like?" | "method_defined?"
+        | "enum_for" | "to_enum" => Ty::Untyped,
+        "instance_variable_defined?" | "in?" | "method_defined?"
         | "public_method_defined?" | "private_method_defined?" | "const_defined?"
         | "class_variable_defined?" | "include?" => Ty::Bool,
         "instance_variables" | "methods" | "public_methods" | "private_methods"
@@ -2948,23 +2952,11 @@ pub(super) fn object_protocol_method(
         | "module_exec" => block(),
         "display" => Ty::Nil,
         // ActiveSupport's Object extensions.
-        "to_json" | "to_param" | "to_query" | "to_yaml" | "pretty_inspect" => Ty::Str,
-        "instance_values" => Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
-        "presence_in" => Ty::Untyped,
+        "to_json" | "to_yaml" => Ty::Str,
         "===" | "!~" => Ty::Bool,
         "<=>" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
         _ => return None,
     })
-}
-
-/// Modules of Ruby itself and of the frameworks the analyzer models by
-/// convention; an `include` of one that is not in the registry adds no
-/// unknown methods.
-fn is_known_module(id: &ClassId) -> bool {
-    let root = id.0.as_str().trim_start_matches("::");
-    let root = root.split("::").next().unwrap_or(root);
-    super::RUBY_TOP_LEVEL.contains(&root)
-        || matches!(root, "ActiveSupport" | "ActiveModel" | "ActiveRecord" | "ActiveJob" | "ActionView" | "ActionController" | "ActionDispatch" | "ActionMailer" | "Rails" | "T" | "Sorbet")
 }
 
 /// `ActionController::Parameters` read as the Hash it stands in for:

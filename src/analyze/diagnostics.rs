@@ -49,12 +49,31 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // Rubydex's unresolved constants emit refusal stubs. Collect those
     // annotations from support methods/defaults/constants as well, so
     // an emitted raise cannot be hidden by the library diagnostic policy.
+    // Restore the nominal-class operator refusal widened by the fork.
+    // Primitive/nullable arithmetic keeps the existing library policy.
+    fn nominal_class_operand(ty: &Ty) -> bool {
+        match ty {
+            Ty::Class { .. } => true,
+            Ty::Union { variants } => !variants.is_empty() && variants.iter().all(nominal_class_operand),
+            _ => false,
+        }
+    }
     fn collect_constants(expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if let Some(kind @ DiagnosticKind::IncompatibleBinop { op, lhs_ty, .. }) = &expr.diagnostic {
+            if nominal_class_operand(lhs_ty) {
+            out.push(Diagnostic {
+                span: expr.span,
+                severity: Diagnostic::default_severity(kind),
+                kind: kind.clone(),
+                message: format!("`{op}` with incompatible operand types"),
+            });
+            }
+        }
         if matches!(&expr.diagnostic,
-            Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "constant")
+            Some(DiagnosticKind::Unsupported { .. }))
         {
-            if let Some(DiagnosticKind::Unsupported { detail, .. }) = &expr.diagnostic {
-                out.push(Diagnostic::unsupported(expr.span, None, "constant", detail.clone()));
+            if let Some(DiagnosticKind::Unsupported { target, construct, detail }) = &expr.diagnostic {
+                out.push(Diagnostic::unsupported(expr.span, target.clone(), construct.as_str(), detail.clone()));
             }
         }
         expr.node.for_each_child(&mut |child| collect_constants(child, out));
@@ -69,6 +88,21 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
             }
         }
         for (_, value) in &class.constants { collect_constants(value, &mut out); }
+        for call in &class.unknown_calls { collect_constants(call, &mut out); }
+    }
+    // The analyzer resolves model include identities against the registry.
+    // Collect that edge's refusal; declaration-marker arguments are metadata
+    // handled by the shared model lowerer, rather than executable reads.
+    for model in &app.models {
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                if let Some(DiagnosticKind::Unsupported { construct, detail, .. }) = &expr.diagnostic {
+                    if construct.as_str() == "include" {
+                        out.push(Diagnostic::unsupported(expr.span, None, "include", detail.clone()));
+                    }
+                }
+            }
+        }
     }
     // A filter's return value is Rails' to discard (`around_action
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing

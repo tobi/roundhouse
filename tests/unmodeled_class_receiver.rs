@@ -1,8 +1,4 @@
-//! A receiver whose declared class is an unmodeled gem class
-//! (`Money`, `CSV::Row`, `ActionController::Parameters`) has no method
-//! table to consult, so a send on it is a gradual escape, not
-//! `send_dispatch_failed`. Declared types (T.let / RBS) surface such
-//! receivers where before the value was simply unknown.
+//! A declared nominal type requires a real declaration or modeled dependency.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,7 +7,7 @@ use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};
 use roundhouse::ingest::ingest_app_from_tree;
 
 #[test]
-fn sends_on_an_unregistered_declared_class_are_not_failures() {
+fn nonexistent_declared_classes_are_refused() {
     let ctrl = r#"class FooController < ApplicationController
   def show
     @price = T.let(params[:x], T.nilable(GemMoney))
@@ -32,7 +28,7 @@ end
     Analyzer::new(&app).analyze(&mut app);
     let bad: Vec<_> = diagnose(&app)
         .into_iter()
-        .filter(|d| matches!(d.kind, DiagnosticKind::SendDispatchFailed { .. }))
+        .filter(|d| matches!(d.kind, DiagnosticKind::Unsupported { ref construct, .. } if construct.as_str() == "declared type"))
         .collect();
-    assert!(bad.is_empty(), "{:?}", bad.iter().map(|d| &d.kind).collect::<Vec<_>>());
+    assert!(bad.iter().any(|d| d.message.contains("GemMoney")), "{:?}", bad.iter().map(|d| &d.kind).collect::<Vec<_>>());
 }

@@ -21,6 +21,12 @@ use crate::ty::Ty;
 /// The source reference names a modeled class or module. The Ruby emitter
 /// uses its resolved `Ty::Class` when it changes lexical nesting.
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
+/// The value is a proven class/module object, rather than a nominal instance.
+pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
+/// This receiver's operator call is backed by a registered method definition.
+pub const RESOLVED_OPERATOR_RECEIVER: u64 = 1 << 6;
+/// The cast's type was declared by source, rather than synthesized by lowering.
+pub const SOURCE_TYPE_ASCRIPTION: u64 = 1 << 7;
 /// A generated constant may borrow a source span for diagnostics/layout;
 /// that position is not a written Ruby constant reference to index.
 pub const GENERATED_CONST_REF: u64 = 1 << 4;

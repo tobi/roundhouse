@@ -1,7 +1,4 @@
-//! `x.not_nil!` — the replacement core's CLAUDE.md prescribes for
-//! `T.must`. It answers the receiver with nil removed (or raises), so
-//! a `String?` receiver must answer `String` and stay chainable,
-//! rather than reporting `no known method `not_nil!` on String`.
+//! Non-nil assertion names need an app implementation or a shared nil-check lowerer.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,13 +25,13 @@ fn dispatch_failures(action: &str) -> Vec<String> {
         .iter()
         .chain(roundhouse::analyze::diagnose(&app).iter())
         .map(roundhouse::diagnostic::Diagnostic::to_string)
-        .filter(|d| d.contains("send_dispatch_failed"))
+        .filter(|d| d.contains("send_dispatch_failed") || d.contains("unsupported"))
         .collect()
 }
 
 #[test]
-fn not_nil_bang_strips_nil_and_stays_chainable() {
+fn universal_not_nil_bang_is_refused() {
     let diags = dispatch_failures("    name = User.first.name\n    name.not_nil!.upcase\n    [name].compact.first.not_nil!.strip");
-    assert!(diags.is_empty(), "{diags:?}");
+    assert!(diags.iter().any(|d| d.contains("not_nil!")), "{diags:?}");
 }
 

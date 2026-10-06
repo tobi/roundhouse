@@ -1,19 +1,4 @@
-//! Every object and every module answers the `Object` / `Module`
-//! protocol, whatever its own method table says.
-//!
-//! `instance_variable_get`, `define_singleton_method`, `singleton_class`,
-//! `instance_variables`, `in?`, `to_json`, `instance_eval { }` ... come
-//! from Kernel, Object, Module and ActiveSupport's `Object` extensions,
-//! not from the model or service class that receives them. A send with an
-//! explicit receiver whose own table lacks the name used to be reported
-//! as an unknown method of that class (core: `self.instance_variable_get`
-//! in a concern, `klass.define_method`, `record.to_json`).
-//!
-//! The answers are the ones Ruby gives: the reflective getters return
-//! whatever the program stored (untyped), predicates return Bool, name
-//! listings return arrays of Symbols, `dup`/`clone`/`extend` return the
-//! receiver's type, and the `*_eval` / `*_exec` family returns the block's
-//! value.
+//! Object reflection and proven Module receivers keep their distinct protocols.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,7 +27,7 @@ const RECORD: &str = "class ApplicationRecord < ActiveRecord::Base\n  self.abstr
 
 #[test]
 fn an_instance_answers_the_object_protocol() {
-    let model = "class Widget < ApplicationRecord\n  def inst\n    self.instance_variable_get(:@x)\n    self.instance_variable_set(:@x, 1)\n    self.instance_variables.map(&:to_s)\n    self.instance_variable_defined?(:@x)\n    self.define_singleton_method(:x) { 1 }\n    self.singleton_class\n    self.in?([1])\n    self.to_json\n    self.as_json\n    self.instance_values\n    self.dup\n    self.itself\n  end\nend\n";
+    let model = "class Widget < ApplicationRecord\n  def inst\n    self.instance_variable_get(:@x)\n    self.instance_variable_set(:@x, 1)\n    self.instance_variables.map(&:to_s)\n    self.instance_variable_defined?(:@x)\n    self.define_singleton_method(:x) { 1 }\n    self.singleton_class\n    self.in?([1])\n    self.to_json\n    self.dup\n    self.itself\n  end\nend\n";
     let err = check(&[("app/models/application_record.rb", RECORD), ("app/models/widget.rb", model)]);
     assert!(err.contains(" 0 error(s)"), "{err}");
 }

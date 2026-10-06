@@ -39,24 +39,9 @@ pub fn is_gradual_operand(t: Option<&Ty>) -> bool {
     }
 }
 
-/// A receiver whose class owns the operator: `Money - Money`,
-/// `MoneyBag + MoneyBag`, `Gem::Version < Gem::Version`, `Duration * 2`.
-/// Ruby dispatches a binary operator as a method call on the lhs, so for
-/// any class-typed lhs the question is "does that class define it", which
-/// the operand types alone cannot answer — the builtin value types
-/// (`Int`, `Float`, `Str`, `Array`, `Hash`) are their own `Ty` variants and
-/// never reach here. `Set` is the one class the classifiers model.
-///
-/// A union is one when every arm is (`Money | Money::Zero`): each arm owns its
-/// own operator, and a `nil` arm is what makes it a real mismatch instead.
-pub fn is_user_operator_receiver(t: Option<&Ty>) -> bool {
-    match t {
-        Some(Ty::Class { id, .. }) => id.0.as_str() != "Set",
-        Some(Ty::Union { variants }) => {
-            !variants.is_empty() && variants.iter().all(|v| is_user_operator_receiver(Some(v)))
-        }
-        _ => false,
-    }
+/// Admission comes from the operator's defining method, never the class label.
+pub fn is_user_operator_receiver(receiver: &crate::expr::Expr) -> bool {
+    receiver.decisions & crate::expr::RESOLVED_OPERATOR_RECEIVER != 0
 }
 
 /// An ordered number: `Int`, `Float`, `Numeric`/`BigDecimal`/`Rational`, or

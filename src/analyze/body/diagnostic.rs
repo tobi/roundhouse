@@ -20,6 +20,12 @@ use crate::expr::{Expr, ExprNode};
 use crate::ty::Ty;
 
 pub(super) fn detect_diagnostic(expr: &mut Expr) {
+    // Operator ownership/operand types can become known in a later fixpoint
+    // round. Recompute this classifier's annotation instead of retaining a
+    // refusal from an earlier incomplete registry.
+    if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::IncompatibleBinop { .. })) {
+        expr.diagnostic = None;
+    }
     if let ExprNode::Send { recv: Some(r), method, args, .. } = &*expr.node {
         if args.len() != 1 {
             return;
