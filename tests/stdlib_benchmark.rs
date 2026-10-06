@@ -1,5 +1,4 @@
-//! `Benchmark.realtime` and ActiveSupport's `Benchmark.ms` are the stdlib
-//! timing helpers an app wraps a block in. Both answer a Float.
+//! Benchmark cannot be admitted when emitted projects lack its runtime dependency.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,19 +41,10 @@ fn diagnostics_for(action: &str) -> Vec<String> {
 }
 
 
-fn dispatch_errors(diagnostics: &[String]) -> Vec<&String> {
-    diagnostics.iter().filter(|d| d.contains("send_dispatch_failed")).collect()
-}
-
 #[test]
-fn benchmark_timing_helpers_dispatch_and_answer_a_float() {
-    for action in [
-        "@a = Benchmark.realtime { 1 }.round(2)",
-        "@a = Benchmark.ms { 1 }.round(1)",
-    ] {
+fn benchmark_timing_helpers_are_refused() {
+    for action in ["@a = Benchmark.realtime { 1 }.round(2)", "@a = Benchmark.ms { 1 }.round(1)"] {
         let diags = diagnostics_for(action);
-        assert!(dispatch_errors(&diags).is_empty(), "{action}: {diags:?}");
+        assert!(diags.iter().any(|d| d.contains("Benchmark")), "{action}: {diags:?}");
     }
-    let diags = diagnostics_for("@a = Benchmark.realtime { 1 }.no_such_float_method");
-    assert_eq!(dispatch_errors(&diags).len(), 1, "{diags:?}");
 }

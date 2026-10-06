@@ -30,54 +30,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             args: vec![],
         },
     );
-    // `Rails.event` / `Rails.error` — the structured-event and error
-    // reporters (Rails 8.1 `ActiveSupport::EventReporter`, Rails 7
-    // `ActiveSupport::ErrorReporter`). Both are singletons an app calls
-    // on every request path, so they are modeled as their real classes
-    // rather than left as an unknown method on `Rails`.
-    let reporter = |name: &str| Ty::Class {
-        id: ClassId(Symbol::from(name)),
-        args: vec![],
-    };
-    rails_cls
-        .class_methods
-        .insert(Symbol::from("event"), reporter("ActiveSupport::EventReporter"));
-    rails_cls
-        .class_methods
-        .insert(Symbol::from("error"), reporter("ActiveSupport::ErrorReporter"));
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
-
-    // EventReporter: `notify`/`debug` publish and answer nil; `tagged`
-    // and `with_debug` yield and answer the block's value, which the
-    // registry cannot express, so they stay gradual (like `try`).
-    register_stdlib_class(classes, "ActiveSupport::EventReporter", &[], &[
-        ("notify", Ty::Nil), ("debug", Ty::Nil),
-        ("tagged", Ty::Untyped), ("with_debug", Ty::Untyped),
-        ("set_context", Ty::Nil), ("clear_context", Ty::Nil),
-        ("context", Ty::Untyped), ("debug_mode?", Ty::Bool),
-        ("subscribe", Ty::Untyped), ("unsubscribe", Ty::Untyped),
-        ("raise_on_error!", Ty::Nil), ("raise_on_error", Ty::Bool),
-        ("subscribers", Ty::Untyped),
-    ]);
-    // ErrorReporter: `report`/`unexpected` answer nil; `handle` answers
-    // the block's value or the fallback, `record` the block's value.
-    register_stdlib_class(classes, "ActiveSupport::ErrorReporter", &[], &[
-        ("report", Ty::Nil), ("unexpected", Ty::Nil),
-        ("handle", Ty::Untyped), ("record", Ty::Untyped),
-        ("set_context", Ty::Untyped), ("add_middleware", Ty::Untyped),
-        ("subscribe", Ty::Untyped), ("unsubscribe", Ty::Untyped),
-        ("disable", Ty::Untyped), ("severity_to_level", Ty::Untyped),
-        ("logger", Ty::Untyped), ("debug_mode", Ty::Untyped),
-    ]);
-    // `ShopifyTracer` — core's OpenTelemetry tracer constant, assigned
-    // in the shopify-otel gem boundary (`T.let(... .tracer("Shopify"))`)
-    // which is not part of the analyzed tree. Its span API yields to a
-    // block and answers its value / a span handle: genuinely unmodeled
-    // gem boundary, so gradual.
-    register_stdlib_class(classes, "ShopifyTracer", &[
-        ("in_span", Ty::Untyped), ("start_span", Ty::Untyped),
-        ("start_root_span", Ty::Untyped),
-    ], &[]);
 
     // `ActionController::BrowserBlocker.blocked?(user_agent, floors)` —
     // the gate `ingest::allow_browser` synthesizes into a controller
@@ -157,14 +110,6 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("hex", Ty::Str), ("base64", Ty::Str), ("urlsafe_base64", Ty::Str),
         ("base58", Ty::Str), ("uuid", Ty::Str), ("alphanumeric", Ty::Str),
         ("random_bytes", Ty::Str), ("random_number", Ty::Untyped),
-    ], &[]);
-    // `Benchmark` (the `benchmark` stdlib default gem): `realtime`
-    // answers the block's wall time as a Float, and ActiveSupport's
-    // core extension adds `ms` (the same, in milliseconds).
-    // `measure`/`bm` answer report objects nobody types.
-    register_stdlib_class(classes, "Benchmark", &[
-        ("realtime", Ty::Float), ("ms", Ty::Float),
-        ("measure", Ty::Untyped), ("bm", Ty::Untyped), ("bmbm", Ty::Untyped),
     ], &[]);
     // `Random` carries the same `Random::Formatter` surface as
     // SecureRandom since Ruby 3.3 (`Random.uuid` is campfire's test
@@ -614,7 +559,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // implement the collection operations the app uses; don't invent
     // one concrete representation for the two runtimes.
     register_stdlib_class(classes, "Rails::HTML5::SafeListSanitizer", &[
-        ("allowed_tags", Ty::Untyped), ("allowed_attributes", Ty::Untyped),
+        ("allowed_tags", Ty::Union { variants: vec![Ty::Array { elem: Box::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![] }] }),
+        ("allowed_attributes", Ty::Union { variants: vec![Ty::Array { elem: Box::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![] }] }),
     ], &[]);
     // `Set` is a value type: `Set.new` yields `Class { Set }` (via the
     // universal `.new`), then these instance methods dispatch on it.

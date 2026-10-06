@@ -1,13 +1,4 @@
-//! ActiveSupport's String conversions that a params scalar goes through.
-//!
-//! `params[:start_date].to_date`, `params[:percent].to_d / 100`,
-//! `params[:at].to_time`, `params[:time]&.in_time_zone` and
-//! `params[:capabilities].as_json` are how Shopify's controllers turn a
-//! request string into a value. `String#to_date` and friends, `to_d` and
-//! the `Object#as_json`/`to_json` pair were missing from the String
-//! surface, so each failed dispatch on the very type the request value
-//! is most often. Dates fold into `Time` and a decimal into `Float`, as
-//! everywhere else in the analyzer.
+//! String conversions without shared runtime preserve named unsupported diagnostics.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,25 +35,28 @@ fn failures(body: &str) -> Vec<String> {
                 roundhouse::ide::render_ty(&recv_ty),
                 method.as_str()
             )),
+            DiagnosticKind::Unsupported { construct, detail, .. } => Some(format!("{construct}: {detail}")),
             _ => None,
         })
         .collect()
 }
 
 #[test]
-fn a_string_parses_to_a_date_a_decimal_and_json() {
+fn missing_string_conversion_runtimes_are_refused() {
     let f = failures(
         "  def index\n    a = \"2020-01-01\".to_date\n    b = \"12:00\".to_time\n    c = \"1.5\".to_d / 100\n    d = \"now\".in_time_zone\n    e = \"x\".to_json\n    f = \"x\".as_json\n    render plain: \"x\"\n  end",
     );
-    assert!(f.is_empty(), "string conversion dispatch failures: {f:?}");
+    for name in ["to_date", "to_time", "to_d", "in_time_zone", "as_json"] {
+        assert!(f.iter().any(|d| d.contains(name)), "missing {name}: {f:?}");
+    }
 }
 
 #[test]
-fn a_params_scalar_converts_through_them() {
+fn params_do_not_certify_missing_conversion_runtimes() {
     let f = failures(
         "  def index\n    a = params[:start_date]&.to_date\n    b = params[:percent].to_d / 100\n    c = params[:at].to_time\n    d = params[:time]&.in_time_zone\n    e = params[:tags].as_json\n    render plain: \"x\"\n  end",
     );
-    assert!(f.is_empty(), "params conversion dispatch failures: {f:?}");
+    assert!(f.iter().any(|d| d.contains("to_d")), "{f:?}");
 }
 
 #[test]

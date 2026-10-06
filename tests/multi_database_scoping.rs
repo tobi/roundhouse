@@ -1,11 +1,4 @@
-//! `connected_to(role: :reading) { … }` on an abstract record class.
-//!
-//! `connects_to` makes a base class the door to a second database, and
-//! every read against it goes through `Base.connected_to(role:)` with
-//! a block; the call answers the block's value. Shopify core's
-//! `CoreGeneral2Record` is the shape (31 call sites): the class-side
-//! surface had `transaction` but not its routing sibling, so each call
-//! failed dispatch.
+//! Connection routing requires a runtime implementation, even on abstract records.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,7 +13,7 @@ fn failures(files: &[(&str, &str)]) -> Vec<String> {
     Analyzer::new(&app).analyze(&mut app);
     diagnose(&app)
         .iter()
-        .filter(|d| d.code() == "send_dispatch_failed")
+        .filter(|d| d.code() == "send_dispatch_failed" || d.code() == "unsupported")
         .map(|d| d.message.clone())
         .collect()
 }
@@ -43,7 +36,7 @@ const ROUTES: (&str, &str) = (
 );
 
 #[test]
-fn connected_to_dispatches_on_an_abstract_record_class() {
+fn connected_to_is_refused_without_routing_runtime() {
     let out = failures(&[
         SCHEMA,
         APP_RECORD,
@@ -59,5 +52,5 @@ fn connected_to_dispatches_on_an_abstract_record_class() {
             "class ThingsController < ApplicationController\n  def show\n    CoreGeneral2Record.connected_to(role: :reading) do\n      ApiClient.find(1)\n    end\n  end\nend\n",
         ),
     ]);
-    assert!(out.is_empty(), "unexpected dispatch failures: {out:?}");
+    assert!(out.iter().any(|d| d.contains("connected_to")), "{out:?}");
 }

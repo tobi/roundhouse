@@ -89,53 +89,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ] {
         errors_cls.instance_methods.insert(Symbol::from(m), ty);
     }
-    // The rest of the Rails 7/8 collection API, which core's validators
-    // and services lean on: predicates over an attribute/type pair,
-    // `import`/`merge!` of another model's errors, `delete`/`where`,
-    // and the `details`/`messages` hash views. `Errors` includes
-    // Enumerable over its `Error` objects, so `map`/`select`/... answer
-    // Arrays; the element type of a `map` is the block's, which a static
-    // registry entry cannot express, hence Array[untyped].
-    let error_arr = || Ty::Array { elem: Box::new(error_ty.clone()) };
-    let sym_hash_of = |v: Ty| Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(v) };
-    let untyped_arr = || Ty::Array { elem: Box::new(Ty::Untyped) };
-    for (m, ty) in [
-        ("added?", Ty::Bool),
-        ("of_kind?", Ty::Bool),
-        ("key?", Ty::Bool),
-        ("has_key?", Ty::Bool),
-        ("one?", Ty::Bool),
-        ("blank?", Ty::Bool),
-        ("present?", Ty::Bool),
-        ("import", Ty::Untyped),
-        ("merge!", errors_ty.clone()),
-        ("copy!", errors_ty.clone()),
-        ("delete", Ty::Untyped),
-        ("where", error_arr()),
-        ("errors", error_arr()),
-        ("objects", error_arr()),
-        ("to_a", str_arr()),
-        ("attribute_names", Ty::Array { elem: Box::new(Ty::Sym) }),
-        ("keys", Ty::Array { elem: Box::new(Ty::Sym) }),
-        ("details", sym_hash_of(Ty::Array { elem: Box::new(sym_hash_of(Ty::Untyped)) })),
-        ("messages", sym_hash_of(str_arr())),
-        ("to_hash", sym_hash_of(str_arr())),
-        ("group_by_attribute", sym_hash_of(error_arr())),
-        ("generate_message", Ty::Str),
-        ("map", untyped_arr()),
-        ("collect", untyped_arr()),
-        ("flat_map", untyped_arr()),
-        ("filter_map", untyped_arr()),
-        ("select", error_arr()),
-        ("filter", error_arr()),
-        ("reject", error_arr()),
-        ("sort_by", error_arr()),
-        ("first", Ty::Union { variants: vec![error_ty.clone(), Ty::Nil] }),
-        ("last", Ty::Union { variants: vec![error_ty.clone(), Ty::Nil] }),
-        ("find", Ty::Union { variants: vec![error_ty.clone(), Ty::Nil] }),
-    ] {
-        errors_cls.instance_methods.entry(Symbol::from(m)).or_insert(ty);
-    }
+    // Additional collection APIs require shared runtime/lowering support.
     classes.insert(
         ClassId(Symbol::from("ActiveModel::Errors")),
         errors_cls,
@@ -148,12 +102,6 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("message", Ty::Str),
         ("attribute", Ty::Sym),
         ("type", Ty::Sym),
-        ("raw_type", Ty::Sym),
-        ("options", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
-        ("detail", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
-        ("base", Ty::Untyped),
-        ("match?", Ty::Bool),
-        ("strict_match?", Ty::Bool),
     ] {
         error_cls.instance_methods.insert(Symbol::from(m), ty);
     }

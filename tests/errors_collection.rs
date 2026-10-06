@@ -1,7 +1,4 @@
-//! The `ActiveModel::Errors` API core's validators and services use
-//! beyond `add`/`[]`/`full_messages`: `added?`, `import`, `merge!`,
-//! `delete`, `where`, `details`, and Enumerable over the `Error`
-//! objects (`errors.map(&:type)`, `errors.errors[0].options`).
+//! Errors operations without a shared implementation remain named refusals.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,14 +19,16 @@ fn dispatch_failures(action: &str) -> Vec<String> {
         .iter()
         .chain(roundhouse::analyze::diagnose(&app).iter())
         .map(roundhouse::diagnostic::Diagnostic::to_string)
-        .filter(|d| d.contains("send_dispatch_failed"))
+        .filter(|d| d.contains("send_dispatch_failed") || d.contains("unsupported"))
         .collect()
 }
 
 #[test]
-fn the_rails_errors_api_dispatches() {
+fn unimplemented_errors_operations_are_refused() {
     let diags = dispatch_failures(
         "    errors.added?(:base, :blank)\n    errors.import(other.errors.first)\n    errors.merge!(other.errors)\n    errors.delete(:base)\n    errors.where(:base).any?\n    errors.details[:base]\n    errors.map(&:type).include?(:x)\n    errors.errors[0].options[:code]\n    errors.attribute_names\n    errors.messages",
     );
-    assert!(diags.is_empty(), "{diags:?}");
+    for name in ["added?", "import", "merge!", "delete", "where", "details", "attribute_names"] {
+        assert!(diags.iter().any(|d| d.contains(name)), "missing {name}: {diags:?}");
+    }
 }
