@@ -149,7 +149,7 @@ fn class_eval_macro_also_ingests_substituted_has_one() {
 }
 
 #[test]
-fn load_hook_class_methods_expand_without_mixing_in_instance_methods() {
+fn load_hook_class_macros_expand_into_model_methods() {
     let files = tree(&[
         (
             "db/schema.rb",
@@ -299,7 +299,7 @@ puts "class_eval heredoc accessors passed"
 }
 
 #[test]
-fn emitted_load_hook_class_eval_accessors_run_without_mixin() {
+fn emitted_load_hook_class_eval_accessors_and_literal_mixin_run() {
     emit_and_run::real_blog()
         .write(
             "lib/title_macro.rb",
@@ -336,7 +336,7 @@ end
 a = Article.new
 a.headline = "Hello"
 raise "writer lost" unless a.headline == "Hello"
-raise "hook mixed in instance methods" if a.respond_to?(:installer_marker, true)
+raise "hook lost instance method" unless a.installer_marker == 37
 puts "load-hook class_eval accessors passed"
 "#,
         )
