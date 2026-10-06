@@ -761,22 +761,6 @@ impl<'a> BodyTyper<'a> {
                 return ty.clone();
             }
         }
-        // Core's `x.not_nil!` (Sorbet's `T.must` replacement, per its
-        // CLAUDE.md) answers the receiver with nil removed, or raises.
-        // Resolved ahead of the per-type tables for the same reason as
-        // `freeze`: it applies to every receiver, and it must see the
-        // receiver's whole union to strip the Nil arm — dispatching it
-        // arm by arm reported "no known method `not_nil!` on String".
-        if method.as_str() == "not_nil!" && args.is_empty() {
-            if let Some(ty) = recv_ty {
-                // An un-inferred arm stays gradual, as union dispatch
-                // treats it, rather than becoming a second error.
-                return match ty.clone().strip_nil() {
-                    Ty::Var { .. } => Ty::Untyped,
-                    other => other,
-                };
-            }
-        }
         // `tap` is receiver-identity too — the block's value is
         // discarded and the receiver handed back — so it belongs with
         // `freeze`/`itself`, not in the receiver-agnostic

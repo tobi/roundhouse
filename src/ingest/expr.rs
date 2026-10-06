@@ -398,21 +398,9 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         start: loc.start_offset() as u32,
         end: loc.end_offset() as u32,
     };
-    // sorbet-runtime's value-level assertions evaluate to their first
-    // argument: `T.let(x, String)` IS `x` at run time, and so is
-    // `T.must(x)` / `T.cast(x, T)` / `T.bind(self, T)`. Unwrapping here
-    // keeps the wrapped expression's own type flowing downstream;
-    // without it the site dispatches a method on `T` — a module no gem
-    // in the catalog defines — and every use of the value below it is
-    // untyped from there on.
-    //
-    // The declared type of `T.let` / `T.cast` rides along as a `Cast`
-    // (see `type_ascription`); the other assertions keep just the value.
-    //
-    // `T.must(x)` / `T.must_because(x) { }` are the exception to "just
-    // the value": they raise on nil, so what they answer is `x` with nil
-    // ruled out. That is `x.not_nil!` (core's spelling of the same
-    // thing), which the analyzer reads that way.
+    // Type ascriptions retain the value and its declared type. Nil assertions
+    // are behavior: until a shared nil-check lowerer exists, retain their
+    // explicit Unsupported annotation instead of erasing a possible raise.
     if let Some(inner) = sorbet_assertion_argument(node) {
         let declared = super::type_ascription::sorbet_declared_type(node);
         let value = ingest_expr_strict(&inner, file)?;

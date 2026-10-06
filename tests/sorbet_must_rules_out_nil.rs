@@ -1,8 +1,4 @@
-//! `T.must(x)` and `T.must_because(x) { }` raise when `x` is nil, so
-//! the value they answer is `x` with nil ruled out. Ingest used to treat
-//! them like `T.let`, as the bare argument, so a nilable value the author
-//! had asserted non-nil (15757 uses in core) kept its nil arm and the
-//! next call on it reported a dispatch on nil.
+//! Sorbet nil assertions remain unsupported until their runtime semantics are shared.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,6 +32,7 @@ fn failed_sends(body: &str) -> Vec<(String, String)> {
             DiagnosticKind::SendDispatchFailed { method, recv_ty } => {
                 Some((method.as_str().to_string(), format!("{recv_ty:?}")))
             }
+            DiagnosticKind::Unsupported { construct, detail, .. } => Some((construct.to_string(), detail)),
             _ => None,
         })
         .collect();
@@ -55,22 +52,22 @@ fn action(line: &str) -> String {
 }
 
 #[test]
-fn t_must_answers_the_argument_with_nil_removed() {
+fn t_must_requires_a_shared_nil_check() {
     let bare = receivers(&action("Line.find_by(id: 1).bogus_after"));
     assert_eq!(bare.len(), 1, "{bare:?}");
     assert!(bare[0].contains("Nil"), "{bare:?}");
     let must = receivers(&action("T.must(Line.find_by(id: 1)).bogus_after"));
-    assert_eq!(must.len(), 1, "{must:?}");
-    assert!(!must[0].contains("Nil"), "{must:?}");
+    assert!(must.iter().any(|d| d.contains("nil-check")), "{must:?}");
+    assert!(must.iter().any(|d| d.contains("Nil")), "{must:?}");
 }
 
 #[test]
-fn t_must_because_answers_the_argument_with_nil_removed() {
+fn t_must_because_requires_a_shared_nil_check() {
     let must = receivers(&action(
         "T.must_because(Line.find_by(id: 1)) { \"a line\" }.bogus_after",
     ));
-    assert_eq!(must.len(), 1, "{must:?}");
-    assert!(!must[0].contains("Nil"), "{must:?}");
+    assert!(must.iter().any(|d| d.contains("nil-check")), "{must:?}");
+    assert!(must.iter().any(|d| d.contains("Nil")), "{must:?}");
 }
 
 #[test]
