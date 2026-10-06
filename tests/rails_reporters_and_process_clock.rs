@@ -1,13 +1,4 @@
-//! `Rails.event`, `Rails.error`, `Process.clock_gettime` and
-//! `ShopifyTracer.in_span` in a controller action.
-//!
-//! Shopify core calls these on nearly every request path (structured
-//! events, error reporting, timing, tracing spans). `Rails` modeled a
-//! fixed method list without `event`/`error`, `Process` knew only
-//! `pid`, and `ShopifyTracer` (a constant assigned in a gem boundary)
-//! was unknown, so each call reported `send_dispatch_failed`. The
-//! reporters are now their real classes, `clock_gettime` answers by
-//! its unit, and the tracer is a gradual gem boundary.
+//! Registry-only reporters and undefined application tracers are not executable support.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,7 +29,7 @@ fn diagnostics_for(body: &str) -> Vec<String> {
 }
 
 #[test]
-fn the_reporters_the_clock_and_the_tracer_dispatch() {
+fn unimplemented_reporters_and_tracers_are_refused() {
     let diags = diagnostics_for(
         r#"    Rails.event.notify("thing", message: "m")
     Rails.event.tagged(a: 1) { Rails.event.debug("d", message: "x") }
@@ -51,6 +42,7 @@ fn the_reporters_the_clock_and_the_tracer_dispatch() {
     ShopifyTracer.in_span("x") { |s| 1 }
     [t + 1.0, ms + 1, fm + 1.0]"#,
     );
-    let dispatch: Vec<_> = diags.iter().filter(|d| d.contains("send_dispatch_failed")).collect();
-    assert!(dispatch.is_empty(), "{dispatch:?}");
+    for name in ["event", "error", "ShopifyTracer", "Process"] {
+        assert!(diags.iter().any(|d| d.contains(name)), "missing {name}: {diags:?}");
+    }
 }
