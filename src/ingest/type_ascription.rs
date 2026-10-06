@@ -92,10 +92,11 @@ pub(super) fn ascribe_trailing(value: Expr, trailing: Option<Trailing>) -> Expr 
     }
 }
 
-/// `value.not_nil!`.
+/// A generated non-nil assertion carries a refusal until nil-check semantics
+/// have a shared executable implementation.
 pub(super) fn not_nil(value: Expr) -> Expr {
     let span = value.span;
-    Expr::new(
+    let mut expr = Expr::new(
         span,
         ExprNode::Send {
             recv: Some(value),
@@ -104,7 +105,13 @@ pub(super) fn not_nil(value: Expr) -> Expr {
             block: None,
             parenthesized: false,
         },
-    )
+    );
+    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+        target: None,
+        construct: crate::ident::Symbol::from("non-nil assertion"),
+        detail: "requires a shared nil-check implementation".into(),
+    });
+    expr
 }
 
 /// The `#:` assertion written between a call's receiver and the

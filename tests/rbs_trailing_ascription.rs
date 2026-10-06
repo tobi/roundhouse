@@ -1,12 +1,4 @@
-//! A trailing `#: as Type` / `#: as !nil` comment on an expression that
-//! is not an assignment.
-//!
-//! RBS inline comments are how Shopify core says what a value is where
-//! inference cannot: after a call (`error.response #: as Response?`),
-//! after an argument written on its own line (`x.first, #: as !nil`),
-//! after a method's last expression. Ingest only read them on
-//! assignments (`x = v #: as T`), so about 970 of them were ignored, and
-//! `#: as !nil` (720 uses, RBS inline's `T.must`) was ignored everywhere.
+//! RBS trailing types retain typing; non-nil assertions require executable semantics.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,6 +32,7 @@ fn failed_sends(body: &str) -> Vec<(String, String)> {
             DiagnosticKind::SendDispatchFailed { method, recv_ty } => {
                 Some((method.as_str().to_string(), format!("{recv_ty:?}")))
             }
+            DiagnosticKind::Unsupported { construct, detail, .. } => Some((construct.to_string(), detail)),
             _ => None,
         })
         .collect();
@@ -94,7 +87,7 @@ end
 }
 
 #[test]
-fn as_not_nil_rules_nil_out_of_the_value() {
+fn as_not_nil_is_a_named_refusal() {
     // A dispatch failure names the receiver's type. `Line.find_by` is
     // `Line | nil`; with `#: as !nil` it is a `Line`.
     let unchecked = receivers(
@@ -117,8 +110,8 @@ end
 end
 "#,
     );
-    assert_eq!(checked.len(), 1, "{checked:?}");
-    assert!(!checked[0].contains("Nil"), "{checked:?}");
+    assert!(checked.iter().any(|d| d.contains("nil-check")), "{checked:?}");
+    assert!(checked.iter().any(|d| d.contains("Nil")), "{checked:?}");
 }
 
 #[test]
