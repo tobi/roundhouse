@@ -39,7 +39,7 @@ pub fn classify_div_pow(lhs: &Expr, rhs: &Expr) -> DivPowCase {
     let lhs_ty = lhs_ty.unwrap();
     let rhs_ty = rhs_ty.unwrap();
 
-    if super::operand::is_user_operator_receiver(Some(lhs_ty)) {
+    if super::operand::is_user_operator_receiver(lhs) {
         return DivPowCase::Unknown;
     }
 

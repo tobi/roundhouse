@@ -13,6 +13,104 @@ mod class_configuration;
 mod data_factory;
 
 #[test]
+fn critic_corrections_preserve_class_objects_reflection_and_operators() {
+    emit_and_run::real_blog()
+        .write("app/helpers/protocol_control.rb", r#"class FirstOperand
+  def +(other)
+    other + 41
+  end
+end
+class SecondOperand
+  def +(other)
+    other + 42
+  end
+end
+class ProtocolControl
+  def initialize
+    @value = 7
+  end
+  def self.implicit_eval
+    class_eval { 31 }
+  end
+  def union_operator_control(flag)
+    value = flag ? FirstOperand.new : SecondOperand.new
+    value + 1
+  end
+  def reflection
+    instance_variable_get(:@value)
+  end
+  def include?(value)
+    value == 3
+  end
+  def +(other)
+    @value + other
+  end
+def reflective_override(value)
+  value
+end
+def override_control
+  ProtocolControl.new.reflective_override("ok").upcase
+end
+def operator_control
+    ProtocolControl.new + 2
+  end
+  def install
+    klass = ProtocolControl
+    alias_klass = klass
+    alias_klass.define_method(:installed) { 19 }
+    ProtocolControl.new.installed
+  end
+end
+"#)
+        .run_ruby(r#"
+control = ProtocolControl.new
+raise "implicit class identity lost" unless ProtocolControl.implicit_eval == 31
+raise "first union operator lost" unless control.union_operator_control(true) == 42
+raise "second union operator lost" unless control.union_operator_control(false) == 43
+raise "reflection changed" unless control.reflection == 7
+raise "override changed" unless control.include?(3)
+raise "app return inference changed" unless control.override_control == "OK"
+raise "operator changed" unless control.operator_control == 9
+raise "class alias identity lost" unless control.install == 19
+raise "JSON support changed" unless control.to_json.is_a?(String)
+puts "critic positive controls passed"
+"#)
+        .assert_passes();
+}
+
+#[test]
+fn critic_corrections_preserve_generated_model_narrowing() {
+    emit_and_run::real_blog()
+        .edit("app/models/article.rb", "class Article < ApplicationRecord", "class Article < ApplicationRecord\n  def critic_item\n    self\n  end")
+        .write("app/views/articles/_critic_narrow.html.erb", "<% case article.critic_item %>\n<% when Article %>\n<%= link_to 'narrowed', article.critic_item %>\n<% end %>\n")
+        .run_ruby("article = Article.new(id: 7, title: 'narrowed title'); raise 'model narrowing changed' unless Views::Articles.critic_narrow(article).include?('/articles/7')")
+        .assert_passes();
+}
+
+#[test]
+fn critic_corrections_preserve_native_module_callback_identity() {
+    emit_and_run::real_blog()
+        .write("app/models/concerns/native_hook.rb", "module NativeHook\n  def self.included(base)\n    base.define_method(:hook_value) { 23 }\n  end\nend\n")
+        .edit("app/models/article.rb", "class Article < ApplicationRecord", "class Article < ApplicationRecord\n  include NativeHook")
+        .run_ruby("raise 'native callback identity lost' unless Article.new.hook_value == 23")
+        .assert_passes();
+}
+
+#[test]
+fn critic_corrections_preserve_errors_message_projections() {
+    emit_and_run::real_blog()
+        .edit("app/models/article.rb", "class Article < ApplicationRecord", "class Article < ApplicationRecord\n  def critic_title_messages\n    errors[:title]\n  end\n  def critic_full_messages\n    errors.full_messages\n  end")
+        .run_ruby(r#"
+article = Article.new
+article.valid?
+raise "message indexing changed" unless article.critic_title_messages.include?("can't be blank")
+raise "full messages changed" unless article.critic_full_messages.any?
+puts "error message runtime controls passed"
+"#)
+        .assert_passes();
+}
+
+#[test]
 fn defined_method_operands_are_not_invoked() {
     emit_and_run::empty_app()
         .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")

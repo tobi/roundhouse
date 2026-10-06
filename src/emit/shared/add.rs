@@ -77,7 +77,7 @@ pub fn classify_add(lhs: &Expr, rhs: &Expr) -> AddCase {
     if is_time(lhs_ty.unwrap()) && !is_time(rhs_ty.unwrap()) && !matches!(rhs_ty, Some(Ty::Str)) {
         return AddCase::Unknown;
     }
-    if super::operand::is_user_operator_receiver(lhs_ty) {
+    if super::operand::is_user_operator_receiver(lhs) {
         return AddCase::Unknown;
     }
 

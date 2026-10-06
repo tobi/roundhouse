@@ -1,15 +1,4 @@
-//! A class that includes a module the app never registered has methods
-//! the analyzer cannot see.
-//!
-//! Core's `ApiClient` says `include ::ApiVersioning::ApiClient`; the
-//! gem's module answers `ApiClient.current` and friends (through
-//! `mixes_in_class_methods` / an `included` hook that extends the
-//! class). The analyzer walked the class, its registered includes and its
-//! superclasses, found no `current`, and reported it as an unknown method
-//! of `ApiClient`, a hundred times over. An unregistered superclass
-//! already made the walk answer untyped (the method is most likely
-//! inherited from it); an unregistered included module says the same.
-//! Ruby's own and the frameworks' modules are known ground and do not.
+//! Unresolved includes must not open an arbitrary method surface.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,14 +27,15 @@ const RECORD: &str = "class ApplicationRecord < ActiveRecord::Base\n  self.abstr
 const CLIENT: &str = "class ApiClient < ApplicationRecord\n  include ::ApiVersioning::ApiClient\nend\n";
 
 #[test]
-fn a_method_from_an_unregistered_included_module_is_a_boundary() {
+fn an_unregistered_include_is_a_named_error() {
     let caller = "class Caller < ApplicationRecord\n  def go\n    ApiClient.current.id\n    ApiClient.new.scope_permissions\n  end\nend\n";
     let err = check(&[
         ("app/models/application_record.rb", RECORD),
         ("app/models/api_client.rb", CLIENT),
         ("app/models/caller.rb", caller),
     ]);
-    assert!(err.contains(" 0 error(s)"), "{err}");
+    assert!(!err.contains(" 0 error(s)"), "{err}");
+    assert!(err.contains("ApiVersioning") && err.contains("current"), "{err}");
 }
 
 /// Ruby's own modules are known ground: including `Comparable` does not

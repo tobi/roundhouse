@@ -82,6 +82,9 @@ pub struct Ctx {
     /// assignments accumulated through a `Seq`, and block parameters
     /// seeded from a receiver-aware dispatch.
     pub local_bindings: HashMap<Symbol, Ty>,
+    /// Locals whose assigned value is proven to be a class/module object.
+    /// Nominal instance types alone do not establish this identity.
+    pub class_objects: std::collections::HashSet<Symbol>,
     /// Module/class-level typed constants such as
     /// `STATUS_CODES = { ok: 200, ... }.freeze`. Rubydex IDs resolve
     /// source-backed reads; this scope types generated expressions.
@@ -123,6 +126,8 @@ pub struct Ctx {
 /// Rails schema + conventions; the body-typer reads it.
 #[derive(Default, Clone)]
 pub struct ClassInfo {
+    /// Kind of the indexed source declaration; never inferred from its name.
+    pub is_module: bool,
     /// Constant values declared by external gem RBI/RBS files.
     pub constants: HashMap<Symbol, Ty>,
     /// If this class maps to a database table, which one.
@@ -334,6 +339,8 @@ impl<'a> BodyTyper<'a> {
     pub fn analyze_expr(&self, expr: &mut Expr, ctx: &Ctx) -> Ty {
         let ty = self.compute(expr, ctx);
         expr.ty = Some(ty.clone());
+        expr.decisions &= !crate::expr::CLASS_OBJECT_VALUE;
+        if self.is_class_object(expr, ctx) { expr.decisions |= crate::expr::CLASS_OBJECT_VALUE; }
         diagnostic::detect_diagnostic(expr);
         ty
     }
@@ -452,6 +459,7 @@ impl<'a> BodyTyper<'a> {
                 } else {
                     union_of(ctx.local_bindings.get(&name).cloned().unwrap_or(Ty::Nil), ty)
                 };
+                ctx.class_objects.remove(&name);
                 ctx.local_bindings.insert(name, ty);
             }
         };
@@ -487,6 +495,55 @@ impl<'a> BodyTyper<'a> {
             cursor = info.parent.clone();
         }
         None
+    }
+
+    /// Identity evidence for Module protocol, independent of nominal instance type.
+    fn is_class_object(&self, expr: &Expr, ctx: &Ctx) -> bool {
+        match &*expr.node {
+            ExprNode::SelfRef => ctx.class_side,
+            ExprNode::Var { name, .. } => ctx.class_objects.contains(name),
+            ExprNode::Const { path } => {
+                if expr.decisions & crate::expr::RESOLVED_CLASS_REF != 0 { return true; }
+                if let Some(answer) = self.const_resolver.as_ref().and_then(|r| r.reference(expr.span, path)) {
+                    if let Some(resolved) = answer {
+                        return matches!(resolved, ResolvedConstant::Namespace { .. });
+                    }
+                }
+                // An exact modeled namespace is valid without a source document.
+                // A typed VALUE constant, even with the same nominal type, is not.
+                let id = written_class_id(path);
+                let value = if let [name] = path.as_slice() {
+                    ctx.constants.get_own(name).or_else(|| ctx.constants.get_global(name))
+                } else { None };
+                value.is_none() && self.classes.contains_key(&id)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_module_callback(&self, recv_ty: Option<&Ty>, method: &Symbol) -> bool {
+        matches!(method.as_str(), "included" | "prepended" | "append_features" | "prepend_features")
+            && matches!(recv_ty, Some(Ty::Class { id, .. }) if self.classes.get(id).is_some_and(|c| c.is_module && c.class_methods.contains_key(method)))
+    }
+
+    fn owns_operator(&self, ty: Option<&Ty>, method: &Symbol, class_object: bool) -> bool {
+        match ty {
+            Some(Ty::Union { variants }) => !variants.is_empty()
+                && variants.iter().all(|ty| self.owns_operator(Some(ty), method, class_object)),
+            Some(Ty::Class { id, .. }) => {
+                let mut current = Some(id);
+                for _ in 0..32 {
+                    let Some(id) = current else { break };
+                    let Some(class) = self.classes.get(id) else { break };
+                    let own = if class_object { &class.class_methods } else { &class.instance_methods };
+                    if own.contains_key(method) { return true; }
+                    if !class_object && class.includes.iter().any(|m| self.lookup_in_module(m, method).is_some()) { return true; }
+                    current = class.parent.as_ref();
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     fn compute(&self, expr: &mut Expr, ctx: &Ctx) -> Ty {
@@ -672,6 +729,7 @@ impl<'a> BodyTyper<'a> {
                             }
                         }
                         let mut inner = ctx.clone();
+                        inner.class_objects.remove(name);
                         inner.local_bindings.insert(
                             name.clone(),
                             rescued.unwrap_or_else(|| Ty::Class {
@@ -891,11 +949,17 @@ impl<'a> BodyTyper<'a> {
                 let v_ty = self.analyze_expr(value, ctx);
                 let mut inner = ctx.clone();
                 inner.local_bindings.insert(name.clone(), v_ty);
+                inner.class_objects.remove(name);
+                if self.is_class_object(value, ctx) { inner.class_objects.insert(name.clone()); }
                 self.analyze_expr(body, &inner)
             }
 
-            ExprNode::Lambda { body, .. } => {
-                let body_ty = self.analyze_expr(body, ctx);
+            ExprNode::Lambda { params, rest_param, block_param, body, .. } => {
+                let mut inner = ctx.clone();
+                for name in params.iter().chain(rest_param.iter()).chain(block_param.iter()) {
+                    inner.class_objects.remove(name);
+                }
+                let body_ty = self.analyze_expr(body, &inner);
                 // Synthesize a `Fn` type from the body's type. Param
                 // types aren't tracked here (they were seeded into the
                 // outer Ctx by block_ctx_for from the receiver
@@ -957,6 +1021,9 @@ impl<'a> BodyTyper<'a> {
             ExprNode::Defined { .. } => union_of(Ty::Str, Ty::Nil),
 
             ExprNode::Send { recv, method, args, block, parenthesized } => {
+                if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+                    if matches!(construct.as_str(), "Module protocol" | "ActiveModel::Errors" | "ActiveModel::Error" | "Rails" | "ActiveRecord::Base" | "String extension" | "Hash extension" | "not_nil!" | "Object extension" | "Module callback argument"))
+                { expr.diagnostic = None; }
                 expr.decisions &= !crate::expr::RESOLVED_DATA_FACTORY;
                 if let Some(ty) = self.data_factories.and_then(|factories| factories.get(&expr_span)) {
                     // Only admitted declarations establish a Data class identity.
@@ -1097,8 +1164,26 @@ impl<'a> BodyTyper<'a> {
                         recv_ty = r.ty.clone();
                     }
                 }
+                // Ruby's Module callback ABI supplies a class/module object. Direct
+                // source calls must satisfy the same identity contract.
+                if self.is_module_callback(recv_ty.as_ref(), method) {
+                    if let Some(arg) = args.first() {
+                        if !self.is_class_object(arg, ctx) {
+                            expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                                target: None, construct: Symbol::from("Module callback argument"),
+                                detail: format!("{} requires a proven class/module object argument", method),
+                            });
+                        }
+                    }
+                }
                 let block_ret = if let Some(b) = block {
-                    let block_ctx = self.block_ctx_for(ctx, recv_ty.as_ref(), method, args, b);
+                    let mut block_ctx = self.block_ctx_for(ctx, recv_ty.as_ref(), method, args, b);
+                    if matches!(method.as_str(), "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec") {
+                        if let Some(receiver) = recv.as_ref() {
+                            block_ctx.self_ty = recv_ty.clone();
+                            block_ctx.class_side = self.is_class_object(receiver, ctx);
+                        }
+                    }
                     let method_ref_ty = self.analyze_expr(b, &block_ctx);
                     // The Lambda walker stores the analyzed body's type
                     // on the body expr itself. `map`/`collect`/similar
@@ -1260,6 +1345,14 @@ impl<'a> BodyTyper<'a> {
                     return t;
                 }
                 let dispatched = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
+                if let Some(receiver) = recv.as_mut() {
+                    receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;
+                    if matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%" | "<" | "<=" | ">" | ">=")
+                        && self.owns_operator(recv_ty.as_ref(), method, self.is_class_object(receiver, ctx))
+                    {
+                        receiver.decisions |= crate::expr::RESOLVED_OPERATOR_RECEIVER;
+                    }
+                }
                 // Kernel.Array is a container even for scalar params.
                 // App methods (including inherited/included overrides)
                 // have already dispatched above and must win.
@@ -1271,42 +1364,41 @@ impl<'a> BodyTyper<'a> {
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only, like
                 // the gradual escape below.
-                if matches!(dispatched, Ty::Var { .. }) && self.inquirers.is_some() && recv.is_some() {
-                    if let Some(t) = send::object_protocol_method(recv_ty.as_ref(), method, block_ret.as_ref()) {
+                let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx));
+                if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
+                    && (recv.is_some() || (ctx.self_ty.is_some() && send::is_module_protocol(method)))
+                    && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
+                    let class_object = class_object_receiver;
+                    if send::is_module_protocol(method) && !class_object
+                        && !self.owns_operator(recv_ty.as_ref(), method, false) {
+                        expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                            target: None,
+                            construct: Symbol::from("Module protocol"),
+                            detail: format!("{} requires a proven class/module object receiver", method),
+                        });
+                        return dispatched;
+                    }
+                    if let Some(t) = send::object_protocol_method(recv_ty.as_ref(), method, block_ret.as_ref(), class_object) {
                         return t;
                     }
                 }
-                // A value declared as a class the app never registered
-                // (`Money`, `CSV::Row`) has no method table: a send on
-                // it is an unmodeled gem boundary, not a failure. A
-                // written class name (`CSV.generate`) is not such a value; a
-                // constant that HOLDS one (`MIN = Money.new(1)`; `MIN.currency`) is. Only the app
-                // analyzer applies this: the runtime-source typer (no
-                // inquirers) holds framework code to full typing.
-                if matches!(dispatched, Ty::Var { .. }) && self.inquirers.is_some() {
-                    let held = match recv_ty.as_ref() {
-                        Some(Ty::Union { variants }) => {
-                            let mut rest = variants.iter().filter(|v| !matches!(v, Ty::Nil));
-                            match (rest.next(), rest.next()) {
-                                (Some(one), None) => Some(one),
-                                _ => None,
-                            }
-                        }
-                        other => other,
+                if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
+                    && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
+                    let gap = match recv_ty.as_ref() {
+                        Some(Ty::Class { id, .. }) if matches!(id.0.as_str(), "ActiveModel::Errors" | "ActiveModel::Error") => Some(id.0.as_str()),
+                        Some(Ty::Class { id, .. }) if matches!(id.0.as_str(), "Rails" | "ActiveRecord::Base") => Some(id.0.as_str()),
+                        Some(Ty::Str) if matches!(method.as_str(), "to_date" | "to_time" | "to_datetime" | "in_time_zone" | "to_d" | "as_json") => Some("String extension"),
+                        Some(Ty::Hash { .. }) if method.as_str() == "to_sentence" => Some("Hash extension"),
+                        _ if method.as_str() == "not_nil!" => Some("not_nil!"),
+                        _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "to_param" | "presence_in" | "as_json" | "with_options" | "pretty_inspect") => Some("Object extension"),
+                        _ => None,
                     };
-                    if let (Some(Ty::Class { id, .. }), Some(r)) = (held, recv.as_ref()) {
-                        if !names_the_class(r, id) && !self.classes.contains_key(id)
-                        {
-                            // A rescued gem error is still an Exception.
-                            let exception = self
-                                .classes
-                                .get(&ClassId(Symbol::from("StandardError")))
-                                .and_then(|c| c.instance_methods.get(method));
-                            if let Some(t) = exception {
-                                return t.clone();
-                            }
-                            return Ty::Untyped;
-                        }
+                    if let Some(owner) = gap.filter(|_| expr.diagnostic.is_none()) {
+                        expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                            target: None,
+                            construct: Symbol::from(owner),
+                            detail: format!("{} lacks a shared runtime/lowering implementation", method),
+                        });
                     }
                 }
                 dispatched
@@ -1455,7 +1547,16 @@ impl<'a> BodyTyper<'a> {
                         _ => false,
                     };
                     let e = &mut exprs[i];
+                    if !matches!(&*e.node, ExprNode::Assign { target: LValue::Var { .. }, .. }) {
+                        forget_class_object_writes(e, &mut local_ctx);
+                    }
                     last = self.analyze_expr(e, &local_ctx);
+                    if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node {
+                        let proven = self.is_class_object(value, &local_ctx);
+                        forget_class_object_writes(value, &mut local_ctx);
+                        local_ctx.class_objects.remove(name);
+                        if proven { local_ctx.class_objects.insert(name.clone()); }
+                    }
                     if let ExprNode::Assign { target, value } = &*e.node {
                         let slot = match target {
                             LValue::Ivar { name } => Some((true, name.clone())),
@@ -1993,16 +2094,70 @@ impl<'a> BodyTyper<'a> {
                 // nearest one (`Capabilities::Charge` in
                 // `ShopifyPayments::Capability` is
                 // `ShopifyPayments::Capabilities::Charge`).
-                match &ctx.self_ty {
+                let resolved = match &ctx.self_ty {
                     Some(Ty::Class { id: scope, .. }) => target_ty.map_class_ids(&|id| {
                         lexical_class(id, scope.0.as_str(), self.classes).unwrap_or_else(|| id.clone())
                     }),
-                    _ => target_ty.clone(),
+                _ => target_ty.clone(),
+                };
+                let missing = std::cell::RefCell::new(Vec::new());
+                // Lowerers also synthesize casts whose identities were proven
+                // against the full app before a reduced view/runtime registry
+                // retypes them. Resolve source declarations at their boundary.
+                if expr.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0 {
+                    resolved.map_class_ids(&|id| {
+                        if !self.classes.contains_key(id) && !RUBY_TOP_LEVEL.contains(&id.0.as_str())
+                            && !self.const_resolver.as_ref().is_some_and(|r| r.has_source_namespace(id.0.as_str())) {
+                            missing.borrow_mut().push(id.0.as_str().to_owned());
+                        }
+                        id.clone()
+                    });
                 }
+                let missing = missing.into_inner();
+                if !missing.is_empty() {
+                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                        target: None,
+                        construct: Symbol::from("declared type"),
+                        detail: format!("{} has no indexed declaration or modeled dependency", missing.join(", ")),
+                    });
+                } else if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "declared type") {
+                    expr.diagnostic = None;
+                }
+                resolved
             }
         }
     }
 
+}
+
+/// Conditional writes, block writes and parameter rebinding invalidate identity.
+fn forget_class_object_writes(expr: &Expr, ctx: &mut Ctx) {
+    let mut names = Vec::new();
+    match &*expr.node {
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => names.push(name.clone()),
+        ExprNode::MultiAssign { targets, .. } => {
+            for target in targets {
+                if let LValue::Var { name, .. } = target { names.push(name.clone()); }
+            }
+        }
+        ExprNode::Lambda { params, rest_param, block_param, .. } => {
+            names.extend(params.iter().cloned());
+            names.extend(rest_param.iter().cloned());
+            names.extend(block_param.iter().cloned());
+        }
+        ExprNode::Let { name, .. } => names.push(name.clone()),
+        ExprNode::CaseMatch { arms, .. } => {
+            for arm in arms { arm.pattern.bound_names(&mut names); }
+        }
+        ExprNode::MatchRequired { pattern, .. } | ExprNode::MatchPredicate { pattern, .. } => pattern.bound_names(&mut names),
+        ExprNode::BeginRescue { rescues, .. } => {
+            for rescue in rescues { names.extend(rescue.binding.iter().cloned()); }
+        }
+        _ => {}
+    }
+    for name in names { ctx.class_objects.remove(&name); }
+    expr.node.for_each_child(&mut |child| forget_class_object_writes(child, ctx));
 }
 
 // Literal / primitive types ---------------------------------------------
@@ -3939,23 +4094,8 @@ fn literal_extremum_ty(recv: Option<&Expr>, recv_ty: &Ty, method: &Symbol, args:
     })
 }
 
-/// Is `recv` a constant that names the class `id` — `CSV` in
-/// `CSV.generate`, the class object — rather than a value that merely
-/// has that class? `MIN = Money.new(1, "USD")` reads as `Class { Money }`
-/// too (the type does not tell class object from instance), but what it
-/// is written as is `MIN`: a class object is written as the class it is,
-/// so the written name's last segment is the class's own.
-fn names_the_class(recv: &Expr, id: &ClassId) -> bool {
-    match &*recv.node {
-        ExprNode::Const { path } => path
-            .last()
-            .is_some_and(|last| id.0.as_str().rsplit("::").next() == Some(last.as_str())),
-        _ => false,
-    }
-}
-
 // Exact top-level stdlib names used by receiver dispatch.
-const RUBY_TOP_LEVEL: &[&str] = &[
+pub(super) const RUBY_TOP_LEVEL: &[&str] = &[
     "Base64", "Benchmark", "BigDecimal", "CGI", "CSV", "Comparable", "Complex", "Coverage",
     "Date", "DateTime", "Digest", "Dir", "ERB", "Encoding", "Enumerable", "Errno", "Etc",
     "Fiber", "File", "FileUtils", "Find", "Forwardable", "GC", "IO", "IPAddr", "JSON",

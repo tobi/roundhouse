@@ -29,7 +29,9 @@ pub(super) fn ascribe(value: Expr, ty: Option<Ty>) -> Expr {
     match ty {
         Some(ty) if !ty.is_open() => {
             let span = value.span;
-            Expr::new(span, ExprNode::Cast { value, target_ty: ty })
+            let mut cast = Expr::new(span, ExprNode::Cast { value, target_ty: ty });
+            cast.decisions |= crate::expr::SOURCE_TYPE_ASCRIPTION;
+            cast
         }
         _ => value,
     }
@@ -165,4 +167,3 @@ pub(crate) fn rbs_type(text: &str) -> Option<Ty> {
         _ => None,
     }
 }
-
